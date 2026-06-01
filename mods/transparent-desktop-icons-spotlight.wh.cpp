@@ -37,7 +37,7 @@ customizable independent timeouts, blurs, and fade durations.
 /*
 - idleOpacity: 128
   $name: Idle Opacity
-  $description: Opacity of overlay when idle (0 = fully transparent, 255 = fully opaque/dark)
+  $description: Opacity of overlay when idle (0 = fully opaque, 255 = fully transparent)
 - spotlightRadius: 200
   $name: Spotlight Radius
   $description: Size of the spotlight in pixels
