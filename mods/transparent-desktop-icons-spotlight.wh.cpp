@@ -23,6 +23,11 @@ As the cursor leaves the desktop or remains idle, the spotlight fades and icons
 gradually become transparent again. Selected icons remain opaque with their own 
 customizable independent timeouts, blurs, and fade durations.
 
+
+**Demonstration**: in this case the selected icons have a timeout (set it to 0 to keep them active)
+
+![Demonstration:](https://i.imgur.com/7cTTHTN.gif)
+
 **Note:** This mod captures the static Windows wallpaper for performance reasons. 
 It does not currently support live/animated wallpapers (e.g., Wallpaper Engine, Lively).
 
@@ -31,7 +36,7 @@ It does not currently support live/animated wallpapers (e.g., Wallpaper Engine, 
 * Dedicated render thread for flawless, vsync-matched 60/144+ FPS performance.
 * 0% background GPU/CPU usage when the desktop is idle.
 * Independent Dual-GPU Blur processing for both the cursor spotlight and selected icons.
-* Interactive morphing shapes (square to circle) for both the spotlight and selected areas.
+* Customizable shapes (square to circle) for both the spotlight and selected areas.
 * Click-through architecture using WS_EX_TRANSPARENT ensures no interference with native OS interaction.
 */
 // ==/WindhawkModReadme==
