@@ -29,7 +29,7 @@ customizable independent timeouts, blurs, and fade durations.
 * Independent Dual-GPU Blur processing for both the cursor spotlight and selected icons.
 * Interactive morphing shapes (square to circle) for both the spotlight and selected areas.
 * Persistent selection memory allows deselected icons to gracefully fade away.
-* Click-through architecture using WS_DISABLED ensures no interference with native OS interaction.
+* Click-through architecture using WS_EX_TRANSPARENT ensures no interference with native OS interaction.
 */
 // ==/WindhawkModReadme==
 
@@ -37,7 +37,7 @@ customizable independent timeouts, blurs, and fade durations.
 /*
 - idleOpacity: 128
   $name: Idle Opacity
-  $description: Opacity of overlay when idle (0 = fully opaque, 255 = fully transparent)
+  $description: How much the icons are dimmed when idle (0 = icons fully visible, 255 = icons fully hidden)
 - spotlightRadius: 200
   $name: Spotlight Radius
   $description: Size of the spotlight in pixels
@@ -50,9 +50,12 @@ customizable independent timeouts, blurs, and fade durations.
 - idleDelay: 2000
   $name: Spotlight Idle Timeout (ms)
   $description: Time in milliseconds before the spotlight begins to fade out
-- spotlightFadeDuration: 500
-  $name: Spotlight Fade Duration (ms)
-  $description: How long it takes for the spotlight to fade in and out
+- spotlightFadeInDuration: 500
+  $name: Spotlight Fade In Duration (ms)
+  $description: How long it takes for the spotlight to fade in when mouse enters
+- spotlightFadeOutDuration: 500
+  $name: Spotlight Fade Out Duration (ms)
+  $description: How long it takes for the spotlight to fade out when mouse leaves
 - mouseSmoothing: 10
   $name: Mouse Smoothing
   $description: Smoothing factor for spotlight following (0-20, 0 = no smoothing, 20 = very smooth)
@@ -70,10 +73,13 @@ customizable independent timeouts, blurs, and fade durations.
   $description: Blur radius for the selection reveal box
 - selectionTimeout: 0
   $name: Selection Timeout (ms)
-  $description: Time to keep the icon visible after deselection
-- selectionFadeDuration: 250
-  $name: Selection Fade Duration (ms)
-  $description: How long the selection area takes to fade out after the timeout
+  $description: Time to keep the icon visible after deselection (0 = keep visible indefinitely while selected)
+- selectionFadeInDuration: 250
+  $name: Selection Fade In Duration (ms)
+  $description: How long the selection area takes to fade in when icon is selected
+- selectionFadeOutDuration: 250
+  $name: Selection Fade Out Duration (ms)
+  $description: How long the selection area takes to fade out after deselection
 */
 // ==/WindhawkModSettings==
 
@@ -94,7 +100,6 @@ customizable independent timeouts, blurs, and fade durations.
 #include <atomic>
 #include <mutex>
 #include <thread>
-#include <chrono>
 #include <cmath>
 #include <vector>
 
@@ -124,7 +129,8 @@ struct Settings {
     int spotlightRoundness;
     int spotlightBlur;
     int idleDelay;
-    int spotlightFadeDuration;
+    int spotlightFadeInDuration;
+    int spotlightFadeOutDuration;
     int mouseSmoothing;
     
     int selectionOpacity;
@@ -132,7 +138,8 @@ struct Settings {
     int selectionRoundness;
     int selectionBlur;
     int selectionTimeout;
-    int selectionFadeDuration;
+    int selectionFadeInDuration;
+    int selectionFadeOutDuration;
 } g_settings;
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -142,11 +149,13 @@ struct Settings {
 HWND g_overlayWnd = nullptr;
 HWND g_messageWnd = nullptr;
 std::atomic<bool> g_unloading{false};
+bool g_isRecreating = false;
 
 // Background Render Thread
 std::thread g_renderThread;
 std::atomic<bool> g_threadStop{false};
 std::mutex g_renderMutex;
+std::atomic<bool> g_forceRender{true}; // Force a frame render when settings change
 
 // DirectX pipeline resources
 ComPtr<ID3D11Device> g_d3dDevice;
@@ -259,12 +268,20 @@ bool IsFolderViewWnd(HWND hWnd) {
     HWND hParent = GetAncestor(hWnd, GA_PARENT);
     if (!hParent) return false;
     if (!GetClassName(hParent, buffer, ARRAYSIZE(buffer)) || _wcsicmp(buffer, L"SHELLDLL_DefView")) return false;
-    return true;
+    
+    HWND hGrandParent = GetAncestor(hParent, GA_PARENT);
+    if (!hGrandParent) return false;
+    if (GetClassName(hGrandParent, buffer, ARRAYSIZE(buffer))) {
+        if (_wcsicmp(buffer, L"Progman") == 0 || _wcsicmp(buffer, L"WorkerW") == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 HMODULE GetCurrentModuleHandle() {
     HMODULE module;
-    if (!GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, L"", &module)) return nullptr;
+    if (!GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)GetCurrentModuleHandle, &module)) return nullptr;
     return module;
 }
 
@@ -272,18 +289,17 @@ HMODULE GetCurrentModuleHandle() {
 // UI Thread Polling
 
 void PollDesktopState() {
-    // Cache the window handles so we don't spam FindWindow globally!
     static HWND s_hwndLV = nullptr;
     static HWND s_hwndShellView = nullptr;
-    static HWND s_hwndWorkerW = nullptr;
+    static HWND s_hwndDesktopHost = nullptr;
 
     if (!s_hwndLV || !IsWindow(s_hwndLV)) {
         s_hwndLV = GetDesktopListView();
         if (s_hwndLV) {
             s_hwndShellView = GetParent(s_hwndLV);
-            s_hwndWorkerW = s_hwndShellView ? GetParent(s_hwndShellView) : nullptr;
+            s_hwndDesktopHost = s_hwndShellView ? GetParent(s_hwndShellView) : nullptr;
         } else {
-            return; // Desktop not ready yet
+            return;
         }
     }
 
@@ -292,7 +308,7 @@ void PollDesktopState() {
     HWND hWndAtCursor = WindowFromPoint(pt);
 
     bool overDesktop = (hWndAtCursor == s_hwndLV || hWndAtCursor == s_hwndShellView || 
-                        hWndAtCursor == s_hwndWorkerW || hWndAtCursor == g_overlayWnd);
+                        hWndAtCursor == s_hwndDesktopHost || hWndAtCursor == g_overlayWnd);
 
     std::vector<RECT> selected;
     if (s_hwndLV) {
@@ -389,16 +405,16 @@ void CaptureWallpaperBitmap() {
     PaintDesktop(hdcMem);
     GdiFlush();
 
-    BYTE* pixels = static_cast<BYTE*>(pvBits);
-    for (int i = 0; i < w * h; i++) pixels[i * 4 + 3] = 255;
-
-    D2D1_BITMAP_PROPERTIES bitmapProps = D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+    // MAJOR OPTIMIZATION: D2D1_ALPHA_MODE_IGNORE eliminates the need to manually loop millions of pixels to set alpha to 255.
+    D2D1_BITMAP_PROPERTIES bitmapProps = D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
     g_dc->CreateBitmap(D2D1::SizeU(w, h), pvBits, w * 4, bitmapProps, &g_wallpaperBitmap);
 
     SelectObject(hdcMem, hOldBmp);
     DeleteObject(hBmp);
     DeleteDC(hdcMem);
     ReleaseDC(nullptr, hdcScreen);
+    
+    g_forceRender = true;
 }
 
 void RecreateBrushesAndMask(UINT width, UINT height) {
@@ -541,9 +557,6 @@ void UpdateMouseAndAnimations(float deltaTime) {
         float speed = 30.0f - g_settings.mouseSmoothing; 
         lerpFactor = 1.0f - std::exp(-speed * deltaTime);
     }
-    
-    g_smoothedMousePos.x += ((float)localPos.x - g_smoothedMousePos.x) * lerpFactor;
-    g_smoothedMousePos.y += ((float)localPos.y - g_smoothedMousePos.y) * lerpFactor;
 
     bool overDesktop = false;
     std::vector<RECT> currentSelectedRects;
@@ -554,55 +567,94 @@ void UpdateMouseAndAnimations(float deltaTime) {
     }
 
     // --- Spotlight Logic ---
-    if (overDesktop && mouseMoved) {
+    static bool s_wasOverDesktop = false;
+    if (overDesktop && !s_wasOverDesktop) {
+        g_smoothedMousePos = { (float)localPos.x, (float)localPos.y };
+        g_lastMouseTime = GetTickCount64();
+        g_isIdle = false;
+    } else if (overDesktop && mouseMoved) {
         g_lastMouseTime = GetTickCount64();
         g_isIdle = false;
     }
+    s_wasOverDesktop = overDesktop;
+
+    g_smoothedMousePos.x += ((float)localPos.x - g_smoothedMousePos.x) * lerpFactor;
+    g_smoothedMousePos.y += ((float)localPos.y - g_smoothedMousePos.y) * lerpFactor;
+
     ULONGLONG timeSinceLastMove = GetTickCount64() - g_lastMouseTime;
     if (!overDesktop || timeSinceLastMove > (ULONGLONG)g_settings.idleDelay) {
         g_isIdle = true;
     }
 
-    float spotFadeSpeed = (g_settings.spotlightFadeDuration > 0) ? (1.0f / (g_settings.spotlightFadeDuration / 1000.0f)) : 100.0f;
     float targetSpotFade = g_isIdle ? 0.0f : 1.0f;
     
-    if (g_spotlightFade < targetSpotFade) g_spotlightFade = (std::min)(g_spotlightFade + spotFadeSpeed * deltaTime, targetSpotFade);
-    else if (g_spotlightFade > targetSpotFade) g_spotlightFade = (std::max)(g_spotlightFade - spotFadeSpeed * deltaTime, targetSpotFade);
+    if (targetSpotFade > 0.5f) { // Fading IN
+        if (g_settings.spotlightFadeInDuration <= 0) {
+            g_spotlightFade = 1.0f;
+        } else {
+            float speed = 1.0f / (g_settings.spotlightFadeInDuration / 1000.0f);
+            g_spotlightFade = (std::min)(g_spotlightFade + speed * deltaTime, 1.0f);
+        }
+    } else { // Fading OUT
+        if (g_settings.spotlightFadeOutDuration <= 0) {
+            g_spotlightFade = 0.0f;
+        } else {
+            float speed = 1.0f / (g_settings.spotlightFadeOutDuration / 1000.0f);
+            g_spotlightFade = (std::max)(g_spotlightFade - speed * deltaTime, 0.0f);
+        }
+    }
 
     // --- Selection Logic ---
     if (!currentSelectedRects.empty()) {
-        g_hasSelection = true;
-        g_lastSelectionTime = GetTickCount64();
-        g_cachedSelectedRects = currentSelectedRects; // Keep them alive for the fade out
-    } else {
-        ULONGLONG timeSinceSelection = GetTickCount64() - g_lastSelectionTime;
-        if (timeSinceSelection > (ULONGLONG)g_settings.selectionTimeout) {
-            g_hasSelection = false;
+        g_cachedSelectedRects = currentSelectedRects;
+        
+        // Keep resetting the interaction timer as long as we have a selection 
+        // AND the desktop isn't fully idle yet.
+        if (!g_isIdle) {
+            g_lastSelectionTime = GetTickCount64();
         }
     }
 
-    float selFadeSpeed = (g_settings.selectionFadeDuration > 0) ? (1.0f / (g_settings.selectionFadeDuration / 1000.0f)) : 100.0f;
-    float targetSelFade;
-    if (g_hasSelection) {
-        if (g_settings.selectionFadeDuration > 0 && g_isIdle) {
-            targetSelFade = 0.0f;
+    float targetSelFade = 0.0f;
+    
+    if (!g_cachedSelectedRects.empty()) {
+        if (g_settings.selectionTimeout <= 0) {
+            // 0 = keep visible indefinitely while selected. Instantly fade if deselected.
+            targetSelFade = currentSelectedRects.empty() ? 0.0f : 1.0f;
         } else {
-            targetSelFade = 1.0f;
+            // > 0 = fade out after selectionTimeout ms of no interaction
+            ULONGLONG timeSinceInteraction = GetTickCount64() - g_lastSelectionTime;
+            if (timeSinceInteraction <= (ULONGLONG)g_settings.selectionTimeout) {
+                targetSelFade = 1.0f;
+            } else {
+                targetSelFade = 0.0f;
+            }
         }
-    } else {
-        targetSelFade = 0.0f;
     }
     
-    if (g_selectionFade < targetSelFade) g_selectionFade = (std::min)(g_selectionFade + selFadeSpeed * deltaTime, targetSelFade);
-    else if (g_selectionFade > targetSelFade) g_selectionFade = (std::max)(g_selectionFade - selFadeSpeed * deltaTime, targetSelFade);
+    if (targetSelFade > 0.5f) { // Fading IN
+        if (g_settings.selectionFadeInDuration <= 0) {
+            g_selectionFade = 1.0f;
+        } else {
+            float speed = 1.0f / (g_settings.selectionFadeInDuration / 1000.0f);
+            g_selectionFade = (std::min)(g_selectionFade + speed * deltaTime, 1.0f);
+        }
+    } else { // Fading OUT
+        if (g_settings.selectionFadeOutDuration <= 0) {
+            g_selectionFade = 0.0f;
+        } else {
+            float speed = 1.0f / (g_settings.selectionFadeOutDuration / 1000.0f);
+            g_selectionFade = (std::max)(g_selectionFade - speed * deltaTime, 0.0f);
+        }
+    }
 
-    if (!g_hasSelection && g_selectionFade <= 0.0f) {
+    if (currentSelectedRects.empty() && g_selectionFade <= 0.0f && targetSelFade < 0.5f) {
         g_cachedSelectedRects.clear();
     }
 }
 
 void RenderOverlay() {
-    if (!g_dc || !g_swapChain || !g_targetBitmap || !g_spotlightMaskBitmap || !g_selectionMaskBitmap) return;
+    if (!g_dc || !g_targetBitmap || !g_spotlightMaskBitmap || !g_selectionMaskBitmap) return;
 
     RECT rc;
     GetClientRect(g_overlayWnd, &rc);
@@ -635,7 +687,6 @@ void RenderOverlay() {
     g_dc->Clear(D2D1::ColorF(0, 0, 0, 0));
 
     if (g_selectionFade > 0.001f && !g_cachedSelectedRects.empty() && g_selectionBrush) {
-        // Selection opacity drives the alpha channel of the mask cutout
         float activeAlpha = (g_settings.selectionOpacity / 255.0f) * g_selectionFade;
         g_selectionBrush->SetColor(D2D1::ColorF(D2D1::ColorF::Black, activeAlpha));
         
@@ -667,7 +718,6 @@ void RenderOverlay() {
                          g_settings.idleOpacity / 255.0f);
     }
 
-    // Apply soft-edged masks to punch holes through the overlay
     if (g_spotlightFade > 0.001f && g_spotlightBlurEffect) {
         g_spotlightBlurEffect->SetInput(0, g_spotlightMaskBitmap.Get());
         float blurVal = (std::max)(0.1f, (std::min)((float)g_settings.spotlightBlur * g_dpiScale, 100.0f));
@@ -683,13 +733,17 @@ void RenderOverlay() {
     }
 
     g_dc->EndDraw();
-    g_swapChain->Present(1, 0); 
 }
 
 void RenderLoop() {
     LARGE_INTEGER freq, lastTime, currentTime;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&lastTime);
+
+    // State memory for Idle GPU Frame Skipping
+    float s_lastRenderedSpotFade = -1.0f;
+    float s_lastRenderedSelFade = -1.0f;
+    D2D1_POINT_2F s_lastRenderedMousePos = {-1.0f, -1.0f};
 
     while (!g_threadStop) {
         QueryPerformanceCounter(&currentTime);
@@ -698,13 +752,40 @@ void RenderLoop() {
 
         if (deltaTime > 0.1f) deltaTime = 0.1f; 
 
-        UpdateMouseAndAnimations(deltaTime);
+        bool frameRendered = false;
+        ComPtr<IDXGISwapChain1> currentSwapChain;
 
         {
+            // Lock mutex ONLY for state update and drawing instructions
             std::lock_guard<std::mutex> lock(g_renderMutex);
             if (g_overlayWnd && !g_unloading) {
-                RenderOverlay();
+                UpdateMouseAndAnimations(deltaTime);
+
+                // Idle skip condition: Did anything visual change?
+                bool stateChanged = (std::abs(g_spotlightFade - s_lastRenderedSpotFade) > 0.001f) ||
+                                    (std::abs(g_selectionFade - s_lastRenderedSelFade) > 0.001f) ||
+                                    (std::abs(g_smoothedMousePos.x - s_lastRenderedMousePos.x) > 0.1f) ||
+                                    (std::abs(g_smoothedMousePos.y - s_lastRenderedMousePos.y) > 0.1f) ||
+                                    g_forceRender;
+
+                if (stateChanged && g_swapChain && g_targetBitmap) {
+                    RenderOverlay();
+                    
+                    s_lastRenderedSpotFade = g_spotlightFade;
+                    s_lastRenderedSelFade = g_selectionFade;
+                    s_lastRenderedMousePos = g_smoothedMousePos;
+                    g_forceRender = false;
+                    
+                    currentSwapChain = g_swapChain; // hold ref safely for Present
+                    frameRendered = true;
+                }
             }
+        } // <--- MUTEX IS RELEASED HERE. Settings updates can instantly lock now!
+
+        if (frameRendered && currentSwapChain) {
+            currentSwapChain->Present(1, 0); // VSync block happens safely outside lock
+        } else {
+            Sleep(16); // 0% GPU / CPU Usage while idle
         }
     }
 }
@@ -714,6 +795,9 @@ void RenderLoop() {
 
 LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
+        case WM_NCHITTEST:
+            return HTTRANSPARENT;
+
         case WM_TIMER:
             if (!g_unloading && wParam == TIMER_ID_STATE_POLL) {
                 PollDesktopState();
@@ -741,7 +825,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPar
             }
             
             g_overlayWnd = nullptr;
-            if (!g_unloading && g_messageWnd) {
+            if (!g_unloading && g_messageWnd && !g_isRecreating) {
                 SetTimer(g_messageWnd, TIMER_ID_RECREATE_OVERLAY, 200, nullptr);
             }
             return 0;
@@ -751,12 +835,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPar
             return 0;
 
         case WM_APP_SETTINGS_CHANGED: {
-            std::lock_guard<std::mutex> lock(g_renderMutex);
             LoadSettings();
-            ReleaseSwapChainResources();
-            RECT rc;
-            GetClientRect(hWnd, &rc);
-            CreateSwapChainResources(rc.right - rc.left, rc.bottom - rc.top);
             return 0;
         }
     }
@@ -768,8 +847,10 @@ LRESULT CALLBACK MessageWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPar
         case WM_TIMER:
             if (!g_unloading && wParam == TIMER_ID_RECREATE_OVERLAY) {
                 KillTimer(hWnd, TIMER_ID_RECREATE_OVERLAY);
+                g_isRecreating = true;
                 if (g_overlayWnd) { DestroyWindow(g_overlayWnd); }
                 CreateOverlayWindow();
+                g_isRecreating = false;
             }
             return 0;
 
@@ -819,6 +900,14 @@ void CreateOverlayWindow() {
     if (!g_initialized) {
         if (!InitDirectX()) return;
         g_initialized = true;
+    } else {
+        HRESULT hr = g_d3dDevice ? g_d3dDevice->GetDeviceRemovedReason() : E_FAIL;
+        if (FAILED(hr)) {
+            UninitDirectX();
+            g_initialized = false;
+            if (!InitDirectX()) return;
+            g_initialized = true;
+        }
     }
 
     HWND hParent = GetDesktopParent();
@@ -833,7 +922,7 @@ void CreateOverlayWindow() {
 
     g_overlayWnd = CreateWindowEx(
         WS_EX_NOREDIRECTIONBITMAP | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
-        OVERLAY_WINDOW_CLASS, nullptr, WS_CHILD | WS_VISIBLE | WS_DISABLED, 0, 0, width,
+        OVERLAY_WINDOW_CLASS, nullptr, WS_CHILD | WS_VISIBLE, 0, 0, width,
         height, hParent, nullptr, GetCurrentModuleHandle(), nullptr);
 
     if (!g_overlayWnd) return;
@@ -848,6 +937,7 @@ void CreateOverlayWindow() {
             g_spotlightFade = 0.0f;
             g_selectionFade = 0.0f;
             g_hasSelection = false;
+            g_forceRender = true;
             
             POINT pt; GetCursorPos(&pt);
             ScreenToClient(g_overlayWnd, &pt);
@@ -856,7 +946,14 @@ void CreateOverlayWindow() {
             g_threadStop = false;
             g_renderThread = std::thread(RenderLoop);
             
-            SetTimer(g_overlayWnd, TIMER_ID_STATE_POLL, 50, nullptr); // Dropped to 50ms to guarantee zero UI interference
+            // Reduced polling from 16ms to 50ms (20fps) to save Explorer UI thread CPU
+            SetTimer(g_overlayWnd, TIMER_ID_STATE_POLL, 50, nullptr); 
+        } else {
+            DestroyWindow(g_overlayWnd);
+            g_overlayWnd = nullptr;
+            if (g_messageWnd) {
+                SetTimer(g_messageWnd, TIMER_ID_RECREATE_OVERLAY, 2000, nullptr);
+            }
         }
     }
 }
@@ -889,8 +986,7 @@ HWND WINAPI CreateWindowExW_Hook(DWORD dwExStyle, LPCWSTR lpClassName, LPCWSTR l
     HWND hWnd = CreateWindowExW_Original(dwExStyle, lpClassName, lpWindowName, dwStyle, X, Y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam);
     if (!hWnd || !IsFolderViewWnd(hWnd)) return hWnd;
 
-    static UINT_PTR s_timer = 0;
-    s_timer = SetTimer(nullptr, s_timer, 1000, [](HWND, UINT, UINT_PTR idEvent, DWORD) {
+    SetTimer(nullptr, 0, 1000, [](HWND, UINT, UINT_PTR idEvent, DWORD) {
         KillTimer(nullptr, idEvent);
         CreateOverlayWindow();
         CreateMessageWindow();
@@ -899,33 +995,57 @@ HWND WINAPI CreateWindowExW_Hook(DWORD dwExStyle, LPCWSTR lpClassName, LPCWSTR l
     return hWnd;
 }
 
+bool g_initialized_desktop = false;
+DWORD g_desktopThreadId = 0;
+using DispatchMessageW_t = decltype(&DispatchMessageW);
+DispatchMessageW_t DispatchMessageW_Original;
+
+LRESULT WINAPI DispatchMessageW_Hook(const MSG* lpMsg) {
+    if (!g_initialized_desktop && g_desktopThreadId != 0 && GetCurrentThreadId() == g_desktopThreadId) {
+        g_initialized_desktop = true;
+        CreateOverlayWindow();
+        CreateMessageWindow();
+    }
+    return DispatchMessageW_Original(lpMsg);
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Mod lifecycle
 
+// Thread-safe settings load. Reads from Windhawk unlocked, locks briefly just to assign.
 void LoadSettings() {
-    g_settings.idleOpacity = std::clamp(Wh_GetIntSetting(L"idleOpacity"), 0, 255);
-    g_settings.spotlightRadius = std::max(Wh_GetIntSetting(L"spotlightRadius"), 10);
-    g_settings.spotlightRoundness = std::clamp(Wh_GetIntSetting(L"spotlightRoundness"), 0, 100);
-    g_settings.spotlightBlur = std::max(Wh_GetIntSetting(L"spotlightBlur"), 0);
-    g_settings.idleDelay = std::max(Wh_GetIntSetting(L"idleDelay"), 0);
-    g_settings.spotlightFadeDuration = std::max(Wh_GetIntSetting(L"spotlightFadeDuration"), 0);
-    g_settings.mouseSmoothing = std::clamp(Wh_GetIntSetting(L"mouseSmoothing"), 0, 20);
+    Settings newSettings;
+    newSettings.idleOpacity = std::clamp(Wh_GetIntSetting(L"idleOpacity"), 0, 255);
+    newSettings.spotlightRadius = std::max(Wh_GetIntSetting(L"spotlightRadius"), 10);
+    newSettings.spotlightRoundness = std::clamp(Wh_GetIntSetting(L"spotlightRoundness"), 0, 100);
+    newSettings.spotlightBlur = std::max(Wh_GetIntSetting(L"spotlightBlur"), 0);
+    newSettings.idleDelay = std::max(Wh_GetIntSetting(L"idleDelay"), 0);
+    newSettings.spotlightFadeInDuration = std::max(Wh_GetIntSetting(L"spotlightFadeInDuration"), 0);
+    newSettings.spotlightFadeOutDuration = std::max(Wh_GetIntSetting(L"spotlightFadeOutDuration"), 0);
+    newSettings.mouseSmoothing = std::clamp(Wh_GetIntSetting(L"mouseSmoothing"), 0, 20);
     
-    g_settings.selectionOpacity = std::clamp(Wh_GetIntSetting(L"selectionOpacity"), 0, 255);
-    g_settings.selectionPadding = std::max(Wh_GetIntSetting(L"selectionPadding"), 0);
-    g_settings.selectionRoundness = std::clamp(Wh_GetIntSetting(L"selectionRoundness"), 0, 100);
-    g_settings.selectionBlur = std::max(Wh_GetIntSetting(L"selectionBlur"), 0);
-    g_settings.selectionTimeout = std::max(Wh_GetIntSetting(L"selectionTimeout"), 0);
-    g_settings.selectionFadeDuration = std::max(Wh_GetIntSetting(L"selectionFadeDuration"), 0);
+    newSettings.selectionOpacity = std::clamp(Wh_GetIntSetting(L"selectionOpacity"), 0, 255);
+    newSettings.selectionPadding = std::max(Wh_GetIntSetting(L"selectionPadding"), 0);
+    newSettings.selectionRoundness = std::clamp(Wh_GetIntSetting(L"selectionRoundness"), 0, 100);
+    newSettings.selectionBlur = std::max(Wh_GetIntSetting(L"selectionBlur"), 0);
+    newSettings.selectionTimeout = std::max(Wh_GetIntSetting(L"selectionTimeout"), 0);
+    newSettings.selectionFadeInDuration = std::max(Wh_GetIntSetting(L"selectionFadeInDuration"), 0);
+    newSettings.selectionFadeOutDuration = std::max(Wh_GetIntSetting(L"selectionFadeOutDuration"), 0);
+
+    std::lock_guard<std::mutex> lock(g_renderMutex);
+    g_settings = newSettings;
+    g_forceRender = true;
 }
 
 BOOL Wh_ModInit() {
     LoadSettings();
     Wh_SetFunctionHook((void*)CreateWindowExW, (void*)CreateWindowExW_Hook, (void**)&CreateWindowExW_Original);
+    Wh_SetFunctionHook((void*)DispatchMessageW, (void*)DispatchMessageW_Hook, (void**)&DispatchMessageW_Original);
 
-    if (GetDesktopListView()) {
-        CreateOverlayWindow();
-        CreateMessageWindow();
+    HWND hLV = GetDesktopListView();
+    if (hLV) {
+        g_desktopThreadId = GetWindowThreadProcessId(hLV, nullptr);
+        PostMessage(hLV, WM_NULL, 0, 0); // Wake up the thread
     }
     return TRUE;
 }
@@ -938,7 +1058,7 @@ void Wh_ModUninit() {
 }
 
 BOOL Wh_ModSettingsChanged(BOOL* bReload) {
-    if (g_overlayWnd) SendMessage(g_overlayWnd, WM_APP_SETTINGS_CHANGED, 0, 0);
+    if (g_overlayWnd) PostMessage(g_overlayWnd, WM_APP_SETTINGS_CHANGED, 0, 0);
     *bReload = FALSE;
     return TRUE;
 }
