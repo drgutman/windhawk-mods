@@ -8,7 +8,7 @@
 // @homepage        https://instagram.com/drgutman
 // @include         explorer.exe
 // @architecture    x86-64
-// @compilerOptions -lcomctl32 -ldxgi -ld2d1 -ldwrite -ld3d11 -ldcomp -ldwmapi -lgdi32 -lwininet -lpdh -lpowrprof -lshcore -lshlwapi
+// @compilerOptions -lcomctl32 -ldxgi -ld2d1 -ld3d11 -ldcomp -lgdi32 -lshcore
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -23,12 +23,15 @@ As the cursor leaves the desktop or remains idle, the spotlight fades and icons
 gradually become transparent again. Selected icons remain opaque with their own 
 customizable independent timeouts, blurs, and fade durations.
 
+**Note:** This mod captures the static Windows wallpaper for performance reasons. 
+It does not currently support live/animated wallpapers (e.g., Wallpaper Engine, Lively).
+
 ## Features
 
 * Dedicated render thread for flawless, vsync-matched 60/144+ FPS performance.
+* 0% background GPU/CPU usage when the desktop is idle.
 * Independent Dual-GPU Blur processing for both the cursor spotlight and selected icons.
 * Interactive morphing shapes (square to circle) for both the spotlight and selected areas.
-* Persistent selection memory allows deselected icons to gracefully fade away.
 * Click-through architecture using WS_EX_TRANSPARENT ensures no interference with native OS interaction.
 */
 // ==/WindhawkModReadme==
@@ -90,8 +93,6 @@ customizable independent timeouts, blurs, and fade durations.
 #include <d2d1helper.h>
 #include <d3d11.h>
 #include <dcomp.h>
-#include <dwmapi.h>
-#include <dwrite.h>
 #include <dxgi1_3.h>
 #include <shellscalingapi.h>
 #include <windhawk_api.h>
@@ -111,7 +112,6 @@ using Microsoft::WRL::ComPtr;
 #define TIMER_ID_STATE_POLL 2
 
 #define WM_APP_CLEANUP (WM_APP + 1)
-#define WM_APP_SETTINGS_CHANGED (WM_APP + 2)
 #define OVERLAY_WINDOW_CLASS (L"TransparentDesktopSpotlight_" WH_MOD_ID)
 #define MESSAGE_WINDOW_CLASS L"TransparentDesktopSpotlight_Message_" WH_MOD_ID
 
@@ -152,10 +152,10 @@ std::atomic<bool> g_unloading{false};
 bool g_isRecreating = false;
 
 // Background Render Thread
-std::thread g_renderThread;
+std::thread* g_renderThread = nullptr; // Heap pointer to prevent process termination on explorer unload
 std::atomic<bool> g_threadStop{false};
 std::mutex g_renderMutex;
-std::atomic<bool> g_forceRender{true}; // Force a frame render when settings change
+std::atomic<bool> g_forceRender{true};
 
 // DirectX pipeline resources
 ComPtr<ID3D11Device> g_d3dDevice;
@@ -187,10 +187,9 @@ bool g_isIdle = true;
 ULONGLONG g_lastMouseTime = 0;
 float g_spotlightFade = 0.0f; 
 
-bool g_hasSelection = false;
 ULONGLONG g_lastSelectionTime = 0;
 float g_selectionFade = 0.0f;
-std::vector<RECT> g_cachedSelectedRects; // Kept alive for fade-out
+std::vector<RECT> g_cachedSelectedRects;
 
 // UI Thread State polling
 std::mutex g_stateMutex;
@@ -402,7 +401,7 @@ void CaptureWallpaperBitmap() {
     PaintDesktop(hdcMem);
     GdiFlush();
 
-    // MAJOR OPTIMIZATION: D2D1_ALPHA_MODE_IGNORE eliminates the need to manually loop millions of pixels to set alpha to 255.
+    // D2D1_ALPHA_MODE_IGNORE naturally treats the 32-bit GDI bitmap as fully opaque
     D2D1_BITMAP_PROPERTIES bitmapProps = D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
     g_dc->CreateBitmap(D2D1::SizeU(w, h), pvBits, w * 4, bitmapProps, &g_wallpaperBitmap);
 
@@ -541,7 +540,6 @@ void UpdateMouseAndAnimations(float deltaTime) {
     POINT screenPos;
     GetCursorPos(&screenPos);
 
-    // Get the window at cursor instantly on the fast render thread!
     HWND hWndAtCursor = WindowFromPoint(screenPos);
 
     static POINT s_lastScreenPos = {0, 0};
@@ -551,7 +549,6 @@ void UpdateMouseAndAnimations(float deltaTime) {
     POINT localPos = screenPos;
     ScreenToClient(g_overlayWnd, &localPos);
 
-    // Delta-time based mouse smoothing
     float lerpFactor = 1.0f;
     if (g_settings.mouseSmoothing > 0) {
         float speed = 30.0f - g_settings.mouseSmoothing; 
@@ -564,7 +561,6 @@ void UpdateMouseAndAnimations(float deltaTime) {
         std::lock_guard<std::mutex> lock(g_stateMutex);
         currentSelectedRects = g_selectedRects;
         
-        // Compare against the cached desktop handles
         overDesktop = (hWndAtCursor == g_cachedHwndLV || 
                        hWndAtCursor == g_cachedHwndShellView || 
                        hWndAtCursor == g_cachedHwndDesktopHost || 
@@ -612,9 +608,6 @@ void UpdateMouseAndAnimations(float deltaTime) {
     // --- Selection Logic ---
     if (!currentSelectedRects.empty()) {
         g_cachedSelectedRects = currentSelectedRects;
-        
-        // Keep resetting the interaction timer as long as we have a selection 
-        // AND the desktop isn't fully idle yet.
         if (!g_isIdle) {
             g_lastSelectionTime = GetTickCount64();
         }
@@ -624,10 +617,8 @@ void UpdateMouseAndAnimations(float deltaTime) {
     
     if (!g_cachedSelectedRects.empty()) {
         if (g_settings.selectionTimeout <= 0) {
-            // 0 = keep visible indefinitely while selected. Instantly fade if deselected.
             targetSelFade = currentSelectedRects.empty() ? 0.0f : 1.0f;
         } else {
-            // > 0 = fade out after selectionTimeout ms of no interaction
             ULONGLONG timeSinceInteraction = GetTickCount64() - g_lastSelectionTime;
             if (timeSinceInteraction <= (ULONGLONG)g_settings.selectionTimeout) {
                 targetSelFade = 1.0f;
@@ -761,16 +752,17 @@ void RenderLoop() {
         ComPtr<IDXGISwapChain1> currentSwapChain;
 
         {
-            // Lock mutex ONLY for state update and drawing instructions
             std::lock_guard<std::mutex> lock(g_renderMutex);
             if (g_overlayWnd && !g_unloading) {
                 UpdateMouseAndAnimations(deltaTime);
 
-                // Idle skip condition: Did anything visual change?
+                // Idle skip condition: Only render if opacities are shifting, 
+                // OR if mouse is moving while the spotlight is actually visible
                 bool stateChanged = (std::abs(g_spotlightFade - s_lastRenderedSpotFade) > 0.001f) ||
                                     (std::abs(g_selectionFade - s_lastRenderedSelFade) > 0.001f) ||
-                                    (std::abs(g_smoothedMousePos.x - s_lastRenderedMousePos.x) > 0.1f) ||
-                                    (std::abs(g_smoothedMousePos.y - s_lastRenderedMousePos.y) > 0.1f) ||
+                                    ((std::abs(g_smoothedMousePos.x - s_lastRenderedMousePos.x) > 0.1f ||
+                                      std::abs(g_smoothedMousePos.y - s_lastRenderedMousePos.y) > 0.1f) &&
+                                     (g_spotlightFade > 0.001f || !g_isIdle)) ||
                                     g_forceRender;
 
                 if (stateChanged && g_swapChain && g_targetBitmap) {
@@ -785,12 +777,12 @@ void RenderLoop() {
                     frameRendered = true;
                 }
             }
-        } // <--- MUTEX IS RELEASED HERE. Settings updates can instantly lock now!
+        } 
 
         if (frameRendered && currentSwapChain) {
-            currentSwapChain->Present(1, 0); // VSync block happens safely outside lock
+            currentSwapChain->Present(1, 0); 
         } else {
-            Sleep(16); // 0% GPU / CPU Usage while idle
+            Sleep(16); // 0% GPU / CPU Usage while completely idle
         }
     }
 }
@@ -820,8 +812,12 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPar
         }
         case WM_DESTROY:
             g_threadStop = true;
-            if (g_renderThread.joinable()) {
-                g_renderThread.join();
+            if (g_renderThread) {
+                if (g_renderThread->joinable()) {
+                    g_renderThread->join();
+                }
+                delete g_renderThread;
+                g_renderThread = nullptr;
             }
             
             {
@@ -838,11 +834,6 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPar
         case WM_APP_CLEANUP:
             DestroyWindow(hWnd);
             return 0;
-
-        case WM_APP_SETTINGS_CHANGED: {
-            LoadSettings();
-            return 0;
-        }
     }
     return DefWindowProc(hWnd, uMsg, wParam, lParam);
 }
@@ -889,14 +880,12 @@ LRESULT CALLBACK MessageWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPar
 // Setup
 
 bool RegisterOverlayWindowClass() {
-    static bool registered = false;
-    if (registered) return true;
     WNDCLASS wc = {};
+    if (GetClassInfo(GetCurrentModuleHandle(), OVERLAY_WINDOW_CLASS, &wc)) return true;
     wc.lpfnWndProc = OverlayWndProc;
     wc.hInstance = GetCurrentModuleHandle();
     wc.lpszClassName = OVERLAY_WINDOW_CLASS;
-    registered = RegisterClass(&wc) != 0;
-    return registered;
+    return RegisterClass(&wc) != 0;
 }
 
 void CreateOverlayWindow() {
@@ -941,17 +930,18 @@ void CreateOverlayWindow() {
             g_lastMouseTime = GetTickCount64();
             g_spotlightFade = 0.0f;
             g_selectionFade = 0.0f;
-            g_hasSelection = false;
             g_forceRender = true;
             
             POINT pt; GetCursorPos(&pt);
             ScreenToClient(g_overlayWnd, &pt);
             g_smoothedMousePos = { (float)pt.x, (float)pt.y };
             
+            // Poll once instantly so the background thread has correct window handles on frame 1
+            PollDesktopState();
+
             g_threadStop = false;
-            g_renderThread = std::thread(RenderLoop);
+            g_renderThread = new std::thread(RenderLoop);
             
-            // Reduced polling from 16ms to 50ms (20fps) to save Explorer UI thread CPU
             SetTimer(g_overlayWnd, TIMER_ID_STATE_POLL, 50, nullptr); 
         } else {
             DestroyWindow(g_overlayWnd);
@@ -964,14 +954,12 @@ void CreateOverlayWindow() {
 }
 
 bool RegisterMessageWindowClass() {
-    static bool registered = false;
-    if (registered) return true;
     WNDCLASS wc = {};
+    if (GetClassInfo(GetCurrentModuleHandle(), MESSAGE_WINDOW_CLASS, &wc)) return true;
     wc.lpfnWndProc = MessageWndProc;
     wc.hInstance = GetCurrentModuleHandle();
     wc.lpszClassName = MESSAGE_WINDOW_CLASS;
-    registered = RegisterClass(&wc) != 0;
-    return registered;
+    return RegisterClass(&wc) != 0;
 }
 
 void CreateMessageWindow() {
@@ -991,11 +979,8 @@ HWND WINAPI CreateWindowExW_Hook(DWORD dwExStyle, LPCWSTR lpClassName, LPCWSTR l
     HWND hWnd = CreateWindowExW_Original(dwExStyle, lpClassName, lpWindowName, dwStyle, X, Y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam);
     if (!hWnd || !IsFolderViewWnd(hWnd)) return hWnd;
 
-    SetTimer(nullptr, 0, 1000, [](HWND, UINT, UINT_PTR idEvent, DWORD) {
-        KillTimer(nullptr, idEvent);
-        CreateOverlayWindow();
-        CreateMessageWindow();
-    });
+    // Use a standard window timer instead of a callback lambda to avoid use-after-free crashes
+    SetTimer(hWnd, 0x1337, 1000, nullptr);
 
     return hWnd;
 }
@@ -1011,13 +996,20 @@ LRESULT WINAPI DispatchMessageW_Hook(const MSG* lpMsg) {
         CreateOverlayWindow();
         CreateMessageWindow();
     }
+    
+    // Catch the safe bootstrap timer
+    if (lpMsg->message == WM_TIMER && lpMsg->wParam == 0x1337 && IsFolderViewWnd(lpMsg->hwnd)) {
+        KillTimer(lpMsg->hwnd, 0x1337);
+        CreateOverlayWindow();
+        CreateMessageWindow();
+    }
+
     return DispatchMessageW_Original(lpMsg);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 // Mod lifecycle
 
-// Thread-safe settings load. Reads from Windhawk unlocked, locks briefly just to assign.
 void LoadSettings() {
     Settings newSettings;
     newSettings.idleOpacity = std::clamp(Wh_GetIntSetting(L"idleOpacity"), 0, 255);
@@ -1044,8 +1036,8 @@ void LoadSettings() {
 
 BOOL Wh_ModInit() {
     LoadSettings();
-    Wh_SetFunctionHook((void*)CreateWindowExW, (void*)CreateWindowExW_Hook, (void**)&CreateWindowExW_Original);
-    Wh_SetFunctionHook((void*)DispatchMessageW, (void*)DispatchMessageW_Hook, (void**)&DispatchMessageW_Original);
+    WindhawkUtils::SetFunctionHook(CreateWindowExW, CreateWindowExW_Hook, &CreateWindowExW_Original);
+    WindhawkUtils::SetFunctionHook(DispatchMessageW, DispatchMessageW_Hook, &DispatchMessageW_Original);
 
     HWND hLV = GetDesktopListView();
     if (hLV) {
@@ -1060,10 +1052,11 @@ void Wh_ModUninit() {
     if (g_overlayWnd) SendMessage(g_overlayWnd, WM_APP_CLEANUP, 0, 0);
     if (g_messageWnd) SendMessage(g_messageWnd, WM_APP_CLEANUP, 0, 0);
     UninitDirectX();
+    
+    UnregisterClass(OVERLAY_WINDOW_CLASS, GetCurrentModuleHandle());
+    UnregisterClass(MESSAGE_WINDOW_CLASS, GetCurrentModuleHandle());
 }
 
-BOOL Wh_ModSettingsChanged(BOOL* bReload) {
-    if (g_overlayWnd) PostMessage(g_overlayWnd, WM_APP_SETTINGS_CHANGED, 0, 0);
-    *bReload = FALSE;
-    return TRUE;
+void Wh_ModSettingsChanged() {
+    LoadSettings();
 }
