@@ -194,7 +194,9 @@ std::vector<RECT> g_cachedSelectedRects; // Kept alive for fade-out
 
 // UI Thread State polling
 std::mutex g_stateMutex;
-bool g_isMouseOverDesktop = false;
+HWND g_cachedHwndLV = nullptr;
+HWND g_cachedHwndShellView = nullptr;
+HWND g_cachedHwndDesktopHost = nullptr;
 std::vector<RECT> g_selectedRects;
 
 // DPI scaling factor
@@ -303,13 +305,6 @@ void PollDesktopState() {
         }
     }
 
-    POINT pt;
-    GetCursorPos(&pt);
-    HWND hWndAtCursor = WindowFromPoint(pt);
-
-    bool overDesktop = (hWndAtCursor == s_hwndLV || hWndAtCursor == s_hwndShellView || 
-                        hWndAtCursor == s_hwndDesktopHost || hWndAtCursor == g_overlayWnd);
-
     std::vector<RECT> selected;
     if (s_hwndLV) {
         int idx = -1;
@@ -327,7 +322,9 @@ void PollDesktopState() {
     }
 
     std::lock_guard<std::mutex> lock(g_stateMutex);
-    g_isMouseOverDesktop = overDesktop;
+    g_cachedHwndLV = s_hwndLV;
+    g_cachedHwndShellView = s_hwndShellView;
+    g_cachedHwndDesktopHost = s_hwndDesktopHost;
     g_selectedRects = std::move(selected);
 }
 
@@ -544,6 +541,9 @@ void UpdateMouseAndAnimations(float deltaTime) {
     POINT screenPos;
     GetCursorPos(&screenPos);
 
+    // Get the window at cursor instantly on the fast render thread!
+    HWND hWndAtCursor = WindowFromPoint(screenPos);
+
     static POINT s_lastScreenPos = {0, 0};
     bool mouseMoved = (screenPos.x != s_lastScreenPos.x || screenPos.y != s_lastScreenPos.y);
     s_lastScreenPos = screenPos;
@@ -562,8 +562,13 @@ void UpdateMouseAndAnimations(float deltaTime) {
     std::vector<RECT> currentSelectedRects;
     {
         std::lock_guard<std::mutex> lock(g_stateMutex);
-        overDesktop = g_isMouseOverDesktop;
         currentSelectedRects = g_selectedRects;
+        
+        // Compare against the cached desktop handles
+        overDesktop = (hWndAtCursor == g_cachedHwndLV || 
+                       hWndAtCursor == g_cachedHwndShellView || 
+                       hWndAtCursor == g_cachedHwndDesktopHost || 
+                       hWndAtCursor == g_overlayWnd);
     }
 
     // --- Spotlight Logic ---
