@@ -886,7 +886,6 @@ LRESULT CALLBACK MessageWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPar
 
 bool RegisterOverlayWindowClass() {
     WNDCLASS wc = {};
-    if (GetClassInfo(GetCurrentModuleHandle(), OVERLAY_WINDOW_CLASS, &wc)) return true;
     wc.lpfnWndProc = OverlayWndProc;
     wc.hInstance = GetCurrentModuleHandle();
     wc.lpszClassName = OVERLAY_WINDOW_CLASS;
@@ -960,7 +959,6 @@ void CreateOverlayWindow() {
 
 bool RegisterMessageWindowClass() {
     WNDCLASS wc = {};
-    if (GetClassInfo(GetCurrentModuleHandle(), MESSAGE_WINDOW_CLASS, &wc)) return true;
     wc.lpfnWndProc = MessageWndProc;
     wc.hInstance = GetCurrentModuleHandle();
     wc.lpszClassName = MESSAGE_WINDOW_CLASS;
