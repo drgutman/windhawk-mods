@@ -327,28 +327,25 @@ void PollDesktopState() {
         }
     }
 
-    std::vector<RECT> selected;
+    static std::vector<RECT> s_selected;
+    s_selected.clear();
+
     if (s_hwndLV) {
-        int idx = -1;
-        while ((idx = (int)SendMessage(s_hwndLV, LVM_GETNEXTITEM, idx, LVNI_SELECTED)) != -1) {
-            RECT rcBounds = {};
-            rcBounds.left = LVIR_BOUNDS;
-            if (SendMessage(s_hwndLV, LVM_GETITEMRECT, idx, (LPARAM)&rcBounds)) {
-                POINT ptTL = { rcBounds.left, rcBounds.top };
-                POINT ptBR = { rcBounds.right, rcBounds.bottom };
-                MapWindowPoints(s_hwndLV, g_overlayWnd, &ptTL, 1);
-                MapWindowPoints(s_hwndLV, g_overlayWnd, &ptBR, 1);
-                selected.push_back({ptTL.x, ptTL.y, ptBR.x, ptBR.y});
+        int selectedCount = (int)SendMessage(s_hwndLV, LVM_GETSELECTEDCOUNT, 0, 0);
+        if (selectedCount > 0) {
+            int idx = -1;
+            while ((idx = (int)SendMessage(s_hwndLV, LVM_GETNEXTITEM, idx, LVNI_SELECTED)) != -1) {
+                RECT rcBounds = {};
+                rcBounds.left = LVIR_BOUNDS;
+                if (SendMessage(s_hwndLV, LVM_GETITEMRECT, idx, (LPARAM)&rcBounds)) {
+                    POINT ptTL = { rcBounds.left, rcBounds.top };
+                    POINT ptBR = { rcBounds.right, rcBounds.bottom };
+                    MapWindowPoints(s_hwndLV, g_overlayWnd, &ptTL, 1);
+                    MapWindowPoints(s_hwndLV, g_overlayWnd, &ptBR, 1);
+                    s_selected.push_back({ptTL.x, ptTL.y, ptBR.x, ptBR.y});
+                }
             }
         }
-    }
-
-    WCHAR currentWallpaper[MAX_PATH] = {};
-    SystemParametersInfoW(SPI_GETDESKWALLPAPER, MAX_PATH, currentWallpaper, 0);
-    if (wcscmp(currentWallpaper, g_lastKnownWallpaperPath) != 0) {
-        std::lock_guard<std::mutex> lock(g_renderMutex);
-        CaptureWallpaperBitmap();
-        g_forceRender = true;
     }
 
     // Wake render thread if things are happening
@@ -362,11 +359,11 @@ void PollDesktopState() {
     // g_selectedRects is only written from this (UI) thread below, and the
     // render thread only reads it under g_stateMutex. The comparison here is
     // safe without a lock because it runs on the same thread as the writer.
-    bool selectionChanged = (selected.size() != g_selectedRects.size());
+    bool selectionChanged = (s_selected.size() != g_selectedRects.size());
     if (!selectionChanged) {
-        for (size_t i = 0; i < selected.size(); ++i) {
-            if (selected[i].left != g_selectedRects[i].left || selected[i].right != g_selectedRects[i].right ||
-                selected[i].top != g_selectedRects[i].top || selected[i].bottom != g_selectedRects[i].bottom) {
+        for (size_t i = 0; i < s_selected.size(); ++i) {
+            if (s_selected[i].left != g_selectedRects[i].left || s_selected[i].right != g_selectedRects[i].right ||
+                s_selected[i].top != g_selectedRects[i].top || s_selected[i].bottom != g_selectedRects[i].bottom) {
                 selectionChanged = true; break;
             }
         }
@@ -381,7 +378,7 @@ void PollDesktopState() {
     g_cachedHwndLV = s_hwndLV;
     g_cachedHwndShellView = s_hwndShellView;
     g_cachedHwndDesktopHost = s_hwndDesktopHost;
-    g_selectedRects = std::move(selected);
+    g_selectedRects = s_selected;
     g_isEditing = isEditing;
 }
 
@@ -518,7 +515,6 @@ void CaptureWallpaperBitmap() {
     DeleteDC(hdcMem);
     ReleaseDC(nullptr, hdcScreen);
 
-    SystemParametersInfoW(SPI_GETDESKWALLPAPER, MAX_PATH, g_lastKnownWallpaperPath, 0);
 }
 
 void RecreateBrushesAndMask(UINT width, UINT height) {
