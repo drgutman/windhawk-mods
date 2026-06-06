@@ -271,8 +271,6 @@ std::atomic<int> g_initAttempts{0};
 std::atomic<ULONGLONG> g_lastInitFailure{0};
 
 // Cold-start retry tracking
-std::atomic<int>       g_initAttempts{0};
-std::atomic<ULONGLONG> g_lastInitFailure{0};
 
 //
 
