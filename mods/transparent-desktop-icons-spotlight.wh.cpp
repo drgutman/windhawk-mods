@@ -261,6 +261,14 @@ float g_dpiScale = 1.0f;
 // Initialization state
 std::atomic<bool> g_initialized_desktop{false};
 std::atomic<bool> g_initialized{false};
+WCHAR g_lastKnownWallpaperPath[MAX_PATH] = {};
+
+// Cold-start retry tracking. g_initAttempts counts consecutive failed WM_APP_INIT
+// handling; g_lastInitFailure records the GetTickCount64 of the most recent failure.
+// On success both reset. Used to switch to a longer (5s) backoff after a few quick
+// attempts so we don't peg a timer forever on a permanently broken environment.
+std::atomic<int> g_initAttempts{0};
+std::atomic<ULONGLONG> g_lastInitFailure{0};
 
 // Cold-start retry tracking
 std::atomic<int>       g_initAttempts{0};
