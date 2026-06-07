@@ -111,26 +111,6 @@ customizable independent timeouts, blurs, and fade durations.
 #include <knownfolders.h>
 #include <string>
 
-////////////////////////////////////////////////////////////////////////////////
-// Debug logging to console
-
-// void DebugLog(const wchar_t* format, ...) {
-//     static bool consoleAttached = false;
-//     if (!consoleAttached) {
-//         AllocConsole();
-//         FILE* fDummy;
-//         freopen_s(&fDummy, "CONOUT$", "w", stdout);
-//         freopen_s(&fDummy, "CONOUT$", "w", stderr);
-//         consoleAttached = true;
-//     }
-//     va_list args;
-//     va_start(args, format);
-//     vwprintf(format, args);
-//     va_end(args);
-//     wprintf(L"\n");
-//     fflush(stdout);
-// }
-
 using namespace std::literals;
 using Microsoft::WRL::ComPtr;
 
@@ -146,7 +126,6 @@ using Microsoft::WRL::ComPtr;
 
 UINT WM_APP_CLEANUP = 0;
 UINT WM_APP_DEVICE_LOST = 0;
-UINT WM_APP_INIT = 0;
 UINT WM_APP_TRIGGER_REFRESH = 0;
 UINT WM_APP_SELECTION_UPDATE = 0;
 
@@ -511,7 +490,6 @@ bool LoadWallpaperBitmap(const std::wstring& path, ComPtr<ID2D1Bitmap>& outBitma
     // We use GENERIC_READ. If Windows is actively saving the file, this will fail with ERROR_SHARING_VIOLATION.
     HRESULT hr = g_wicFactory->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &decoder);
     if (FAILED(hr)) {
-        //Wh_Log(L"LoadWallpaperBitmap: CreateDecoderFromFilename FAILED. hr=0x%08X, Path=%ls", hr, path.c_str());
         return false;
     }
 
@@ -550,7 +528,6 @@ void RefreshWallpaperAndStyle() {
     // Do not add call sites from the render thread or any non-UI thread.
     HRESULT hrCom = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
-    //Wh_Log(L"--- RefreshWallpaperAndStyle Triggered ---");
 
     DWORD bgType = 0; 
     HKEY hKey;
@@ -559,17 +536,14 @@ void RefreshWallpaperAndStyle() {
         RegQueryValueExW(hKey, L"BackgroundType", nullptr, nullptr, (LPBYTE)&bgType, &size);
         RegCloseKey(hKey);
     }
-    //Wh_Log(L"Refresh: BackgroundType = %lu", bgType);
 
     // 1. Force a direct color read (bypasses COM cache)
     D2D1_COLOR_F newColor = {0.0f, 0.0f, 0.0f, 1.0f};
     ReadBackgroundColor(newColor);
     bool colorChanged = (newColor.r != g_desktopBgColor.r || newColor.g != g_desktopBgColor.g || newColor.b != g_desktopBgColor.b);
     g_desktopBgColor = newColor;
-    //Wh_Log(L"Refresh: Direct Color = R:%f G:%f B:%f", g_desktopBgColor.r, g_desktopBgColor.g, g_desktopBgColor.b);
 
     if (bgType == 1) { 
-        //Wh_Log(L"Refresh: Solid color mode applied.");
         g_hasWallpaper = false;
         g_wallpaperBitmap.Reset();
         g_tileBrush.Reset();
@@ -592,7 +566,6 @@ void RefreshWallpaperAndStyle() {
                 RegCloseKey(hKey);
             }
         }
-        //Wh_Log(L"Refresh: Direct Path = %ls", newPath.c_str());
 
         // 3. We STILL use COM just for the Fit position (Center, Stretch, etc) because that works well
         DESKTOP_WALLPAPER_POSITION pos = DWPOS_CENTER;
@@ -603,7 +576,6 @@ void RefreshWallpaperAndStyle() {
         }
         if (SUCCEEDED(coInitHr)) CoUninitialize();
         
-        //Wh_Log(L"Refresh: Position Enum = %d", pos);
 
         // 4. File Timestamp Check
         WIN32_FILE_ATTRIBUTE_DATA fileInfo;
@@ -636,7 +608,6 @@ void RefreshWallpaperAndStyle() {
                 g_dc->CreateBitmapBrush(g_wallpaperBitmap.Get(), brushProps, &g_tileBrush);
             }
         } else {
-            //Wh_Log(L"Refresh: No changes to active path/time/pos.");
         }
     }
 
@@ -644,7 +615,7 @@ void RefreshWallpaperAndStyle() {
     if (g_renderEvent) SetEvent(g_renderEvent);
 
     // Clean up COM if we initialized it
-    if (SUCCEEDED(hrCom)) CoUninitialize();
+    if (hrCom == S_OK) CoUninitialize();
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1487,7 +1458,6 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPar
 
         case WM_WINDOWPOSCHANGED: {
             const WINDOWPOS* wp = (const WINDOWPOS*)lParam;
-            //Wh_Log(L"WINDOWPOSCHANGED: cx=%d cy=%d flags=0x%X unloading=%d", wp->cx, wp->cy, wp->flags, g_unloading.load());
             if (!(wp->flags & SWP_NOSIZE) && !g_unloading) {
                 std::lock_guard<std::mutex> lock(g_renderMutex);
                 g_overlayWidth  = (UINT)wp->cx;
@@ -1495,7 +1465,6 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                 
                 // FIX: Update DPI scale BEFORE refreshing wallpaper
                 g_dpiScale = GetMonitorDpiScale(GetWorkerWMonitor());
-                //Wh_Log(L"WINDOWPOSCHANGED: DPI scale updated to %.2f", g_dpiScale);
                 
                 ResizeSwapChain(wp->cx, wp->cy);
                 RefreshWallpaperAndStyle();
@@ -1631,12 +1600,6 @@ void CreateOverlayWindow() {
     int x = mi.rcMonitor.left - mi.rcWork.left;
     int y = mi.rcMonitor.top - mi.rcWork.top;
 
-    // Wh_Log(L"CreateOverlayWindow: dm=%dx%d rcMon={%d,%d,%d,%d} rcWork={%d,%d,%d,%d} pos=%dx%d",
-    //        width, height,
-    //        mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right, mi.rcMonitor.bottom,
-    //        mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom,
-    //        x, y);
-
     g_overlayWnd = CreateWindowEx(
         WS_EX_NOREDIRECTIONBITMAP | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
         OVERLAY_WINDOW_CLASS, nullptr, WS_CHILD | WS_VISIBLE, x, y, width, height,
@@ -1644,7 +1607,6 @@ void CreateOverlayWindow() {
 
     if (!g_overlayWnd) { scheduleRetry(); return; }
 
-    //Wh_Log(L"CreateOverlayWindow: window created, g_overlayWnd=%p", g_overlayWnd);
 
     SetWindowPos(g_overlayWnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 
@@ -1653,7 +1615,6 @@ void CreateOverlayWindow() {
 
         g_overlayWidth  = (UINT)width;
         g_overlayHeight = (UINT)height;
-        //Wh_Log(L"CreateOverlayWindow: forced overlay dims to %ux%u", g_overlayWidth, g_overlayHeight);
 
         if (CreateSwapChainResources(width, height)) {
             g_isIdle        = true;
@@ -1823,7 +1784,6 @@ void RegistryWatcherThread() {
             break;
         }
         if (res >= WAIT_OBJECT_0 + 1 && res <= WAIT_OBJECT_0 + 4) {
-            //Wh_Log(L"RegWatcher: Trap triggered by event index %lu", res - WAIT_OBJECT_0);
             if (g_messageWnd) {
                 PostMessageW(g_messageWnd, WM_APP_TRIGGER_REFRESH, 0, 0); // CHANGED THIS
             }
@@ -1843,7 +1803,6 @@ std::thread* g_bootstrapThread = nullptr;
 BOOL Wh_ModInit() {
     WM_APP_CLEANUP = RegisterWindowMessageW(L"TransparentDesktopSpotlight_Cleanup");
     WM_APP_DEVICE_LOST = RegisterWindowMessageW(L"TransparentDesktopSpotlight_DeviceLost");
-    WM_APP_INIT = RegisterWindowMessageW(L"TransparentDesktopSpotlight_Init");
     WM_APP_TRIGGER_REFRESH = RegisterWindowMessageW(L"TransparentDesktopSpotlight_Refresh");
     WM_APP_SELECTION_UPDATE = RegisterWindowMessageW(L"TransparentDesktopSpotlight_SelUpdate");
 
