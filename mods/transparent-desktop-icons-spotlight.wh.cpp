@@ -131,7 +131,6 @@ using Microsoft::WRL::ComPtr;
 #define TIMER_ID_STATE_POLL       2   // Heartbeat: revalidate desktop window handles (1s)
 #define TIMER_ID_RECREATE_OVERLAY 4
 #define TIMER_ID_WALLPAPER_UPDATE 5
-#define TIMER_ID_SELECTION_UPDATE 6   // Batches rapid LVN_ITEMCHANGED bursts (1ms)
 
 ////////////////////////////////////////////////////////////////////////////////
 // Custom messages
@@ -270,8 +269,6 @@ std::atomic<int>       g_initAttempts{0};
 std::atomic<ULONGLONG> g_lastInitFailure{0};
 
 //
-
-bool g_needsCacheHotSwap = false;
 
 ////////////////////////////////////////////////////////////////////////////////
 // Forward declarations
@@ -527,8 +524,14 @@ bool LoadWallpaperBitmap(const std::wstring& path, ComPtr<ID2D1Bitmap>& outBitma
 // Must be called while holding g_renderMutex.
 void RefreshWallpaperAndStyle() {
     if (!g_dc) return;
-    
-    // SAFETY NET: Ensure COM is initialized for both WIC and IDesktopWallpaper
+
+    // THREADING CONTRACT: Must be called while holding g_renderMutex AND on the
+    // Explorer UI thread (STA). CoCreateInstance for IDesktopWallpaper requires STA.
+    // All current call sites satisfy both constraints:
+    //   - CreateSwapChainResources (called from CreateOverlayWindow, UI thread, under mutex)
+    //   - WM_WINDOWPOSCHANGED handler (overlay wndproc, UI thread, under mutex)
+    //   - TIMER_ID_WALLPAPER_UPDATE handler (message wndproc, UI thread, under mutex)
+    // Do not add call sites from the render thread or any non-UI thread.
     HRESULT hrCom = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
     //Wh_Log(L"--- RefreshWallpaperAndStyle Triggered ---");
@@ -609,16 +612,6 @@ void RefreshWallpaperAndStyle() {
                 g_hasWallpaper = true;
                 g_currentWallpaperPath = newPath;
                 g_lastWallpaperWriteTime = newWriteTime;
-
-                D2D1_SIZE_U pixelSize = g_wallpaperBitmap->GetPixelSize();
-                float maxDim = (float)std::max(pixelSize.width, pixelSize.height);
-                if (maxDim <= 1536.0f) {
-                    g_needsCacheHotSwap = true;
-                    //Wh_Log(L"Refresh: Image Max_Dim (%.0f) <= 1536. Enabling Cache Hot-Swap.", maxDim);
-                    // You will trigger your background CachedFiles watcher here
-                } else {
-                    g_needsCacheHotSwap = false;
-                }
             } else {
                 //Wh_Log(L"Refresh: ERROR - Bitmap locked/invalid. Retrying in 300ms.");
                 if (g_messageWnd) SetTimer(g_messageWnd, TIMER_ID_WALLPAPER_UPDATE, 300, nullptr);
@@ -639,7 +632,7 @@ void RefreshWallpaperAndStyle() {
     if (g_renderEvent) SetEvent(g_renderEvent);
 
     // Clean up COM if we initialized it
-    if (hrCom == S_OK) CoUninitialize();
+    if (SUCCEEDED(hrCom)) CoUninitialize();
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -685,38 +678,42 @@ void RemoveDesktopSubclasses() {
     }
 }
 
+static void HandleDesktopMouseMove(HWND hWnd) {
+    if (!g_isMouseOverDesktop.load(std::memory_order_relaxed))
+        g_isMouseOverDesktop.store(true, std::memory_order_relaxed);
+    TRACKMOUSEEVENT tme = { sizeof(TRACKMOUSEEVENT), TME_LEAVE, hWnd, 0 };
+    TrackMouseEvent(&tme);
+    if (g_renderEvent) SetEvent(g_renderEvent);
+}
+
+static void HandleDesktopMouseLeave() {
+    POINT pt; GetCursorPos(&pt);
+    HWND hUnder = WindowFromPoint(pt);
+    HWND hLV = nullptr, hSV = nullptr, hHost = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        hLV = g_cachedHwndLV; hSV = g_cachedHwndShellView; hHost = g_cachedHwndDesktopHost;
+    }
+    bool stillOver = (hUnder == hLV || hUnder == hSV || hUnder == hHost || hUnder == g_overlayWnd);
+    if (!stillOver && hUnder && hLV) {
+        if (GetAncestor(hUnder, GA_PARENT) == hLV) stillOver = true;
+    }
+    if (!stillOver) {
+        g_isMouseOverDesktop.store(false, std::memory_order_relaxed);
+        if (g_renderEvent) SetEvent(g_renderEvent);
+    }
+}
+
+
 LRESULT CALLBACK ListViewSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
 UINT_PTR uId, DWORD_PTR dwRef) {
     if (!g_unloading) {
         switch (uMsg) {
             case WM_MOUSEMOVE:
-                if (!g_isMouseOverDesktop.load(std::memory_order_relaxed)) {
-                    g_isMouseOverDesktop.store(true, std::memory_order_relaxed);
-                }
-                {
-                    TRACKMOUSEEVENT tme = { sizeof(TRACKMOUSEEVENT), TME_LEAVE, hWnd, 0 };
-                    TrackMouseEvent(&tme);
-                }
-                if (g_renderEvent) SetEvent(g_renderEvent);
+                HandleDesktopMouseMove(hWnd);
                 break;
             case WM_MOUSELEAVE:
-                {
-                    POINT pt; GetCursorPos(&pt);
-                    HWND hUnder = WindowFromPoint(pt);
-                    HWND hLV = nullptr, hSV = nullptr, hHost = nullptr;
-                    {
-                        std::lock_guard<std::mutex> lock(g_stateMutex);
-                        hLV = g_cachedHwndLV; hSV = g_cachedHwndShellView; hHost = g_cachedHwndDesktopHost;
-                    }
-                    bool stillOver = (hUnder == hLV || hUnder == hSV || hUnder == hHost || hUnder == g_overlayWnd);
-                    if (!stillOver && hUnder && hLV) {
-                        if (GetAncestor(hUnder, GA_PARENT) == hLV) stillOver = true;
-                    }
-                    if (!stillOver) {
-                        g_isMouseOverDesktop.store(false, std::memory_order_relaxed);
-                        if (g_renderEvent) SetEvent(g_renderEvent);
-                    }
-                }
+                HandleDesktopMouseLeave();
                 break;
             case WM_LBUTTONDOWN:
             case WM_RBUTTONDOWN:
@@ -735,33 +732,10 @@ LRESULT CALLBACK ShellViewSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPAR
         if (!g_unloading) {
             switch (uMsg) {
                 case WM_MOUSEMOVE:
-                    if (!g_isMouseOverDesktop.load(std::memory_order_relaxed)) {
-                        g_isMouseOverDesktop.store(true, std::memory_order_relaxed);
-                    }
-                    {
-                        TRACKMOUSEEVENT tme = { sizeof(TRACKMOUSEEVENT), TME_LEAVE, hWnd, 0 };
-                        TrackMouseEvent(&tme);
-                    }
-                    if (g_renderEvent) SetEvent(g_renderEvent);
+                    HandleDesktopMouseMove(hWnd);
                     break;
                 case WM_MOUSELEAVE:
-                    {
-                        POINT pt; GetCursorPos(&pt);
-                        HWND hUnder = WindowFromPoint(pt);
-                        HWND hLV = nullptr, hSV = nullptr, hHost = nullptr;
-                        {
-                            std::lock_guard<std::mutex> lock(g_stateMutex);
-                            hLV = g_cachedHwndLV; hSV = g_cachedHwndShellView; hHost = g_cachedHwndDesktopHost;
-                        }
-                        bool stillOver = (hUnder == hLV || hUnder == hSV || hUnder == hHost || hUnder == g_overlayWnd);
-                        if (!stillOver && hUnder && hLV) {
-                            if (GetAncestor(hUnder, GA_PARENT) == hLV) stillOver = true;
-                        }
-                        if (!stillOver) {
-                            g_isMouseOverDesktop.store(false, std::memory_order_relaxed);
-                            if (g_renderEvent) SetEvent(g_renderEvent);
-                        }
-                    }
+                    HandleDesktopMouseLeave();
                     break;
                 }
 
@@ -801,12 +775,6 @@ LRESULT CALLBACK ShellViewSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPAR
                         g_selectionJustChanged.store(true, std::memory_order_relaxed);
                         if (g_renderEvent) SetEvent(g_renderEvent);
                         break;
-
-                        // if (g_overlayWnd) {
-                        //     KillTimer(g_overlayWnd, TIMER_ID_SELECTION_UPDATE);
-                        //     SetTimer(g_overlayWnd, TIMER_ID_SELECTION_UPDATE, 1, nullptr);
-                        // }
-                        // break;
                 }
             }
         }
@@ -1675,9 +1643,10 @@ LRESULT CALLBACK BootstrapHookProc(int code, WPARAM wParam, LPARAM lParam) {
         g_initialized_desktop.store(true);
         
         // Unhook immediately to eliminate ALL overhead
-        if (g_bootstrapHook) {
-            UnhookWindowsHookEx(g_bootstrapHook);
-            g_bootstrapHook = nullptr;
+        HHOOK hookToUnhook = g_bootstrapHook;
+        g_bootstrapHook = nullptr;
+        if (hookToUnhook) {
+            UnhookWindowsHookEx(hookToUnhook);
         }
 
         // Safely create windows on the correct UI thread
@@ -1686,7 +1655,7 @@ LRESULT CALLBACK BootstrapHookProc(int code, WPARAM wParam, LPARAM lParam) {
             CreateOverlayWindow();
         }
     }
-    return CallNextHookEx(g_bootstrapHook, code, wParam, lParam);
+    return CallNextHookEx(nullptr, code, wParam, lParam);
 }
 
 void BootstrapThread() {
