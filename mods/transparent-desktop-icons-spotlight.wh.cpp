@@ -136,11 +136,11 @@ using Microsoft::WRL::ComPtr;
 ////////////////////////////////////////////////////////////////////////////////
 // Custom messages
 
-#define WM_APP_CLEANUP          (WM_APP + 1)
-#define WM_APP_DEVICE_LOST      (WM_APP + 2)
-#define WM_APP_INIT             (WM_APP + 3)
-#define WM_APP_TRIGGER_REFRESH  (WM_APP + 4)
-#define WM_APP_SELECTION_UPDATE (WM_APP + 5)
+UINT WM_APP_CLEANUP = 0;
+UINT WM_APP_DEVICE_LOST = 0;
+UINT WM_APP_INIT = 0;
+UINT WM_APP_TRIGGER_REFRESH = 0;
+UINT WM_APP_SELECTION_UPDATE = 0;
 
 ////////////////////////////////////////////////////////////////////////////////
 // Window / subclass identifiers
@@ -359,7 +359,7 @@ void UpdateSelectionRects() {
                 POINT ptBR = {rcBounds.right, rcBounds.bottom};
                 MapWindowPoints(hLV, overlay, &ptTL, 1);
                 MapWindowPoints(hLV, overlay, &ptBR, 1);
-                // Wh_Log(L"SEL RECT: idx=%d, mapped L=%d T=%d R=%d B=%d", idx, ptTL.x, ptTL.y, ptBR.x, ptBR.y);
+                Wh_Log(L"SEL RECT: idx=%d, mapped L=%d T=%d R=%d B=%d", idx, ptTL.x, ptTL.y, ptBR.x, ptBR.y);
                 s_rects.push_back({ptTL.x, ptTL.y, ptBR.x, ptBR.y});
             }
         }
@@ -373,7 +373,7 @@ void UpdateSelectionRects() {
                 POINT ptBR = {rcBounds.right, rcBounds.bottom};
                 MapWindowPoints(hLV, overlay, &ptTL, 1);
                 MapWindowPoints(hLV, overlay, &ptBR, 1);
-                // Wh_Log(L"FOC RECT: idx=%d, mapped L=%d T=%d R=%d B=%d", focusedIdx, ptTL.x, ptTL.y, ptBR.x, ptBR.y);
+                Wh_Log(L"FOC RECT: idx=%d, mapped L=%d T=%d R=%d B=%d", focusedIdx, ptTL.x, ptTL.y, ptBR.x, ptBR.y);
                 RECT r = {ptTL.x, ptTL.y, ptBR.x, ptBR.y};
                 // Avoid duplicates if the focused item is also selected
                 auto rectsEqual = [](const RECT& a, const RECT& b) {
@@ -1363,17 +1363,19 @@ void RenderLoop() {
 // Window procedures
 
 LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    // Handle dynamic messages before the switch (they can't be case labels)
+    if (uMsg == WM_APP_SELECTION_UPDATE) {
+        if (!g_unloading) { 
+            g_selectionUpdatePending.store(false); 
+            UpdateSelectionRects(); 
+            }
+        return 0;
+    }
+    if (uMsg == WM_APP_CLEANUP) { DestroyWindow(hWnd); return 0; }
+
     switch (uMsg) {
         case WM_NCHITTEST:
             return HTTRANSPARENT;
-
-        case WM_APP_SELECTION_UPDATE:
-            if (!g_unloading) {
-                // CRITICAL: Reset the gate so the next arrow key press can trigger an update!
-                g_selectionUpdatePending.store(false); 
-                UpdateSelectionRects();
-            }
-            return 0;
 
         case WM_TIMER:
             if (!g_unloading) {
@@ -1419,15 +1421,27 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPar
             if (!g_unloading && g_messageWnd && !g_isRecreating)
                 SetTimer(g_messageWnd, TIMER_ID_RECREATE_OVERLAY, 200, nullptr);
             return 0;
-
-        case WM_APP_CLEANUP:
-            DestroyWindow(hWnd);
-            return 0;
     }
+
     return DefWindowProc(hWnd, uMsg, wParam, lParam);
 }
 
 LRESULT CALLBACK MessageWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    // Handle dynamic messages before the switch
+    if (uMsg == WM_APP_DEVICE_LOST) {
+        if (!g_unloading && !g_isRecreating)
+            SetTimer(hWnd, TIMER_ID_RECREATE_OVERLAY, 100, nullptr);
+        return 0;
+    }
+    if (uMsg == WM_APP_TRIGGER_REFRESH || uMsg == WM_THEMECHANGED || uMsg == WM_SETTINGCHANGE) {
+        if (!g_unloading && g_overlayWnd) {
+            KillTimer(hWnd, TIMER_ID_WALLPAPER_UPDATE);
+            SetTimer(hWnd, TIMER_ID_WALLPAPER_UPDATE, 200, nullptr);
+        }
+        return 0;
+    }
+    if (uMsg == WM_APP_CLEANUP) { DestroyWindow(hWnd); return 0; }
+
     switch (uMsg) {
         case WM_TIMER:
             if (!g_unloading) {
@@ -1447,21 +1461,6 @@ LRESULT CALLBACK MessageWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPar
             }
             return 0;
 
-        case WM_APP_DEVICE_LOST:
-            if (!g_unloading && !g_isRecreating)
-                SetTimer(hWnd, TIMER_ID_RECREATE_OVERLAY, 100, nullptr);
-            return 0;
-
-        case WM_APP_TRIGGER_REFRESH: // ADDED THIS
-            case WM_THEMECHANGED:
-                case WM_SETTINGCHANGE:
-                    if (!g_unloading && g_overlayWnd) {
-                        //Wh_Log(L"MessageWndProc: Update trigger received.");
-                        KillTimer(hWnd, TIMER_ID_WALLPAPER_UPDATE);
-                        SetTimer(hWnd, TIMER_ID_WALLPAPER_UPDATE, 200, nullptr);
-                    }
-                    break;
-
         case WM_DISPLAYCHANGE:
             if (!g_unloading)
                 SetTimer(hWnd, TIMER_ID_RECREATE_OVERLAY, 50, nullptr);
@@ -1469,10 +1468,6 @@ LRESULT CALLBACK MessageWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPar
 
         case WM_DESTROY:
             g_messageWnd = nullptr;
-            return 0;
-
-        case WM_APP_CLEANUP:
-            DestroyWindow(hWnd);
             return 0;
     }
     return DefWindowProc(hWnd, uMsg, wParam, lParam);
@@ -1611,58 +1606,52 @@ void CreateMessageWindow() {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// DispatchMessageW hook — bootstrap only
+// Thread-local bootstrap hook (Zero ongoing overhead)
+HHOOK g_bootstrapHook = nullptr;
 
-using DispatchMessageW_t = decltype(&DispatchMessageW);
-DispatchMessageW_t DispatchMessageW_Original;
-
-LRESULT WINAPI DispatchMessageW_Hook(const MSG* lpMsg) {
-    if (!g_unloading) {
-        if (lpMsg->message == WM_APP_INIT && lpMsg->hwnd == nullptr) {
-            CreateMessageWindow();
-            if (g_messageWnd) {
-                CreateOverlayWindow();
-                if (g_overlayWnd) {
-                    g_initAttempts.store(0, std::memory_order_relaxed);
-                    g_lastInitFailure.store(0, std::memory_order_relaxed);
-                } else {
-                    g_initAttempts.fetch_add(1, std::memory_order_relaxed);
-                    g_lastInitFailure.store(GetTickCount64(), std::memory_order_relaxed);
-                    g_initialized_desktop = false;
-                }
-            } else {
-                g_initAttempts.fetch_add(1, std::memory_order_relaxed);
-                g_lastInitFailure.store(GetTickCount64(), std::memory_order_relaxed);
-                g_initialized_desktop = false;
-            }
+LRESULT CALLBACK BootstrapHookProc(int code, WPARAM wParam, LPARAM lParam) {
+    if (code == HC_ACTION && !g_initialized_desktop.load()) {
+        g_initialized_desktop.store(true);
+        
+        // Unhook immediately to eliminate ALL overhead
+        if (g_bootstrapHook) {
+            UnhookWindowsHookEx(g_bootstrapHook);
+            g_bootstrapHook = nullptr;
         }
-        if (!g_initialized_desktop) {
-            ULONGLONG now           = GetTickCount64();
-            bool useLongBackoff     = g_initAttempts.load(std::memory_order_relaxed) > 5;
-            ULONGLONG lastFail      = g_lastInitFailure.load(std::memory_order_relaxed);
-            bool backoffActive      = (useLongBackoff && lastFail != 0 && (now - lastFail) < 5000);
 
-            if (!backoffActive) {
-                static std::atomic<ULONGLONG> s_lastCheck{0};
-                ULONGLONG last = s_lastCheck.load(std::memory_order_relaxed);
-
-                if (now - last >= 500) {
-                    s_lastCheck.store(now, std::memory_order_relaxed);
-
-                    HWND hLV = GetDesktopListView();
-                    if (hLV && IsWindowVisible(hLV)) {
-                        DWORD tid = GetWindowThreadProcessId(hLV, nullptr);
-                        if (tid != 0) {
-                            if (PostThreadMessage(tid, WM_APP_INIT, 0, 0))
-                                g_initialized_desktop = true;
-                        }
-                    }
-                }
-            }
+        // Safely create windows on the correct UI thread
+        CreateMessageWindow();
+        if (g_messageWnd) {
+            CreateOverlayWindow();
         }
     }
-    return DispatchMessageW_Original(lpMsg);
+    return CallNextHookEx(g_bootstrapHook, code, wParam, lParam);
 }
+
+void BootstrapThread() {
+    while (!g_unloading && !g_initialized_desktop.load()) {
+        HWND hLV = GetDesktopListView();
+        if (hLV && IsWindowVisible(hLV)) {
+            DWORD tid = GetWindowThreadProcessId(hLV, nullptr);
+            if (tid != 0) {
+                // Install hook ONLY on the Explorer UI thread
+                g_bootstrapHook = SetWindowsHookExW(WH_GETMESSAGE, BootstrapHookProc, GetCurrentModuleHandle(), tid);
+                if (g_bootstrapHook) {
+                    // Wake up the thread's message pump to trigger the hook
+                    PostThreadMessageW(tid, WM_NULL, 0, 0);
+                    
+                    // Wait to see if it succeeds
+                    for (int i = 0; i < 10 && !g_initialized_desktop.load(); ++i) {
+                        Sleep(500);
+                    }
+                    if (g_initialized_desktop.load()) break;
+                }
+            }
+        }
+        Sleep(2000); // Retry every 2 seconds if desktop isn't ready (e.g. cold boot)
+    }
+}
+
 
 ////////////////////////////////////////////////////////////////////////////////
 // Mod lifecycle
@@ -1745,9 +1734,19 @@ void RegistryWatcherThread() {
     for (int i=1; i<5; i++) CloseHandle(hEvents[i]);
 }
 
+std::thread* g_bootstrapThread = nullptr;
+
 BOOL Wh_ModInit() {
+    WM_APP_CLEANUP = RegisterWindowMessageW(L"TransparentDesktopSpotlight_Cleanup");
+    WM_APP_DEVICE_LOST = RegisterWindowMessageW(L"TransparentDesktopSpotlight_DeviceLost");
+    WM_APP_INIT = RegisterWindowMessageW(L"TransparentDesktopSpotlight_Init");
+    WM_APP_TRIGGER_REFRESH = RegisterWindowMessageW(L"TransparentDesktopSpotlight_Refresh");
+    WM_APP_SELECTION_UPDATE = RegisterWindowMessageW(L"TransparentDesktopSpotlight_SelUpdate");
+
     LoadSettings();
-    WindhawkUtils::SetFunctionHook(DispatchMessageW, DispatchMessageW_Hook, &DispatchMessageW_Original);
+    
+    // Start the lightweight bootstrap thread
+    g_bootstrapThread = new std::thread(BootstrapThread);
 
     g_hRegStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_regThread = new std::thread(RegistryWatcherThread);
@@ -1757,6 +1756,12 @@ BOOL Wh_ModInit() {
 
 void Wh_ModUninit() {
     g_unloading = true;
+
+    if (g_bootstrapThread) {
+        if (g_bootstrapThread->joinable()) g_bootstrapThread->join();
+        delete g_bootstrapThread;
+        g_bootstrapThread = nullptr;
+    }
 
     if (g_hRegStopEvent) {
         SetEvent(g_hRegStopEvent);
