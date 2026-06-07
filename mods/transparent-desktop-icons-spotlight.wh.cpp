@@ -619,28 +619,24 @@ void RefreshWallpaperAndStyle() {
         g_wallpaperPosition = pos;
 
         if (pathChanged || timeChanged || posChanged) {
-            //Wh_Log(L"Refresh: Change detected (Path:%d Time:%d Pos:%d), Loading...", pathChanged, timeChanged, posChanged);
-            
             ComPtr<ID2D1Bitmap> newBitmap;
             if (!newPath.empty() && LoadWallpaperBitmap(newPath, newBitmap)) {
-                //Wh_Log(L"Refresh: SUCCESS - Bitmap loaded.");
                 g_wallpaperBitmap = newBitmap;
                 g_hasWallpaper = true;
                 g_currentWallpaperPath = newPath;
                 g_lastWallpaperWriteTime = newWriteTime;
             } else {
-                //Wh_Log(L"Refresh: ERROR - Bitmap locked/invalid. Retrying in 300ms.");
                 if (g_messageWnd) SetTimer(g_messageWnd, TIMER_ID_WALLPAPER_UPDATE, 300, nullptr);
+            }
+
+            g_tileBrush.Reset();
+            if (g_hasWallpaper && g_wallpaperPosition == DWPOS_TILE && g_wallpaperBitmap) {
+                D2D1_BITMAP_BRUSH_PROPERTIES brushProps = D2D1::BitmapBrushProperties(
+                    D2D1_EXTEND_MODE_WRAP, D2D1_EXTEND_MODE_WRAP, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+                g_dc->CreateBitmapBrush(g_wallpaperBitmap.Get(), brushProps, &g_tileBrush);
             }
         } else {
             //Wh_Log(L"Refresh: No changes to active path/time/pos.");
-        }
-
-        g_tileBrush.Reset();
-        if (g_hasWallpaper && g_wallpaperPosition == DWPOS_TILE && g_wallpaperBitmap) {
-            D2D1_BITMAP_BRUSH_PROPERTIES brushProps = D2D1::BitmapBrushProperties(
-                D2D1_EXTEND_MODE_WRAP, D2D1_EXTEND_MODE_WRAP, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-            g_dc->CreateBitmapBrush(g_wallpaperBitmap.Get(), brushProps, &g_tileBrush);
         }
     }
 
@@ -733,18 +729,25 @@ LRESULT CALLBACK ListViewSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARA
                 break;
 
             case WM_LBUTTONDBLCLK:
-                if (g_settings.toggleOnDoubleClick) {
-                    LVHITTESTINFO hti = {};
-                    hti.pt.x = (short)LOWORD(lParam);
-                    hti.pt.y = (short)HIWORD(lParam);
-                    ListView_HitTest(hWnd, &hti);
-                    if (hti.flags & LVHT_NOWHERE) {
-                        g_overlayBypassed.store(!g_overlayBypassed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                {
+                    bool suppressSpotlight = false;
+                    if (g_settings.toggleOnDoubleClick) {
+                        LVHITTESTINFO hti = {};
+                        hti.pt.x = (short)LOWORD(lParam);
+                        hti.pt.y = (short)HIWORD(lParam);
+                        ListView_HitTest(hWnd, &hti);
+                        if (hti.flags & LVHT_NOWHERE) {
+                            bool nowBypassed = !g_overlayBypassed.load(std::memory_order_relaxed);
+                            g_overlayBypassed.store(nowBypassed, std::memory_order_relaxed);
+                            if (g_renderEvent) SetEvent(g_renderEvent);
+                            suppressSpotlight = nowBypassed; // toggling OFF: don't wake the spotlight
+                        }
+                    }
+                    if (!suppressSpotlight) {
+                        g_clickOnDesktop.store(true, std::memory_order_relaxed);
                         if (g_renderEvent) SetEvent(g_renderEvent);
                     }
                 }
-                g_clickOnDesktop.store(true, std::memory_order_relaxed);
-                if (g_renderEvent) SetEvent(g_renderEvent);
                 break;
                 
             case WM_LBUTTONDOWN:
@@ -1417,7 +1420,6 @@ void RenderLoop() {
                     selectionChanged || // Force render if the selected icon moved
                     (std::abs(g_masterFade - s_lastRenderedMasterFade) > 0.001f) ||
                     (std::abs(g_spotlightFade - s_lastRenderedSpotFade) > 0.001f) ||
-                    (std::abs(g_spotlightFade - s_lastRenderedSpotFade)  > 0.001f) ||
                     (std::abs(g_selectionFade - s_lastRenderedSelFade) > 0.001f)  ||
                     ((std::abs(g_smoothedMousePos.x - s_lastRenderedMousePos.x) > 0.1f ||
                       std::abs(g_smoothedMousePos.y - s_lastRenderedMousePos.y) > 0.1f) &&
