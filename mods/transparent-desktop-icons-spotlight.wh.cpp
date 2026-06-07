@@ -44,7 +44,7 @@ customizable independent timeouts, blurs, and fade durations.
   $description: Mouse Spotlight Edge Blur in pixels (0 = hard edge)
 - idleDelay: 2000
   $name: Mouse Spotlight Idle Timeout (ms)
-  $description: Time in milliseconds before the spotlight begins to fade out
+  $description: Time in milliseconds before the spotlight begins to fade out (0 = keep visible indefinitely while over desktop)
 - spotlightFadeInDuration: 100
   $name: Mouse Spotlight Fade In Duration (ms)
   $description: How long it takes for the spotlight to fade in when mouse enters the desktop area
@@ -1124,7 +1124,7 @@ void UpdateMouseAndAnimations(float deltaTime) {
     g_smoothedMousePos.y += ((float)localPos.y - g_smoothedMousePos.y) * lerpFactor;
 
     ULONGLONG timeSinceLastMove = GetTickCount64() - g_lastMouseTime;
-    if (!overDesktop || timeSinceLastMove > (ULONGLONG)g_settings.idleDelay)
+    if (!overDesktop || (g_settings.idleDelay > 0 && timeSinceLastMove > (ULONGLONG)g_settings.idleDelay))
         g_isIdle = true;
 
     float targetSpotFade = g_isIdle ? 0.0f : 1.0f;
