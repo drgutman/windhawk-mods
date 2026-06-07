@@ -140,6 +140,7 @@ using Microsoft::WRL::ComPtr;
 #define WM_APP_DEVICE_LOST      (WM_APP + 2)
 #define WM_APP_INIT             (WM_APP + 3)
 #define WM_APP_TRIGGER_REFRESH  (WM_APP + 4)
+#define WM_APP_SELECTION_UPDATE (WM_APP + 5)
 
 ////////////////////////////////////////////////////////////////////////////////
 // Window / subclass identifiers
@@ -180,6 +181,7 @@ HWND g_overlayWnd   = nullptr;
 HWND g_messageWnd   = nullptr;
 std::atomic<bool> g_unloading{false};
 bool g_isRecreating = false;
+std::atomic<bool> g_selectionUpdatePending{false};
 
 // Cached overlay dimensions (written under g_renderMutex, read in render thread)
 UINT g_overlayWidth  = 0;
@@ -261,16 +263,10 @@ float g_dpiScale = 1.0f;
 // Initialization state
 std::atomic<bool> g_initialized_desktop{false};
 std::atomic<bool> g_initialized{false};
-WCHAR g_lastKnownWallpaperPath[MAX_PATH] = {};
-
-// Cold-start retry tracking. g_initAttempts counts consecutive failed WM_APP_INIT
-// handling; g_lastInitFailure records the GetTickCount64 of the most recent failure.
-// On success both reset. Used to switch to a longer (5s) backoff after a few quick
-// attempts so we don't peg a timer forever on a permanently broken environment.
-std::atomic<int> g_initAttempts{0};
-std::atomic<ULONGLONG> g_lastInitFailure{0};
 
 // Cold-start retry tracking
+std::atomic<int>       g_initAttempts{0};
+std::atomic<ULONGLONG> g_lastInitFailure{0};
 
 //
 
@@ -339,7 +335,6 @@ void UpdateSelectionRects() {
     }
     if (!hLV || !IsWindow(hLV)) return;
 
-    // Check for in-place rename
     bool isEditing = false;
     HWND hEdit = FindWindowEx(hLV, nullptr, L"Edit", nullptr);
     if (!hEdit) hEdit = FindWindowEx(hLV, nullptr, L"WC_EDIT", nullptr);
@@ -351,17 +346,42 @@ void UpdateSelectionRects() {
 
     HWND overlay = g_overlayWnd;
     int count = (int)SendMessage(hLV, LVM_GETSELECTEDCOUNT, 0, 0);
-    if (count > 0 && overlay) {
+    int focusedIdx = (int)SendMessage(hLV, LVM_GETNEXTITEM, -1, LVNI_FOCUSED);
+
+    if ((count > 0 || focusedIdx != -1) && overlay) {
+        // 1. Track all selected items
         int idx = -1;
         while ((idx = (int)SendMessage(hLV, LVM_GETNEXTITEM, idx, LVNI_SELECTED)) != -1) {
             RECT rcBounds = {};
             rcBounds.left = LVIR_BOUNDS;
             if (SendMessage(hLV, LVM_GETITEMRECT, idx, (LPARAM)&rcBounds)) {
-                POINT ptTL = {rcBounds.left,  rcBounds.top};
+                POINT ptTL = {rcBounds.left, rcBounds.top};
                 POINT ptBR = {rcBounds.right, rcBounds.bottom};
                 MapWindowPoints(hLV, overlay, &ptTL, 1);
                 MapWindowPoints(hLV, overlay, &ptBR, 1);
+                // Wh_Log(L"SEL RECT: idx=%d, mapped L=%d T=%d R=%d B=%d", idx, ptTL.x, ptTL.y, ptBR.x, ptBR.y);
                 s_rects.push_back({ptTL.x, ptTL.y, ptBR.x, ptBR.y});
+            }
+        }
+
+        // 2. Track the focused item (for keyboard navigation without selection)
+        if (focusedIdx != -1) {
+            RECT rcBounds = {};
+            rcBounds.left = LVIR_BOUNDS;
+            if (SendMessage(hLV, LVM_GETITEMRECT, focusedIdx, (LPARAM)&rcBounds)) {
+                POINT ptTL = {rcBounds.left, rcBounds.top};
+                POINT ptBR = {rcBounds.right, rcBounds.bottom};
+                MapWindowPoints(hLV, overlay, &ptTL, 1);
+                MapWindowPoints(hLV, overlay, &ptBR, 1);
+                // Wh_Log(L"FOC RECT: idx=%d, mapped L=%d T=%d R=%d B=%d", focusedIdx, ptTL.x, ptTL.y, ptBR.x, ptBR.y);
+                RECT r = {ptTL.x, ptTL.y, ptBR.x, ptBR.y};
+                // Avoid duplicates if the focused item is also selected
+                auto rectsEqual = [](const RECT& a, const RECT& b) {
+                    return a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom;
+                };
+                if (std::find_if(s_rects.begin(), s_rects.end(), [&](const RECT& existing) { return rectsEqual(existing, r); }) == s_rects.end()) {
+                    s_rects.push_back(r);
+                }
             }
         }
     }
@@ -372,7 +392,6 @@ void UpdateSelectionRects() {
         g_isEditing     = isEditing;
     }
 
-    // Signal the render thread that selection changed
     g_selectionJustChanged.store(true, std::memory_order_relaxed);
     if (g_renderEvent) SetEvent(g_renderEvent);
 }
@@ -467,7 +486,7 @@ bool LoadWallpaperBitmap(const std::wstring& path, ComPtr<ID2D1Bitmap>& outBitma
     // We use GENERIC_READ. If Windows is actively saving the file, this will fail with ERROR_SHARING_VIOLATION.
     HRESULT hr = g_wicFactory->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &decoder);
     if (FAILED(hr)) {
-        Wh_Log(L"LoadWallpaperBitmap: CreateDecoderFromFilename FAILED. hr=0x%08X, Path=%ls", hr, path.c_str());
+        //Wh_Log(L"LoadWallpaperBitmap: CreateDecoderFromFilename FAILED. hr=0x%08X, Path=%ls", hr, path.c_str());
         return false;
     }
 
@@ -500,7 +519,7 @@ void RefreshWallpaperAndStyle() {
     // SAFETY NET: Ensure COM is initialized for both WIC and IDesktopWallpaper
     HRESULT hrCom = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
-    Wh_Log(L"--- RefreshWallpaperAndStyle Triggered ---");
+    //Wh_Log(L"--- RefreshWallpaperAndStyle Triggered ---");
 
     DWORD bgType = 0; 
     HKEY hKey;
@@ -509,17 +528,17 @@ void RefreshWallpaperAndStyle() {
         RegQueryValueExW(hKey, L"BackgroundType", nullptr, nullptr, (LPBYTE)&bgType, &size);
         RegCloseKey(hKey);
     }
-    Wh_Log(L"Refresh: BackgroundType = %lu", bgType);
+    //Wh_Log(L"Refresh: BackgroundType = %lu", bgType);
 
     // 1. Force a direct color read (bypasses COM cache)
     D2D1_COLOR_F newColor = {0.0f, 0.0f, 0.0f, 1.0f};
     ReadBackgroundColor(newColor);
     bool colorChanged = (newColor.r != g_desktopBgColor.r || newColor.g != g_desktopBgColor.g || newColor.b != g_desktopBgColor.b);
     g_desktopBgColor = newColor;
-    Wh_Log(L"Refresh: Direct Color = R:%f G:%f B:%f", g_desktopBgColor.r, g_desktopBgColor.g, g_desktopBgColor.b);
+    //Wh_Log(L"Refresh: Direct Color = R:%f G:%f B:%f", g_desktopBgColor.r, g_desktopBgColor.g, g_desktopBgColor.b);
 
     if (bgType == 1) { 
-        Wh_Log(L"Refresh: Solid color mode applied.");
+        //Wh_Log(L"Refresh: Solid color mode applied.");
         g_hasWallpaper = false;
         g_wallpaperBitmap.Reset();
         g_tileBrush.Reset();
@@ -542,7 +561,7 @@ void RefreshWallpaperAndStyle() {
                 RegCloseKey(hKey);
             }
         }
-        Wh_Log(L"Refresh: Direct Path = %ls", newPath.c_str());
+        //Wh_Log(L"Refresh: Direct Path = %ls", newPath.c_str());
 
         // 3. We STILL use COM just for the Fit position (Center, Stretch, etc) because that works well
         DESKTOP_WALLPAPER_POSITION pos = DWPOS_CENTER;
@@ -553,7 +572,7 @@ void RefreshWallpaperAndStyle() {
         }
         if (SUCCEEDED(coInitHr)) CoUninitialize();
         
-        Wh_Log(L"Refresh: Position Enum = %d", pos);
+        //Wh_Log(L"Refresh: Position Enum = %d", pos);
 
         // 4. File Timestamp Check
         WIN32_FILE_ATTRIBUTE_DATA fileInfo;
@@ -569,11 +588,11 @@ void RefreshWallpaperAndStyle() {
         g_wallpaperPosition = pos;
 
         if (pathChanged || timeChanged || posChanged) {
-            Wh_Log(L"Refresh: Change detected (Path:%d Time:%d Pos:%d), Loading...", pathChanged, timeChanged, posChanged);
+            //Wh_Log(L"Refresh: Change detected (Path:%d Time:%d Pos:%d), Loading...", pathChanged, timeChanged, posChanged);
             
             ComPtr<ID2D1Bitmap> newBitmap;
             if (!newPath.empty() && LoadWallpaperBitmap(newPath, newBitmap)) {
-                Wh_Log(L"Refresh: SUCCESS - Bitmap loaded.");
+                //Wh_Log(L"Refresh: SUCCESS - Bitmap loaded.");
                 g_wallpaperBitmap = newBitmap;
                 g_hasWallpaper = true;
                 g_currentWallpaperPath = newPath;
@@ -583,17 +602,17 @@ void RefreshWallpaperAndStyle() {
                 float maxDim = (float)std::max(pixelSize.width, pixelSize.height);
                 if (maxDim <= 1536.0f) {
                     g_needsCacheHotSwap = true;
-                    Wh_Log(L"Refresh: Image Max_Dim (%.0f) <= 1536. Enabling Cache Hot-Swap.", maxDim);
+                    //Wh_Log(L"Refresh: Image Max_Dim (%.0f) <= 1536. Enabling Cache Hot-Swap.", maxDim);
                     // You will trigger your background CachedFiles watcher here
                 } else {
                     g_needsCacheHotSwap = false;
                 }
             } else {
-                Wh_Log(L"Refresh: ERROR - Bitmap locked/invalid. Retrying in 300ms.");
+                //Wh_Log(L"Refresh: ERROR - Bitmap locked/invalid. Retrying in 300ms.");
                 if (g_messageWnd) SetTimer(g_messageWnd, TIMER_ID_WALLPAPER_UPDATE, 300, nullptr);
             }
         } else {
-            Wh_Log(L"Refresh: No changes to active path/time/pos.");
+            //Wh_Log(L"Refresh: No changes to active path/time/pos.");
         }
 
         g_tileBrush.Reset();
@@ -689,8 +708,11 @@ LRESULT CALLBACK ShellViewSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPAR
                 switch (hdr->code) {
                     case LVN_ITEMCHANGED:
                         if (g_overlayWnd) {
-                            KillTimer(g_overlayWnd, TIMER_ID_SELECTION_UPDATE);
-                            SetTimer(g_overlayWnd, TIMER_ID_SELECTION_UPDATE, 1, nullptr);
+                            bool expected = false;
+                            // Only post if an update isn't already pending
+                            if (g_selectionUpdatePending.compare_exchange_strong(expected, true)) {
+                                PostMessageW(g_overlayWnd, WM_APP_SELECTION_UPDATE, 0, 0);
+                            }
                         }
                         break;
                     case LVN_BEGINLABELEDIT:
@@ -698,6 +720,7 @@ LRESULT CALLBACK ShellViewSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPAR
                             std::lock_guard<std::mutex> lock(g_stateMutex);
                             g_isEditing = true;
                         }
+                        g_selectionJustChanged.store(true, std::memory_order_relaxed);
                         if (g_renderEvent) SetEvent(g_renderEvent);
                         break;
                     case LVN_ENDLABELEDIT:
@@ -705,11 +728,15 @@ LRESULT CALLBACK ShellViewSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPAR
                             std::lock_guard<std::mutex> lock(g_stateMutex);
                             g_isEditing = false;
                         }
-                        if (g_overlayWnd) {
-                            KillTimer(g_overlayWnd, TIMER_ID_SELECTION_UPDATE);
-                            SetTimer(g_overlayWnd, TIMER_ID_SELECTION_UPDATE, 1, nullptr);
-                        }
+                        g_selectionJustChanged.store(true, std::memory_order_relaxed);
+                        if (g_renderEvent) SetEvent(g_renderEvent);
                         break;
+
+                        // if (g_overlayWnd) {
+                        //     KillTimer(g_overlayWnd, TIMER_ID_SELECTION_UPDATE);
+                        //     SetTimer(g_overlayWnd, TIMER_ID_SELECTION_UPDATE, 1, nullptr);
+                        // }
+                        // break;
                 }
             }
         }
@@ -1262,6 +1289,7 @@ void RenderLoop() {
     float s_lastRenderedSpotFade  = -1.0f;
     float s_lastRenderedSelFade   = -1.0f;
     D2D1_POINT_2F s_lastRenderedMousePos = {-1.0f, -1.0f};
+    std::vector<RECT> s_lastRenderedSelectedRects; // Track geometry changes
 
     while (!g_threadStop) {
         QueryPerformanceCounter(&currentTime);
@@ -1279,9 +1307,23 @@ void RenderLoop() {
             if (g_overlayWnd && !g_unloading) {
                 UpdateMouseAndAnimations(deltaTime);
 
+                // Check if the actual selection rectangles changed
+                bool selectionChanged = (g_cachedSelectedRects.size() != s_lastRenderedSelectedRects.size());
+                if (!selectionChanged) {
+                    for (size_t i = 0; i < g_cachedSelectedRects.size(); ++i) {
+                        if (g_cachedSelectedRects[i].left != s_lastRenderedSelectedRects[i].left ||
+                            g_cachedSelectedRects[i].top != s_lastRenderedSelectedRects[i].top ||
+                            g_cachedSelectedRects[i].right != s_lastRenderedSelectedRects[i].right ||
+                            g_cachedSelectedRects[i].bottom != s_lastRenderedSelectedRects[i].bottom) {
+                            selectionChanged = true;
+                            break;
+                        }
+                    }
+                }
+
                 bool stateChanged =
-                    (std::abs(g_spotlightFade - s_lastRenderedSpotFade) > 0.001f) ||
-                    (std::abs(g_selectionFade - s_lastRenderedSelFade) > 0.001f)  ||
+                    selectionChanged || // Force render if the selected icon moved
+                    (std::abs(g_spotlightFade - s_lastRenderedSpotFade)  > 0.001f) ||                    (std::abs(g_selectionFade - s_lastRenderedSelFade) > 0.001f)  ||
                     ((std::abs(g_smoothedMousePos.x - s_lastRenderedMousePos.x) > 0.1f ||
                       std::abs(g_smoothedMousePos.y - s_lastRenderedMousePos.y) > 0.1f) &&
                      (g_spotlightFade > 0.001f || !g_isIdle))                     ||
@@ -1297,6 +1339,7 @@ void RenderLoop() {
                     s_lastRenderedSpotFade  = g_spotlightFade;
                     s_lastRenderedSelFade   = g_selectionFade;
                     s_lastRenderedMousePos  = g_smoothedMousePos;
+                    s_lastRenderedSelectedRects = g_cachedSelectedRects;
                     g_forceRender           = false;
                     currentSwapChain        = g_swapChain;
                     frameRendered           = true;
@@ -1324,21 +1367,25 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPar
         case WM_NCHITTEST:
             return HTTRANSPARENT;
 
+        case WM_APP_SELECTION_UPDATE:
+            if (!g_unloading) {
+                // CRITICAL: Reset the gate so the next arrow key press can trigger an update!
+                g_selectionUpdatePending.store(false); 
+                UpdateSelectionRects();
+            }
+            return 0;
+
         case WM_TIMER:
             if (!g_unloading) {
                 if (wParam == TIMER_ID_STATE_POLL) {
                     RevalidateDesktopWindows();
-                } else if (wParam == TIMER_ID_SELECTION_UPDATE) {
-                    KillTimer(hWnd, TIMER_ID_SELECTION_UPDATE);
-                    UpdateSelectionRects();
                 }
             }
             return 0;
 
         case WM_WINDOWPOSCHANGED: {
             const WINDOWPOS* wp = (const WINDOWPOS*)lParam;
-            Wh_Log(L"WINDOWPOSCHANGED: cx=%d cy=%d flags=0x%X unloading=%d",
-                wp->cx, wp->cy, wp->flags, g_unloading.load());
+            //Wh_Log(L"WINDOWPOSCHANGED: cx=%d cy=%d flags=0x%X unloading=%d", wp->cx, wp->cy, wp->flags, g_unloading.load());
             if (!(wp->flags & SWP_NOSIZE) && !g_unloading) {
                 std::lock_guard<std::mutex> lock(g_renderMutex);
                 g_overlayWidth  = (UINT)wp->cx;
@@ -1346,7 +1393,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                 
                 // FIX: Update DPI scale BEFORE refreshing wallpaper
                 g_dpiScale = GetMonitorDpiScale(GetWorkerWMonitor());
-                Wh_Log(L"WINDOWPOSCHANGED: DPI scale updated to %.2f", g_dpiScale);
+                //Wh_Log(L"WINDOWPOSCHANGED: DPI scale updated to %.2f", g_dpiScale);
                 
                 ResizeSwapChain(wp->cx, wp->cy);
                 RefreshWallpaperAndStyle();
@@ -1409,7 +1456,7 @@ LRESULT CALLBACK MessageWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPar
             case WM_THEMECHANGED:
                 case WM_SETTINGCHANGE:
                     if (!g_unloading && g_overlayWnd) {
-                        Wh_Log(L"MessageWndProc: Update trigger received.");
+                        //Wh_Log(L"MessageWndProc: Update trigger received.");
                         KillTimer(hWnd, TIMER_ID_WALLPAPER_UPDATE);
                         SetTimer(hWnd, TIMER_ID_WALLPAPER_UPDATE, 200, nullptr);
                     }
@@ -1489,11 +1536,11 @@ void CreateOverlayWindow() {
     int x = mi.rcMonitor.left - mi.rcWork.left;
     int y = mi.rcMonitor.top - mi.rcWork.top;
 
-    Wh_Log(L"CreateOverlayWindow: dm=%dx%d rcMon={%d,%d,%d,%d} rcWork={%d,%d,%d,%d} pos=%dx%d",
-           width, height,
-           mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right, mi.rcMonitor.bottom,
-           mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom,
-           x, y);
+    // Wh_Log(L"CreateOverlayWindow: dm=%dx%d rcMon={%d,%d,%d,%d} rcWork={%d,%d,%d,%d} pos=%dx%d",
+    //        width, height,
+    //        mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right, mi.rcMonitor.bottom,
+    //        mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom,
+    //        x, y);
 
     g_overlayWnd = CreateWindowEx(
         WS_EX_NOREDIRECTIONBITMAP | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
@@ -1502,7 +1549,7 @@ void CreateOverlayWindow() {
 
     if (!g_overlayWnd) { scheduleRetry(); return; }
 
-    Wh_Log(L"CreateOverlayWindow: window created, g_overlayWnd=%p", g_overlayWnd);
+    //Wh_Log(L"CreateOverlayWindow: window created, g_overlayWnd=%p", g_overlayWnd);
 
     SetWindowPos(g_overlayWnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 
@@ -1511,7 +1558,7 @@ void CreateOverlayWindow() {
 
         g_overlayWidth  = (UINT)width;
         g_overlayHeight = (UINT)height;
-        Wh_Log(L"CreateOverlayWindow: forced overlay dims to %ux%u", g_overlayWidth, g_overlayHeight);
+        //Wh_Log(L"CreateOverlayWindow: forced overlay dims to %ux%u", g_overlayWidth, g_overlayHeight);
 
         if (CreateSwapChainResources(width, height)) {
             g_isIdle        = true;
@@ -1683,7 +1730,7 @@ void RegistryWatcherThread() {
             break;
         }
         if (res >= WAIT_OBJECT_0 + 1 && res <= WAIT_OBJECT_0 + 4) {
-            Wh_Log(L"RegWatcher: Trap triggered by event index %lu", res - WAIT_OBJECT_0);
+            //Wh_Log(L"RegWatcher: Trap triggered by event index %lu", res - WAIT_OBJECT_0);
             if (g_messageWnd) {
                 PostMessageW(g_messageWnd, WM_APP_TRIGGER_REFRESH, 0, 0); // CHANGED THIS
             }
