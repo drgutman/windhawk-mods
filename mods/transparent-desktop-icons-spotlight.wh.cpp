@@ -75,6 +75,15 @@ customizable independent timeouts, blurs, and fade durations.
 - selectionFadeOutDuration: 2000
   $name: Icon Selection Fade Out Duration (ms)
   $description: How long the icon selection area takes to fade out after deselection
+- toggleOnDoubleClick: true
+  $name: Toggle Overlay on Double-Click
+  $description: Double-click on empty desktop background to hide or show the overlay.
+- toggleFadeInDuration: 600
+  $name: Overlay Toggle Fade In Duration (ms)
+  $description: How long it takes for the overlay to fade back in when toggled on.
+- toggleFadeOutDuration: 600
+  $name: Overlay Toggle Fade Out Duration (ms)
+  $description: How long it takes for the overlay to fade out when toggled off.
 */
 // ==/WindhawkModSettings==
 
@@ -170,6 +179,10 @@ struct Settings {
     int selectionTimeout;
     int selectionFadeInDuration;
     int selectionFadeOutDuration;
+
+    bool toggleOnDoubleClick;
+    int toggleFadeInDuration;
+    int toggleFadeOutDuration;
 } g_settings;
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -267,6 +280,10 @@ std::atomic<bool> g_initialized{false};
 // Cold-start retry tracking
 std::atomic<int>       g_initAttempts{0};
 std::atomic<ULONGLONG> g_lastInitFailure{0};
+
+// Overlay toggle
+std::atomic<bool> g_overlayBypassed{false};
+float g_masterFade = 1.0f;
 
 //
 
@@ -704,8 +721,8 @@ static void HandleDesktopMouseLeave() {
 }
 
 
-LRESULT CALLBACK ListViewSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
-UINT_PTR uId, DWORD_PTR dwRef) {
+LRESULT CALLBACK ListViewSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, 
+                                        UINT_PTR uId, DWORD_PTR dwRef) {
     if (!g_unloading) {
         switch (uMsg) {
             case WM_MOUSEMOVE:
@@ -714,13 +731,30 @@ UINT_PTR uId, DWORD_PTR dwRef) {
             case WM_MOUSELEAVE:
                 HandleDesktopMouseLeave();
                 break;
+
+            case WM_LBUTTONDBLCLK:
+                if (g_settings.toggleOnDoubleClick) {
+                    LVHITTESTINFO hti = {};
+                    hti.pt.x = (short)LOWORD(lParam);
+                    hti.pt.y = (short)HIWORD(lParam);
+                    ListView_HitTest(hWnd, &hti);
+                    if (hti.flags & LVHT_NOWHERE) {
+                        g_overlayBypassed.store(!g_overlayBypassed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                        if (g_renderEvent) SetEvent(g_renderEvent);
+                    }
+                }
+                g_clickOnDesktop.store(true, std::memory_order_relaxed);
+                if (g_renderEvent) SetEvent(g_renderEvent);
+                break;
+                
             case WM_LBUTTONDOWN:
             case WM_RBUTTONDOWN:
-            case WM_LBUTTONDBLCLK:
+
             case WM_MBUTTONDOWN:
                 g_clickOnDesktop.store(true, std::memory_order_relaxed);
                 if (g_renderEvent) SetEvent(g_renderEvent);
                 break;
+
         }
     }
     return DefSubclassProc(hWnd, uMsg, wParam, lParam);
@@ -1151,6 +1185,24 @@ void UpdateMouseAndAnimations(float deltaTime) {
         }
     }
 
+    // Master overlay toggle fade (independent of spotlight/selection)
+    float targetMasterFade = g_overlayBypassed.load(std::memory_order_relaxed) ? 0.0f : 1.0f;
+    if (targetMasterFade > 0.5f) {
+        if (g_settings.toggleFadeInDuration <= 0) {
+            g_masterFade = 1.0f;
+        } else {
+            float speed = 1.0f / (g_settings.toggleFadeInDuration / 1000.0f);
+            g_masterFade = (std::min)(g_masterFade + speed * deltaTime, 1.0f);
+        }
+    } else {
+        if (g_settings.toggleFadeOutDuration <= 0) {
+            g_masterFade = 0.0f;
+        } else {
+            float speed = 1.0f / (g_settings.toggleFadeOutDuration / 1000.0f);
+            g_masterFade = (std::max)(g_masterFade - speed * deltaTime, 0.0f);
+        }
+    }
+
     // 4. Clean up the cached geometry ONLY after the fade-out animation is completely finished
     if (currentSelectedRects.empty() && g_selectionFade <= 0.0f && targetSelFade < 0.5f) {
         g_cachedSelectedRects.clear();
@@ -1163,6 +1215,7 @@ void RenderOverlay() {
     UINT width  = g_overlayWidth;
     UINT height = g_overlayHeight;
     if (width == 0 || height == 0) return;
+
 
     // 1. Spotlight mask
     g_dc->SetTarget(g_spotlightMaskBitmap.Get());
@@ -1204,6 +1257,7 @@ void RenderOverlay() {
             g_dc->FillRoundedRectangle(rRect, g_selectionBrush.Get());
         }
     }
+
     g_dc->EndDraw();
 
     // 3. Final composited frame
@@ -1216,7 +1270,7 @@ void RenderOverlay() {
     // PREPARE LAYER: We use a layer to apply the idleOpacity to the 
     // ENTIRE background + wallpaper uniformly. This prevents the alpha 
     // accumulation trap where the wallpaper ends up more opaque than the bg color.
-    float idleAlpha = g_settings.idleOpacity / 255.0f;
+    float idleAlpha = (g_settings.idleOpacity / 255.0f) * g_masterFade;
     D2D1_LAYER_PARAMETERS layerParams;
     layerParams.contentBounds = D2D1::InfiniteRect();
     layerParams.geometricMask = nullptr;
@@ -1296,20 +1350,22 @@ void RenderOverlay() {
     g_dc->PopLayer();
 
     // SHOW: Apply spotlight and selection masks (destination out)
-    if (g_spotlightFade > 0.001f && g_spotlightBlurEffect) {
-        g_spotlightBlurEffect->SetInput(0, g_spotlightMaskBitmap.Get());
-        float blurVal = (std::max)(0.1f, (std::min)((float)g_settings.spotlightBlur * g_dpiScale, 100.0f));
-        g_spotlightBlurEffect->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, blurVal);
-        g_dc->DrawImage(g_spotlightBlurEffect.Get(), D2D1_INTERPOLATION_MODE_LINEAR,
-                        D2D1_COMPOSITE_MODE_DESTINATION_OUT);
-    }
+    if (g_masterFade > 0.001f) {
+        if (g_spotlightFade > 0.001f && g_spotlightBlurEffect) {
+            g_spotlightBlurEffect->SetInput(0, g_spotlightMaskBitmap.Get());
+            float blurVal = (std::max)(0.1f, (std::min)((float)g_settings.spotlightBlur * g_dpiScale, 100.0f));
+            g_spotlightBlurEffect->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, blurVal);
+            g_dc->DrawImage(g_spotlightBlurEffect.Get(), D2D1_INTERPOLATION_MODE_LINEAR,
+                            D2D1_COMPOSITE_MODE_DESTINATION_OUT);
+        }
 
-    if (g_selectionFade > 0.001f && g_selectionBlurEffect) {
-        g_selectionBlurEffect->SetInput(0, g_selectionMaskBitmap.Get());
-        float blurVal = (std::max)(0.1f, (std::min)((float)g_settings.selectionBlur * g_dpiScale, 100.0f));
-        g_selectionBlurEffect->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, blurVal);
-        g_dc->DrawImage(g_selectionBlurEffect.Get(), D2D1_INTERPOLATION_MODE_LINEAR,
-                        D2D1_COMPOSITE_MODE_DESTINATION_OUT);
+        if (g_selectionFade > 0.001f && g_selectionBlurEffect) {
+            g_selectionBlurEffect->SetInput(0, g_selectionMaskBitmap.Get());
+            float blurVal = (std::max)(0.1f, (std::min)((float)g_settings.selectionBlur * g_dpiScale, 100.0f));
+            g_selectionBlurEffect->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, blurVal);
+            g_dc->DrawImage(g_selectionBlurEffect.Get(), D2D1_INTERPOLATION_MODE_LINEAR,
+                            D2D1_COMPOSITE_MODE_DESTINATION_OUT);
+        }
     }
 
     g_dc->EndDraw();
@@ -1322,6 +1378,8 @@ void RenderLoop() {
 
     float s_lastRenderedSpotFade  = -1.0f;
     float s_lastRenderedSelFade   = -1.0f;
+    float s_lastRenderedMasterFade = 1.0f;
+
     D2D1_POINT_2F s_lastRenderedMousePos = {-1.0f, -1.0f};
     std::vector<RECT> s_lastRenderedSelectedRects; // Track geometry changes
 
@@ -1357,19 +1415,25 @@ void RenderLoop() {
 
                 bool stateChanged =
                     selectionChanged || // Force render if the selected icon moved
-                    (std::abs(g_spotlightFade - s_lastRenderedSpotFade)  > 0.001f) ||                    (std::abs(g_selectionFade - s_lastRenderedSelFade) > 0.001f)  ||
+                    (std::abs(g_masterFade - s_lastRenderedMasterFade) > 0.001f) ||
+                    (std::abs(g_spotlightFade - s_lastRenderedSpotFade) > 0.001f) ||
+                    (std::abs(g_spotlightFade - s_lastRenderedSpotFade)  > 0.001f) ||
+                    (std::abs(g_selectionFade - s_lastRenderedSelFade) > 0.001f)  ||
                     ((std::abs(g_smoothedMousePos.x - s_lastRenderedMousePos.x) > 0.1f ||
                       std::abs(g_smoothedMousePos.y - s_lastRenderedMousePos.y) > 0.1f) &&
                      (g_spotlightFade > 0.001f || !g_isIdle))                     ||
                     g_forceRender;
 
+                float targetMaster = g_overlayBypassed.load(std::memory_order_relaxed) ? 0.0f : 1.0f;
                 isFullyIdle = (g_spotlightFade <= 0.001f &&
-                               g_selectionFade <= 0.001f &&
-                               g_isIdle);
+                            g_selectionFade <= 0.001f &&
+                            g_isIdle &&
+                            std::abs(g_masterFade - targetMaster) <= 0.001f);
 
                 if (stateChanged && g_swapChain && g_targetBitmap) {
                     RenderOverlay();
 
+                    s_lastRenderedMasterFade = g_masterFade;
                     s_lastRenderedSpotFade  = g_spotlightFade;
                     s_lastRenderedSelFade   = g_selectionFade;
                     s_lastRenderedMousePos  = g_smoothedMousePos;
@@ -1709,6 +1773,10 @@ void LoadSettings() {
     s.selectionTimeout         = std::max(Wh_GetIntSetting(L"selectionTimeout"), 0);
     s.selectionFadeInDuration  = std::max(Wh_GetIntSetting(L"selectionFadeInDuration"), 0);
     s.selectionFadeOutDuration = std::max(Wh_GetIntSetting(L"selectionFadeOutDuration"), 0);
+
+    s.toggleOnDoubleClick    = Wh_GetIntSetting(L"toggleOnDoubleClick") != 0;
+    s.toggleFadeInDuration   = std::max(Wh_GetIntSetting(L"toggleFadeInDuration"), 0);
+    s.toggleFadeOutDuration  = std::max(Wh_GetIntSetting(L"toggleFadeOutDuration"), 0);
 
     std::lock_guard<std::mutex> lock(g_renderMutex);
     g_settings    = s;
