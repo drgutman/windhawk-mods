@@ -248,6 +248,7 @@ std::vector<RECT> g_cachedSelectedRects;
 // Cross-thread signals (render thread reads, UI thread writes)
 std::atomic<bool> g_clickOnDesktop{false};
 std::atomic<bool> g_selectionJustChanged{false};
+std::atomic<bool> g_isMouseOverDesktop{false};
 
 // UI thread state (under g_stateMutex)
 std::mutex        g_stateMutex;
@@ -359,7 +360,7 @@ void UpdateSelectionRects() {
                 POINT ptBR = {rcBounds.right, rcBounds.bottom};
                 MapWindowPoints(hLV, overlay, &ptTL, 1);
                 MapWindowPoints(hLV, overlay, &ptBR, 1);
-                Wh_Log(L"SEL RECT: idx=%d, mapped L=%d T=%d R=%d B=%d", idx, ptTL.x, ptTL.y, ptBR.x, ptBR.y);
+                // Wh_Log(L"SEL RECT: idx=%d, mapped L=%d T=%d R=%d B=%d", idx, ptTL.x, ptTL.y, ptBR.x, ptBR.y);
                 s_rects.push_back({ptTL.x, ptTL.y, ptBR.x, ptBR.y});
             }
         }
@@ -373,7 +374,7 @@ void UpdateSelectionRects() {
                 POINT ptBR = {rcBounds.right, rcBounds.bottom};
                 MapWindowPoints(hLV, overlay, &ptTL, 1);
                 MapWindowPoints(hLV, overlay, &ptBR, 1);
-                Wh_Log(L"FOC RECT: idx=%d, mapped L=%d T=%d R=%d B=%d", focusedIdx, ptTL.x, ptTL.y, ptBR.x, ptBR.y);
+                // Wh_Log(L"FOC RECT: idx=%d, mapped L=%d T=%d R=%d B=%d", focusedIdx, ptTL.x, ptTL.y, ptBR.x, ptBR.y);
                 RECT r = {ptTL.x, ptTL.y, ptBR.x, ptBR.y};
                 // Avoid duplicates if the focused item is also selected
                 auto rectsEqual = [](const RECT& a, const RECT& b) {
@@ -441,13 +442,18 @@ HMODULE GetCurrentModuleHandle() {
 }
 
 // Reads TranscodedImageCache binary value for the guaranteed active image path (fixes Slideshows)
+
 std::wstring ReadTranscodedImageCache() {
     HKEY hKey;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Control Panel\\Desktop", 0, KEY_READ, &hKey) != ERROR_SUCCESS) return L"";
-
     DWORD type = 0, size = 0;
     if (RegQueryValueExW(hKey, L"TranscodedImageCache", nullptr, &type, nullptr, &size) != ERROR_SUCCESS || type != REG_BINARY) {
         RegCloseKey(hKey); return L"";
+    }
+
+    // SANITY CHECK: Prevent std::bad_alloc crash if registry is corrupted with massive size
+    if (size == 0 || size > 1024 * 1024) { 
+        RegCloseKey(hKey); return L""; 
     }
 
     std::vector<BYTE> buffer(size);
@@ -457,7 +463,13 @@ std::wstring ReadTranscodedImageCache() {
     if (size <= 24) return L""; // Skip 24-byte header
     const wchar_t* pathStart = reinterpret_cast<const wchar_t*>(buffer.data() + 24);
     size_t maxChars = (size - 24) / sizeof(wchar_t);
-    return std::wstring(pathStart, wcsnlen(pathStart, maxChars));
+    std::wstring path(pathStart, wcsnlen(pathStart, maxChars));
+
+    // SANITY CHECK: Ensure it looks like a valid path (Drive letter or UNC)
+    if (path.length() < 3) return L"";
+    if (path[1] == L':' && path[2] == L'\\') return path; // C:\...
+    if (path[0] == L'\\' && path[1] == L'\\') return path; // \\server\...
+    return L"";
 }
 
 // Reads exact background color string directly (fixes Solid Color swaps)
@@ -627,7 +639,7 @@ void RefreshWallpaperAndStyle() {
     if (g_renderEvent) SetEvent(g_renderEvent);
 
     // Clean up COM if we initialized it
-    if (SUCCEEDED(hrCom)) CoUninitialize();
+    if (hrCom == S_OK) CoUninitialize();
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -674,11 +686,37 @@ void RemoveDesktopSubclasses() {
 }
 
 LRESULT CALLBACK ListViewSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
-                                       UINT_PTR uId, DWORD_PTR dwRef) {
+UINT_PTR uId, DWORD_PTR dwRef) {
     if (!g_unloading) {
         switch (uMsg) {
             case WM_MOUSEMOVE:
+                if (!g_isMouseOverDesktop.load(std::memory_order_relaxed)) {
+                    g_isMouseOverDesktop.store(true, std::memory_order_relaxed);
+                }
+                {
+                    TRACKMOUSEEVENT tme = { sizeof(TRACKMOUSEEVENT), TME_LEAVE, hWnd, 0 };
+                    TrackMouseEvent(&tme);
+                }
                 if (g_renderEvent) SetEvent(g_renderEvent);
+                break;
+            case WM_MOUSELEAVE:
+                {
+                    POINT pt; GetCursorPos(&pt);
+                    HWND hUnder = WindowFromPoint(pt);
+                    HWND hLV = nullptr, hSV = nullptr, hHost = nullptr;
+                    {
+                        std::lock_guard<std::mutex> lock(g_stateMutex);
+                        hLV = g_cachedHwndLV; hSV = g_cachedHwndShellView; hHost = g_cachedHwndDesktopHost;
+                    }
+                    bool stillOver = (hUnder == hLV || hUnder == hSV || hUnder == hHost || hUnder == g_overlayWnd);
+                    if (!stillOver && hUnder && hLV) {
+                        if (GetAncestor(hUnder, GA_PARENT) == hLV) stillOver = true;
+                    }
+                    if (!stillOver) {
+                        g_isMouseOverDesktop.store(false, std::memory_order_relaxed);
+                        if (g_renderEvent) SetEvent(g_renderEvent);
+                    }
+                }
                 break;
             case WM_LBUTTONDOWN:
             case WM_RBUTTONDOWN:
@@ -694,7 +732,39 @@ LRESULT CALLBACK ListViewSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARA
 
 LRESULT CALLBACK ShellViewSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
                                         UINT_PTR uId, DWORD_PTR dwRef) {
-    if (!g_unloading) {
+        if (!g_unloading) {
+            switch (uMsg) {
+                case WM_MOUSEMOVE:
+                    if (!g_isMouseOverDesktop.load(std::memory_order_relaxed)) {
+                        g_isMouseOverDesktop.store(true, std::memory_order_relaxed);
+                    }
+                    {
+                        TRACKMOUSEEVENT tme = { sizeof(TRACKMOUSEEVENT), TME_LEAVE, hWnd, 0 };
+                        TrackMouseEvent(&tme);
+                    }
+                    if (g_renderEvent) SetEvent(g_renderEvent);
+                    break;
+                case WM_MOUSELEAVE:
+                    {
+                        POINT pt; GetCursorPos(&pt);
+                        HWND hUnder = WindowFromPoint(pt);
+                        HWND hLV = nullptr, hSV = nullptr, hHost = nullptr;
+                        {
+                            std::lock_guard<std::mutex> lock(g_stateMutex);
+                            hLV = g_cachedHwndLV; hSV = g_cachedHwndShellView; hHost = g_cachedHwndDesktopHost;
+                        }
+                        bool stillOver = (hUnder == hLV || hUnder == hSV || hUnder == hHost || hUnder == g_overlayWnd);
+                        if (!stillOver && hUnder && hLV) {
+                            if (GetAncestor(hUnder, GA_PARENT) == hLV) stillOver = true;
+                        }
+                        if (!stillOver) {
+                            g_isMouseOverDesktop.store(false, std::memory_order_relaxed);
+                            if (g_renderEvent) SetEvent(g_renderEvent);
+                        }
+                    }
+                    break;
+                }
+
         // Forward critical desktop redraw broadcasts directly to our monitor
         if (uMsg == WM_SETTINGCHANGE || uMsg == WM_THEMECHANGED) {
             if (g_messageWnd) {
@@ -1008,8 +1078,6 @@ void UpdateMouseAndAnimations(float deltaTime) {
     POINT screenPos;
     GetCursorPos(&screenPos);
 
-    HWND hWndAtCursor = WindowFromPoint(screenPos);
-
     bool mouseMoved = false;
     {
         static POINT s_lastScreenPos = {0, 0};
@@ -1026,20 +1094,13 @@ void UpdateMouseAndAnimations(float deltaTime) {
         lerpFactor  = 1.0f - std::exp(-speed * deltaTime);
     }
 
-    bool overDesktop = false;
+    bool overDesktop = g_isMouseOverDesktop.load(std::memory_order_relaxed);
     bool isEditing   = false;
     std::vector<RECT> currentSelectedRects;
     {
         std::lock_guard<std::mutex> lock(g_stateMutex);
         currentSelectedRects = g_selectedRects;
         isEditing            = g_isEditing;
-
-        HWND parent  = GetAncestor(hWndAtCursor, GA_PARENT);
-        overDesktop  = (hWndAtCursor == g_cachedHwndLV          ||
-                        hWndAtCursor == g_cachedHwndShellView    ||
-                        hWndAtCursor == g_cachedHwndDesktopHost  ||
-                        hWndAtCursor == g_overlayWnd             ||
-                        (g_cachedHwndLV && parent == g_cachedHwndLV));
     }
 
     {
@@ -1691,12 +1752,11 @@ void RegistryWatcherThread() {
     HKEY hKeyColors = nullptr;
     HKEY hKeyWallpapers = nullptr;
     HKEY hKeyDWM = nullptr;
-
-    RegOpenKeyExW(HKEY_CURRENT_USER, L"Control Panel\\Desktop", 0, KEY_NOTIFY, &hKeyDesktop);
-    RegOpenKeyExW(HKEY_CURRENT_USER, L"Control Panel\\Colors", 0, KEY_NOTIFY, &hKeyColors);
-    RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Wallpapers", 0, KEY_NOTIFY, &hKeyWallpapers);
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Control Panel\\Desktop", 0, KEY_NOTIFY, &hKeyDesktop) != ERROR_SUCCESS) hKeyDesktop = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Control Panel\\Colors", 0, KEY_NOTIFY, &hKeyColors) != ERROR_SUCCESS) hKeyColors = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Wallpapers", 0, KEY_NOTIFY, &hKeyWallpapers) != ERROR_SUCCESS) hKeyWallpapers = nullptr;
     // Catch modern Windows 11 solid color updates
-    RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\DWM", 0, KEY_NOTIFY, &hKeyDWM);
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\DWM", 0, KEY_NOTIFY, &hKeyDWM) != ERROR_SUCCESS) hKeyDWM = nullptr;
 
     HANDLE hEvents[5];
     hEvents[0] = g_hRegStopEvent;
