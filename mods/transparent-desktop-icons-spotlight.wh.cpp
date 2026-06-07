@@ -344,25 +344,27 @@ void UpdateSelectionRects() {
 
     HWND overlay = g_overlayWnd;
     int count = (int)SendMessage(hLV, LVM_GETSELECTEDCOUNT, 0, 0);
-    int focusedIdx = (int)SendMessage(hLV, LVM_GETNEXTITEM, -1, LVNI_FOCUSED);
 
-    if ((count > 0 || focusedIdx != -1) && overlay) {
+    // If count is 0, the user has deselected everything. 
+    // We intentionally ignore LVNI_FOCUSED here because Windows keeps a "ghost" 
+    // focus anchor for keyboard navigation, but it's not actually selected.
+    if (count > 0 && overlay) {
         // 1. Track all selected items
         int idx = -1;
         while ((idx = (int)SendMessage(hLV, LVM_GETNEXTITEM, idx, LVNI_SELECTED)) != -1) {
-            RECT rcBounds = {};
+            RECT rcBounds = {}; 
             rcBounds.left = LVIR_BOUNDS;
             if (SendMessage(hLV, LVM_GETITEMRECT, idx, (LPARAM)&rcBounds)) {
                 POINT ptTL = {rcBounds.left, rcBounds.top};
                 POINT ptBR = {rcBounds.right, rcBounds.bottom};
                 MapWindowPoints(hLV, overlay, &ptTL, 1);
                 MapWindowPoints(hLV, overlay, &ptBR, 1);
-                // Wh_Log(L"SEL RECT: idx=%d, mapped L=%d T=%d R=%d B=%d", idx, ptTL.x, ptTL.y, ptBR.x, ptBR.y);
                 s_rects.push_back({ptTL.x, ptTL.y, ptBR.x, ptBR.y});
             }
         }
 
-        // 2. Track the focused item (for keyboard navigation without selection)
+        // 2. Track the focused item (for edge cases where focus != selection)
+        int focusedIdx = (int)SendMessage(hLV, LVM_GETNEXTITEM, -1, LVNI_FOCUSED);
         if (focusedIdx != -1) {
             RECT rcBounds = {};
             rcBounds.left = LVIR_BOUNDS;
@@ -371,9 +373,7 @@ void UpdateSelectionRects() {
                 POINT ptBR = {rcBounds.right, rcBounds.bottom};
                 MapWindowPoints(hLV, overlay, &ptTL, 1);
                 MapWindowPoints(hLV, overlay, &ptBR, 1);
-                // Wh_Log(L"FOC RECT: idx=%d, mapped L=%d T=%d R=%d B=%d", focusedIdx, ptTL.x, ptTL.y, ptBR.x, ptBR.y);
                 RECT r = {ptTL.x, ptTL.y, ptBR.x, ptBR.y};
-                // Avoid duplicates if the focused item is also selected
                 auto rectsEqual = [](const RECT& a, const RECT& b) {
                     return a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom;
                 };
@@ -383,7 +383,6 @@ void UpdateSelectionRects() {
             }
         }
     }
-
     {
         std::lock_guard<std::mutex> lock(g_stateMutex);
         g_selectedRects = s_rects;
@@ -1111,6 +1110,8 @@ void UpdateMouseAndAnimations(float deltaTime) {
 
     bool selChanged = g_selectionJustChanged.exchange(false, std::memory_order_relaxed);
 
+    // 1. ONLY update the cached geometry if there is an active selection.
+    // This preserves the last known position so the mask has something to draw during the fade-out.
     if (!currentSelectedRects.empty()) {
         g_cachedSelectedRects = currentSelectedRects;
         if (selChanged || !g_isIdle) {
@@ -1118,20 +1119,22 @@ void UpdateMouseAndAnimations(float deltaTime) {
         }
     }
 
+    // 2. Calculate target fade based on the REAL current selection state, not the cached geometry
     float targetSelFade = 0.0f;
 
-    if (!g_cachedSelectedRects.empty()) {
+    if (!currentSelectedRects.empty()) {
         if (isEditing) {
             targetSelFade       = 1.0f;
             g_lastSelectionTime = GetTickCount64();
         } else if (g_settings.selectionTimeout <= 0) {
-            targetSelFade = currentSelectedRects.empty() ? 0.0f : 1.0f;
+            targetSelFade = 1.0f;
         } else {
             ULONGLONG timeSinceInteraction = GetTickCount64() - g_lastSelectionTime;
             targetSelFade = (timeSinceInteraction <= (ULONGLONG)g_settings.selectionTimeout) ? 1.0f : 0.0f;
         }
     }
 
+    // 3. Animate the fade in/out
     if (targetSelFade > 0.5f) {
         if (g_settings.selectionFadeInDuration <= 0) {
             g_selectionFade = 1.0f;
@@ -1148,8 +1151,10 @@ void UpdateMouseAndAnimations(float deltaTime) {
         }
     }
 
-    if (currentSelectedRects.empty() && g_selectionFade <= 0.0f && targetSelFade < 0.5f)
+    // 4. Clean up the cached geometry ONLY after the fade-out animation is completely finished
+    if (currentSelectedRects.empty() && g_selectionFade <= 0.0f && targetSelFade < 0.5f) {
         g_cachedSelectedRects.clear();
+    }
 }
 
 void RenderOverlay() {
