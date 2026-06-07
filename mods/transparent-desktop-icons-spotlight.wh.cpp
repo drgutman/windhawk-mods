@@ -1732,7 +1732,7 @@ LRESULT CALLBACK BootstrapHookProc(int code, WPARAM wParam, LPARAM lParam) {
 void BootstrapThread() {
     while (!g_unloading && !g_initialized_desktop.load()) {
         HWND hLV = GetDesktopListView();
-        if (hLV && IsWindowVisible(hLV)) {
+        if (hLV && IsWindow(hLV)) {
             DWORD tid = GetWindowThreadProcessId(hLV, nullptr);
             if (tid != 0) {
                 // Install hook ONLY on the Explorer UI thread
