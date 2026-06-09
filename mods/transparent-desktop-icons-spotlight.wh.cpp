@@ -615,7 +615,7 @@ void RefreshWallpaperAndStyle() {
     if (g_renderEvent) SetEvent(g_renderEvent);
 
     // Clean up COM if we initialized it
-    if (hrCom == S_OK) CoUninitialize();
+    if (SUCCEEDED(hrCom)) CoUninitialize();
 }
 
 ////////////////////////////////////////////////////////////////////////////////
