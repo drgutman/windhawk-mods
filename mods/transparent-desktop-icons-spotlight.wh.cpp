@@ -2,7 +2,7 @@
 // @id              transparent-desktop-icons-spotlight
 // @name            "Ab Tenebris" - Transparent Desktop Icons with Spotlight and Dynamic Shadows
 // @description     Make desktop icons transparent when idle with an interactive spotlight effect. Hover over the desktop or select icons to reveal them.
-// @version         2.0.0
+// @version         2.10.0
 // @author          drgutman
 // @github          https://github.com/drgutman
 // @homepage        https://instagram.com/drgutman
@@ -590,7 +590,7 @@ static const uint8_t BLUE_NOISE_64x64[4096] = {
     0x72, 0x07, 0x87, 0xF5, 0x2D, 0xA0, 0xD4, 0x82, 0xFD, 0xB9, 0x9C, 0xAF, 0x0F, 0xF1, 0x83, 0x49,
 };
 
-constexpr uint32_t CACHE_VERSION = 205;
+constexpr uint32_t CACHE_VERSION = 207; // [CORE-CENTER v2.8.3] layer offsetX/Y semantics changed (anchor -> layerPad): old saved layers would restore with corner-pinned growth
 
 ////////////////////////////////////////////////////////////////////////////////
 // Timer IDs
@@ -601,6 +601,7 @@ constexpr uint32_t CACHE_VERSION = 205;
 #define TIMER_ID_FOCUS_RETRY        7   // Catch asynchronous label expansion on focus change
 #define TIMER_ID_EXPLORER_SETTLE    10  // Once-a-second check for Explorer settling, then one resync
 #define TIMER_ID_COLLAPSE_POLL      11  // Fast poll while a selection-collapse hold is active
+#define TIMER_ID_ZOOM_SETTLE        12  // [SLITHER v2.5.2] One-shot re-poll after a zoom change
 
 // WM_APP_TRIGGER_REFRESH wParam tags: how deep the refresh must go.
 // Wallpaper-only churn (Colors/Wallpapers keys) must NOT wipe icon caches.
@@ -624,6 +625,7 @@ UINT WM_APP_DEVICE_LOST = 0;
 UINT WM_APP_TRIGGER_REFRESH = 0;
 UINT WM_APP_SELECTION_UPDATE = 0;
 UINT WM_APP_DEFERRED_INIT = 0;
+UINT WM_APP_FOCUSSTORM = 0;     // render thread -> UI thread: focus-toggle hack (drag release)
 
 // Boot-sequence file log. DebugView's boot capture is unreliable for
 // user-mode OutputDebugString from early-boot processes, so the [BOOT]
@@ -649,6 +651,35 @@ static void BootLog(const wchar_t* fmt, ...) {
     LARGE_INTEGER liEnd = {};
     SetFilePointerEx(hFile, liEnd, nullptr, FILE_END);
     wchar_t line[320];
+    int len = swprintf_s(line, L"%llu\t[pid %u]\t%s\r\n", GetTickCount64(), GetCurrentProcessId(), buf);
+    if (len > 0) {
+        DWORD written = 0;
+        WriteFile(hFile, line, (DWORD)(len * sizeof(wchar_t)), &written, nullptr);
+    }
+    CloseHandle(hFile);
+}
+
+// Same append-to-file pattern as BootLog but for runtime bug-hunt diagnostics
+// ([GHOST]/[SHADOW]/[MASK] sites) — DbgView isn't always running, so the AI
+// can read these straight off disk during a repro.
+static void DiagLog(const wchar_t* fmt, ...) {
+    wchar_t buf[512];
+    va_list args;
+    va_start(args, fmt);
+    _vsnwprintf_s(buf, _TRUNCATE, fmt, args);
+    va_end(args);
+    Wh_Log(L"%s", buf);
+
+    WCHAR storagePath[MAX_PATH];
+    if (Wh_GetModStoragePath(storagePath, MAX_PATH) <= 0) return;
+    std::wstring filePath = std::wstring(storagePath) + L"\\diag_log.txt";
+    HANDLE hFile = CreateFileW(filePath.c_str(), FILE_APPEND_DATA,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+    LARGE_INTEGER liEnd = {};
+    SetFilePointerEx(hFile, liEnd, nullptr, FILE_END);
+    wchar_t line[576];
     int len = swprintf_s(line, L"%llu\t[pid %u]\t%s\r\n", GetTickCount64(), GetCurrentProcessId(), buf);
     if (len > 0) {
         DWORD written = 0;
@@ -694,6 +725,7 @@ struct Settings {
     int selectionFadeOutDuration;
 
     bool toggleOnDoubleClick;
+    bool overlayEnabled;
     int toggleFadeInDuration;
     int toggleFadeOutDuration;
 
@@ -711,6 +743,7 @@ struct Settings {
 
     int targetFps;
     int cacheMode;
+    bool customArrowEnabled;
     int customArrowScale;
     int customArrowOffsetX;
     int customArrowOffsetY;
@@ -736,6 +769,10 @@ std::atomic<bool> g_isCustomShortcutArrow{false};
 // Icon Snapshot & Light Math
 struct IconSnapshot {
     int imageIndex;
+    // LV item index at staging time (raw.index). Transient: never persisted,
+    // never copied at publish. The identity tiebreaker for same-named icons
+    // (see oldSnapshotsMulti in ProcessSnapshotData).
+    int lvIndex = -1;
     RECT iconRect;
     RECT boundsRect;
     RECT labelRect;
@@ -756,7 +793,11 @@ struct IconSnapshot {
     std::wstring customIconPath;
     int customIconIndex = 0;
     uint64_t cacheKey;     // <--- Unique key for the cache (hash of path for thumbs)
-    uint64_t labelCacheKey;
+    // [F1] arrow-generation counter at combo build time. Bumped on any change
+    // that alters the baked-in arrow without changing a combo hash (arrow
+    // settings, custom-arrow registry flip). Manifest restore leaves it 0,
+    // which deliberately rebuilds all combos once on boot (pre-skip behavior).
+    uint32_t arrowGen = 0;
     uint64_t comboHash_c = 0; // Unified pipeline hash for collapsed state
     uint64_t comboHash_e = 0; // Unified pipeline hash for extended state
     RECT combinedRect = {0, 0, 0, 0}; // Unified bounding box of icon + label
@@ -774,6 +815,15 @@ struct IconSnapshot {
     bool pendingCollapse = false;
     ULONGLONG pendingCollapseStart = 0;
     RECT heldCollapseRect = {0, 0, 0, 0}; // boundsRect frozen at selection loss
+    // --- COMPOSITE GEOMETRY STAMPS (persisted in the disk manifest) ---
+    // The label dims each combo hash was BUILT with. The poll compares these
+    // against the live labelRect and invalidates + rebuilds a composite that
+    // was baked from stale geometry (e.g. a deep pass that captured a
+    // collapsed rect while the state said expanded — the boot-restore race
+    // that produced truncated "expanded" silhouettes).
+    RECT comboRect_c = {0, 0, 0, 0};
+    RECT comboRect_e = {0, 0, 0, 0};
+    ULONGLONG lastComboRebuildReq = 0; // poll-side debounce, transient
 };
 
 // How long (ms) an icon keeps full-rect cookie-cut coverage after losing its
@@ -809,10 +859,14 @@ struct CompositeData {
     SilhouetteData pc2_e;    // pc1 + Extended Label
     std::vector<SavedShadowLayer> shadows_c; // Pre-baked shadow layers for collapsed state
     std::vector<SavedShadowLayer> shadows_e; // Pre-baked shadow layers for extended state
+    // [F1/P1.1] Arrow generation the entry was baked with. NOT serialized:
+    // disk-loaded entries carry 0 (unknown) and are never trusted by the
+    // disk-hit skip; RAM entries written this session carry the real gen.
+    uint32_t arrowGen = 0;
 };
 
 
-inline uint64_t GenerateComboHash(uint64_t baseIconHash, int overlayIndex, UINT labelW, UINT labelH, uint64_t shadowBakeHash, uint64_t labelTextHash) {
+inline uint64_t GenerateComboHash(uint64_t baseIconHash, int overlayIndex, UINT labelW, UINT labelH, uint64_t shadowBakeHash, uint64_t labelTextHash, UINT scalePermille = 1000) {
     uint64_t hash = baseIconHash;
     hash ^= (uint64_t)overlayIndex + 0x9e3779b97f4a7c15ULL;
     hash *= 1099511628211ULL;
@@ -823,6 +877,14 @@ inline uint64_t GenerateComboHash(uint64_t baseIconHash, int overlayIndex, UINT 
     hash ^= labelTextHash + 0xd6e8feb86659fd93ULL;
     hash *= 1099511628211ULL;
     hash ^= shadowBakeHash + 0x8527a89c1e4b3d5fULL;
+    hash *= 1099511628211ULL;
+    // [MULTIMON v2.9.4] Explorer draws desktop icons at PER-MONITOR DPI scale
+    // (measured: 94px icons @125% primary vs 75px @100% secondary — ratio
+    // 96/120). The combo content is baked at the item's render scale, so the
+    // scale must be part of the address. Usually redundant (label dims
+    // already differ per monitor) but required for no-label items where
+    // monitor-1 and monitor-2 geometry would otherwise collide.
+    hash ^= (uint64_t)scalePermille + 0x0d94d6a8f7c3b2e1ULL;
     hash *= 1099511628211ULL;
     return hash;
 }
@@ -904,6 +966,11 @@ HANDLE              g_hUnloadEvent = nullptr;
 SafeThread       g_regThread;
 HANDLE       g_hRegStopEvent = nullptr;
 
+// Ab Tenebris config-file watcher (settings.cfg; see the config layer above
+// LoadSettings). The settings window (tool mod) writes the file, we re-read.
+SafeThread       g_cfgThread;
+HANDLE       g_hCfgStopEvent = nullptr;
+
 HHOOK        g_bootstrapHook = nullptr; // Thread-local bootstrap hook
 
 // DirectX pipeline resources
@@ -941,6 +1008,21 @@ static constexpr float kBatSpotOvalScale = 0.465f;
 ComPtr<IDCompositionDevice>  g_compositionDevice;
 ComPtr<IDCompositionTarget>  g_compositionTarget;
 ComPtr<IDCompositionVisual>  g_compositionVisual;
+// [TINT-SPLIT v2.9.26] Two composition visuals on the overlay window:
+// bottom = wallpaper replica (opaque at the mask glyphs), top = tint veil.
+// DWM then blends the tint over BOTH the replica glyphs and the real
+// desktop in ONE composition pass / one color space. Under HDR DWM
+// composites in linear FP16 scRGB while our 8-bit D2D draws blend in gamma
+// space — the single-surface tint was mixed by two transfer functions (the
+// miscolored/lighter cutouts, direction color-pair dependent, Doc
+// field-proven). v2.9.24's attempt failed on IDCompositionVisual::AddVisual
+// NULL-reference semantics (MSDN: insertAbove=TRUE with NULL reference =
+// BELOW all siblings) — the explicit referenceVisual form removes the trap.
+ComPtr<IDXGISwapChain1>      g_tintSwapChain;
+ComPtr<ID2D1DeviceContext>   g_tintDc;
+ComPtr<ID2D1Bitmap1>         g_tintTargetBitmap;
+ComPtr<IDCompositionVisual>  g_rootVisual;
+ComPtr<IDCompositionVisual>  g_tintCompVisual;
 ComPtr<IDCompositionDevice>  g_underlayCompDevice;
 
 // Textures, brushes, and effects
@@ -974,6 +1056,10 @@ bool                       g_hasWallpaper = false;          // True if a wallpap
 D2D1_COLOR_F               g_desktopBgColor = {0.0f, 0.0f, 0.0f, 1.0f};
 DESKTOP_WALLPAPER_POSITION g_wallpaperPosition = DWPOS_CENTER; // Enum replaces int style and bool tile
 std::wstring               g_currentWallpaperPath;           // Path of currently loaded wallpaper (for change detection)
+// [MULTIMON v2.9.4] Per-monitor wallpaper tiles (defined next to the builder
+// further down; the overlay render consumes the table directly).
+struct MonitorTile { RECT rect; };
+static std::vector<MonitorTile> g_monitorTiles; // guarded by g_renderMutex
 FILETIME                   g_lastWallpaperWriteTime = {0, 0}; // Track file modifications!
 
 // WIC factory
@@ -982,6 +1068,11 @@ ComPtr<IWICImagingFactory> g_workerWicFactory;
 
 // Generic icon baselines for fallback detection
 SilhouetteData g_genericFileBaseline;
+// [PIXEL-GENERIC v2.1.10] Windows serves SEVERAL different generic-document
+// renderings depending on the path it resolved (association-based doc,
+// SIID_DOCNOASSOC stock doc, classic shell32 doc). ImageList churn can serve
+// any of them, so placeholder detection compares against all variants.
+std::vector<SilhouetteData> g_genericFileBaselines;
 SilhouetteData g_genericFolderBaseline;
 bool g_baselinesReady = false;
 int g_baselineTargetSize = 0;
@@ -990,6 +1081,35 @@ int g_baselineTargetSize = 0;
 std::atomic<HIMAGELIST> g_cachedImageList{nullptr};
 std::atomic<int> g_cachedIconSize{48};
 std::atomic<int> g_lastSnapshotIconSize{48};
+// [P1.2] Zoom changed: the LEAVING zoom's shape keys must reach
+// icon_shapes.bin before the manifest switches to the new zoom (the
+// debounced 30s save misses quick A->B legs). The [ZOOM] marker sets this;
+// the next pass end honors it with a throttle-bypassing save. Cheap flag
+// here, file I/O on the worker at pass end — never on the zoom T0 path.
+std::atomic<bool> g_shapeSaveForced{false};
+// [STAGE A v2.4.0] Zoom fast path: the [ZOOM] marker stores the new icon
+// size here and wakes the snapshot worker. The worker restores the target
+// zoom's cached manifest + silhouettes BEFORE the (slow) deep pass runs, so
+// known zooms display near-instantly; the pass behind it validates. 0 = no
+// request. Coalesced by design: only the latest stored zoom runs.
+std::atomic<int> g_stageARequestZoom{0};
+// [SLITHER v2.5.3] Tick of the last [ZOOM] event. The publish guard uses it
+// to know a pass is racing Explorer's layout settle; PASS-END uses it to
+// re-arm the settle re-poll when a pass finishes after the 800ms re-poll
+// already fired (the late republish would otherwise reinstate the slither).
+std::atomic<ULONGLONG> g_lastZoomTick{0};
+// [STAGE A v2.4.1] The zoom being LEFT (prevSize at the marker). The worker
+// snapshots the still-live manifest for it and queues its cache-file save
+// BEFORE the geometry swap — cache files are per zoom level, and a leg that
+// ends before any pass-end save ran leaves its file missing (measured:
+// "no cached manifest" on both legs of a 46<->41 cycle whose composites
+// were fully alive in the RAM mirror).
+std::atomic<int> g_stageALeavingZoom{0};
+
+// [STAGE A v2.4.0] Defined further down (worker section); the [ZOOM] marker
+// wakes the worker directly so the cached-state restore never waits for the
+// poll cadence (measured 31ms..921ms ZOOM->PASS-START spread).
+extern HANDLE g_snapshotWorkerEvent;
 
 inline void UpdateCachedImageList(HWND hLV) {
     if (!hLV) return;
@@ -998,7 +1118,34 @@ inline void UpdateCachedImageList(HWND hLV) {
     if (hIL) {
         int cx = 0, cy = 0;
         ImageList_GetIconSize(hIL, &cx, &cy);
-        if (cx > 0) g_cachedIconSize.store(cx, std::memory_order_relaxed);
+        if (cx > 0) {
+            // [PERF-AUDIT v2.2.6] T0 marker for the zoom pipeline timeline.
+            int prevSize = g_cachedIconSize.exchange(cx, std::memory_order_relaxed);
+            if (prevSize != cx) {
+                DiagLog(L"[ZOOM] icon size %d -> %d (pipeline T0)", prevSize, cx);
+                g_lastZoomTick.store(GetTickCount64(), std::memory_order_relaxed); // [SLITHER v2.5.3]
+                g_shapeSaveForced.store(true, std::memory_order_relaxed); // [P1.2]
+                // [STAGE A v2.4.0] request the cached-state restore and wake
+                // the worker directly — display must not wait for the poll
+                // cadence to queue the deep pass (measured 31ms..921ms).
+                g_stageARequestZoom.store(cx, std::memory_order_relaxed);
+                g_stageALeavingZoom.store(prevSize, std::memory_order_relaxed);
+                if (g_snapshotWorkerEvent) SetEvent(g_snapshotWorkerEvent);
+                // [SLITHER v2.5.2] The deep pass now runs ~50ms after T0
+                // (the pacing fix made it fast enough to beat Explorer's
+                // layout settle) and captures rects ~2px above the settled
+                // positions — the sliver at icon bottoms. While idle NOTHING
+                // re-measures (the 1s heartbeat doesn't run the poll), so
+                // the slither persisted until the user touched focus. One
+                // re-poll after the settle window heals it autonomously.
+                // SetTimer resets on rapid zooms — last zoom wins. (Not
+                // ArmSnapRetry: its earliest-deadline rule would let a
+                // shorter pending retry swallow this re-measure.)
+                if (g_overlayWnd && IsWindow(g_overlayWnd)) {
+                    SetTimer(g_overlayWnd, TIMER_ID_ZOOM_SETTLE, 800, nullptr);
+                }
+            }
+        }
     }
 }
 
@@ -1037,6 +1184,14 @@ HWND              g_cachedHwndShellView   = nullptr;
 HWND              g_cachedHwndDesktopHost = nullptr;
 std::vector<RECT> g_selectedRects;
 bool              g_isEditing             = false;
+// [EDIT-SHADOW-OFF v2.7.3] LV index of the item whose label is being edited,
+// -1 when not editing. Atomic: the underlay thread reads it per frame. While
+// set, the UNDERLAY SKIPS DRAWING that icon's shadow entirely (Doc ruling:
+// the label cutout is glyph-shaped for the text AT CAPTURE TIME and never
+// tracks keystrokes, so the shadow would show a stale word under a live
+// editbox). No combo rebuild, no pass, no keypress monitoring — the skip is
+// per-frame, and the shadow returns the moment the index clears.
+std::atomic<int>  g_editingLvIndex{-1};
 
 // DPI scaling factor
 std::atomic<float> g_dpiScale{1.0f};
@@ -1127,6 +1282,8 @@ struct DiskManifestHeader {
     RECT boundsRect;
     RECT labelRect;
     RECT combinedRect;
+    RECT comboLabelRect_c;
+    RECT comboLabelRect_e;
     uint64_t cacheKey;
     uint64_t comboHash_c;
     uint64_t comboHash_e;
@@ -1202,6 +1359,54 @@ public:
 
     std::wstring GetCacheFilePath() const { return m_cacheFilePath; }
 
+    // [STAGE A v2.4.2] Per-zoom cache files: shadow_cache_v2.z<zoom>.bin.
+    // The old single-file design carried the zoom in its HEADER and
+    // OpenValidCacheFile DELETED the whole cache on a zoom mismatch — any
+    // cross-zoom load detonated it (Stage A was the first such caller and
+    // nuked the cache on every zoom change, measured 2026-11-06). One file
+    // per zoom level; the header zoom check stays as a per-file sanity.
+    std::wstring CacheFilePathFor(int zoom) const {
+        std::wstring base = m_cacheFilePath;
+        size_t slash = base.find_last_of(L"\\/");
+        std::wstring dir, name;
+        if (slash == std::wstring::npos) {
+            name = base;
+        } else {
+            dir = base.substr(0, slash + 1);
+            name = base.substr(slash + 1);
+        }
+        size_t dot = name.rfind(L'.');
+        std::wstring stem = (dot == std::wstring::npos) ? name : name.substr(0, dot);
+        std::wstring ext = (dot == std::wstring::npos) ? L"" : name.substr(dot);
+        return dir + stem + L".z" + std::to_wstring(zoom) + ext;
+    }
+
+    // Delete every per-zoom cache file (settings cache clear, mode changes).
+    void DeleteAllZoomCacheFiles() {
+        std::wstring base = m_cacheFilePath;
+        size_t slash = base.find_last_of(L"\\/");
+        std::wstring dir, name;
+        if (slash == std::wstring::npos) {
+            name = base;
+        } else {
+            dir = base.substr(0, slash + 1);
+            name = base.substr(slash + 1);
+        }
+        size_t dot = name.rfind(L'.');
+        std::wstring stem = (dot == std::wstring::npos) ? name : name.substr(0, dot);
+        std::wstring ext = (dot == std::wstring::npos) ? L"" : name.substr(dot);
+        std::wstring pattern = dir + stem + L".z*" + ext;
+        WIN32_FIND_DATAW fd = {};
+        HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
+        if (hFind == INVALID_HANDLE_VALUE) return;
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                DeleteFileW((dir + fd.cFileName).c_str());
+            }
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+    }
+
     void Init() {
         WCHAR pathBuffer[MAX_PATH];
         if (Wh_GetModStoragePath(pathBuffer, MAX_PATH) > 0) {
@@ -1216,10 +1421,17 @@ public:
 
     void CleanupOrphans() {
         DeleteFileW(m_tempFilePath.c_str());
+        // [STAGE A v2.4.2] the legacy single-file cache is orphaned by the
+        // per-zoom scheme; remove it once so its entries re-bake per zoom.
+        DeleteFileW(m_cacheFilePath.c_str());
     }
 
     void LoadManifestFromDisk(float dpi, int zoom, uint64_t themeFontHash);
+    std::vector<IconSnapshot> LoadManifestOnly(float dpi, int zoom, uint64_t themeFontHash);
+    // [STAGEA-DIAG v2.4.1] diagnostics access to the private file opener.
+    HANDLE DebugOpenCacheFile(float dpi, int zoom, uint64_t themeFontHash, CacheFileHeader& header);
     void LoadCompositesFromDisk(float dpi, int zoom, uint64_t themeFontHash);
+    void MergeCompositesFromDisk(float dpi, int zoom, uint64_t themeFontHash);
     void SaveToDisk(float dpi, int zoom, uint64_t themeFontHash, std::vector<IconSnapshot> manifest);
     void QueueSave(float dpi, int zoom, uint64_t themeFontHash, std::vector<IconSnapshot> manifest);
     void JoinSaveThread();
@@ -1404,9 +1616,11 @@ HANDLE DiskCacheManager::OpenValidCacheFile(float dpi, int zoom, uint64_t themeF
         Wh_Log(L"[DISKCACHE] Load skipped: cacheMode is 0");
         return nullptr;
     }
-    HANDLE hFile = CreateFileW(m_cacheFilePath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    // [STAGE A v2.4.2] one file per zoom level.
+    std::wstring zoomFilePath = CacheFilePathFor(zoom);
+    HANDLE hFile = CreateFileW(zoomFilePath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hFile == INVALID_HANDLE_VALUE) {
-        Wh_Log(L"[DISKCACHE] No cache file found at \"%s\" (err=%lu)", m_cacheFilePath.c_str(), GetLastError());
+        Wh_Log(L"[DISKCACHE] No cache file found at \"%s\" (err=%lu)", zoomFilePath.c_str(), GetLastError());
         return nullptr;
     }
 
@@ -1418,16 +1632,25 @@ HANDLE DiskCacheManager::OpenValidCacheFile(float dpi, int zoom, uint64_t themeF
     }
 
     if (header.magic != 0x53484144 || header.version != CACHE_VERSION ||
-        std::fabs(header.dpiScale - dpi) > 0.01f || header.iconZoomLevel != zoom ||
+        std::fabs(header.dpiScale - dpi) > 0.01f ||
         header.themeFontHash != themeFontHash) {
-        Wh_Log(L"[DISKCACHE] Header mismatch, deleting cache: magic=%s version=%u/%u dpi=%.3f/%.3f zoom=%d/%d font=%llu/%llu",
+        // [STAGE A v2.4.2] dpi/font/version mismatch = stale for this zoom:
+        // delete ONLY this zoom's file. The old code deleted the shared
+        // single file here, taking every other zoom's cache with it.
+        Wh_Log(L"[DISKCACHE] Header mismatch, deleting zoom cache: magic=%s version=%u/%u dpi=%.3f/%.3f font=%llu/%llu",
                (header.magic == 0x53484144) ? L"ok" : L"BAD",
                header.version, CACHE_VERSION,
                header.dpiScale, dpi,
-               header.iconZoomLevel, zoom,
                (unsigned long long)header.themeFontHash, (unsigned long long)themeFontHash);
         CloseHandle(hFile);
-        DeleteFileW(m_cacheFilePath.c_str());
+        DeleteFileW(zoomFilePath.c_str());
+        return nullptr;
+    }
+    if (header.iconZoomLevel != zoom) {
+        // Belongs to another zoom (renamed leftover): never delete — the
+        // other zoom's file is named for its own level. Just decline.
+        Wh_Log(L"[DISKCACHE] Zoom mismatch in per-zoom file: %d/%d", header.iconZoomLevel, zoom);
+        CloseHandle(hFile);
         return nullptr;
     }
 
@@ -1444,13 +1667,16 @@ HANDLE DiskCacheManager::OpenValidCacheFile(float dpi, int zoom, uint64_t themeF
 // underlay can draw the icon layout on Frame 1. The heavy composite blobs are
 // decompressed later by the snapshot worker (LoadCompositesFromDisk), so boot
 // never blocks on disk I/O under g_renderMutex.
-void DiskCacheManager::LoadManifestFromDisk(float dpi, int zoom, uint64_t themeFontHash) {
+// [STAGE A v2.4.0] Read the per-zoom cache file's layout manifest
+// (geometry + combo hashes + identity), no GPU work, no publish. Shared by
+// the boot Frame-1 bootstrap and the Stage A zoom fast path.
+std::vector<IconSnapshot> DiskCacheManager::LoadManifestOnly(float dpi, int zoom, uint64_t themeFontHash) {
+    std::vector<IconSnapshot> loadedSnapshots;
     CacheFileHeader header = {};
     HANDLE hFile = OpenValidCacheFile(dpi, zoom, themeFontHash, header);
-    if (!hFile) return;
+    if (!hFile) return loadedSnapshots;
 
     // Read Manifest if present to enable Frame-1 Instant Launch
-    std::vector<IconSnapshot> loadedSnapshots;
     if (header.manifestCount > 0 && header.manifestOffset > 0 && header.manifestCount <= 10000) {
         LARGE_INTEGER liManifest;
         liManifest.QuadPart = header.manifestOffset;
@@ -1468,6 +1694,8 @@ void DiskCacheManager::LoadManifestFromDisk(float dpi, int zoom, uint64_t themeF
                 snap.boundsRect = dmh.boundsRect;
                 snap.labelRect = dmh.labelRect;
                 snap.combinedRect = dmh.combinedRect;
+                snap.comboRect_c = dmh.comboLabelRect_c;
+                snap.comboRect_e = dmh.comboLabelRect_e;
                 snap.cacheKey = dmh.cacheKey;
                 snap.comboHash_c = dmh.comboHash_c;
                 snap.comboHash_e = dmh.comboHash_e;
@@ -1489,6 +1717,15 @@ void DiskCacheManager::LoadManifestFromDisk(float dpi, int zoom, uint64_t themeF
     }
 
     CloseHandle(hFile);
+    return loadedSnapshots;
+}
+
+HANDLE DiskCacheManager::DebugOpenCacheFile(float dpi, int zoom, uint64_t themeFontHash, CacheFileHeader& header) {
+    return OpenValidCacheFile(dpi, zoom, themeFontHash, header);
+}
+
+void DiskCacheManager::LoadManifestFromDisk(float dpi, int zoom, uint64_t themeFontHash) {
+    std::vector<IconSnapshot> loadedSnapshots = LoadManifestOnly(dpi, zoom, themeFontHash);
 
     // FRAME-1 BOOTSTRAP: Pre-populate g_iconSnapshots so the Underlay draws immediately
     if (!loadedSnapshots.empty()) {
@@ -1564,6 +1801,54 @@ void DiskCacheManager::LoadCompositesFromDisk(float dpi, int zoom, uint64_t them
     }
 }
 
+// [STAGE A v2.4.3] Merge-mode composite load for the zoom fast path: read
+// the zoom file's entries into the RAM mirror WITHOUT replacing it —
+// session-built entries keep their arrowGen stamps, disk entries only fill
+// holes. Boot keeps the replace-semantics loader above.
+void DiskCacheManager::MergeCompositesFromDisk(float dpi, int zoom, uint64_t themeFontHash) {
+    ULONGLONG t0 = GetTickCount64();
+    CacheFileHeader header = {};
+    HANDLE hFile = OpenValidCacheFile(dpi, zoom, themeFontHash, header);
+    if (!hFile) return;
+
+    std::vector<CacheFileEntryMeta> metas(header.entryCount);
+    DWORD metaSize = header.entryCount * sizeof(CacheFileEntryMeta);
+    DWORD bytesRead = 0;
+    if (!ReadFile(hFile, metas.data(), metaSize, &bytesRead, nullptr) || bytesRead != metaSize) {
+        CloseHandle(hFile);
+        return;
+    }
+
+    size_t added = 0, skipped = 0;
+    for (const auto& meta : metas) {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_memoryCache.find(meta.comboHash) != m_memoryCache.end()) { ++skipped; continue; }
+        }
+        LARGE_INTEGER liOffset;
+        liOffset.QuadPart = meta.fileOffset;
+        if (!SetFilePointerEx(hFile, liOffset, nullptr, FILE_BEGIN)) continue;
+
+        CompositeData comp;
+        if (!ReadSilhouette(hFile, comp.pc1)) continue;
+        if (!ReadSilhouette(hFile, comp.pc2_c)) continue;
+        if (!ReadSilhouette(hFile, comp.pc2_e)) continue;
+        if (!ReadShadowLayers(hFile, comp.shadows_c)) continue;
+        if (!ReadShadowLayers(hFile, comp.shadows_e)) continue;
+
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_memoryCache.find(meta.comboHash) == m_memoryCache.end()) {
+            m_memoryCache[meta.comboHash] = std::move(comp);
+            m_comboToProfile[meta.comboHash] = meta.profileHash;
+            m_profileToCombos[meta.profileHash].insert(meta.comboHash);
+            m_profileLastUsed[meta.profileHash] = GetTickCount64();
+            ++added;
+        }
+    }
+    CloseHandle(hFile);
+    Wh_Log(L"[DISKCACHE] Merged zoom %d composites: +%zu (skipped %zu) in %llums", zoom, added, skipped, GetTickCount64() - t0);
+}
+
 void DiskCacheManager::SaveToDisk(float dpi, int zoom, uint64_t themeFontHash, std::vector<IconSnapshot> manifest) {
     if (m_cacheMode == 0) {
         m_isDirty.store(false, std::memory_order_relaxed);
@@ -1591,7 +1876,10 @@ void DiskCacheManager::SaveToDisk(float dpi, int zoom, uint64_t themeFontHash, s
         return;
     }
 
-    HANDLE hFile = CreateFileW(m_tempFilePath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    // [STAGE A v2.4.2] per-zoom target file + matching temp.
+    const std::wstring zoomFilePath = CacheFilePathFor(zoom);
+    const std::wstring zoomTempPath = zoomFilePath + L".tmp";
+    HANDLE hFile = CreateFileW(zoomTempPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hFile == INVALID_HANDLE_VALUE) return; // Dirty stays set: next pass retries
 
     CacheFileHeader header;
@@ -1654,6 +1942,8 @@ void DiskCacheManager::SaveToDisk(float dpi, int zoom, uint64_t themeFontHash, s
             dmh.boundsRect = snap.boundsRect;
             dmh.labelRect = snap.labelRect;
             dmh.combinedRect = snap.combinedRect;
+            dmh.comboLabelRect_c = snap.comboRect_c;
+            dmh.comboLabelRect_e = snap.comboRect_e;
             dmh.cacheKey = snap.cacheKey;
             dmh.comboHash_c = snap.comboHash_c;
             dmh.comboHash_e = snap.comboHash_e;
@@ -1690,7 +1980,7 @@ void DiskCacheManager::SaveToDisk(float dpi, int zoom, uint64_t themeFontHash, s
         // Failed/partial save: discard the temp file and keep dirty set so a
         // later pass retries. The previous cache file remains intact.
         Wh_Log(L"[DISKCACHE] Save FAILED (write error), keeping old cache");
-        DeleteFileW(m_tempFilePath.c_str());
+        DeleteFileW(zoomTempPath.c_str());
         return;
     }
 
@@ -1699,18 +1989,18 @@ void DiskCacheManager::SaveToDisk(float dpi, int zoom, uint64_t themeFontHash, s
     bool moved = false;
     for (int attempt = 0; attempt < 3 && !moved; ++attempt) {
         if (attempt > 0) Sleep(25);
-        moved = MoveFileExW(m_tempFilePath.c_str(), m_cacheFilePath.c_str(), MOVEFILE_REPLACE_EXISTING);
+        moved = MoveFileExW(zoomTempPath.c_str(), zoomFilePath.c_str(), MOVEFILE_REPLACE_EXISTING);
         if (!moved) {
             Wh_Log(L"[DISKCACHE] MoveFileExW attempt %d/3 failed (err=%lu)", attempt + 1, GetLastError());
         }
     }
     if (!moved) {
         Wh_Log(L"[DISKCACHE] MoveFileExW failed after retries, keeping old cache");
-        DeleteFileW(m_tempFilePath.c_str());
+        DeleteFileW(zoomTempPath.c_str());
         return;
     }
 
-    Wh_Log(L"[DISKCACHE] Saved %u entries & %u manifest items to \"%s\"", header.entryCount, manifestCount, m_cacheFilePath.c_str());
+    Wh_Log(L"[DISKCACHE] Saved %u entries & %u manifest items to \"%s\"", header.entryCount, manifestCount, zoomFilePath.c_str());
     if (m_dataGeneration.load(std::memory_order_relaxed) == startGeneration) {
         m_isDirty.store(false, std::memory_order_relaxed);
     }
@@ -1799,6 +2089,25 @@ std::mutex g_snapshotRequestMutex;
 std::vector<RawListItem> g_snapshotRequestItems;
 std::wstring g_snapshotUserDesktop;
 std::wstring g_snapshotPublicDesktop;
+
+// [F1 SKIP GUARD] Bumped whenever an input that affects the BAKED-IN pc1
+// arrow can change without changing any combo hash (arrow settings change,
+// custom-arrow registry flip). Snapshots record the generation at build
+// time; the combo skip requires a match. Starts at 1 so manifest-restored
+// snapshots (gen 0) rebuild once on boot — the pre-skip behavior anyway.
+std::atomic<uint32_t> g_arrowGen{1};
+// [P1.1] Set by LoadSettings when a baked-pixel input (shadow params or
+// arrow scale/offsets) actually changed. Wh_ModSettingsChanged consumes it:
+// only THEN does g_arrowGen bump and stand down the skip guard. A settings
+// load that changed nothing relevant must NOT invalidate the whole
+// composite mirror (measured 2026-11-05: every unconditional bump forced a
+// full-leg combo rebuild, zoom revisit 797ms -> 1188ms).
+std::atomic<bool> g_bakedInputsChanged{false};
+
+// [F2 GLYPH CACHE] Bumped on every captured-font change (QueueFullSnapshot);
+// RenderGlyphSilhouette's cache keys include it, so a new font invalidates
+// the whole cache. Defined here because the font-capture site runs earlier.
+std::atomic<uint32_t> g_labelFontGen{1};
 // Label font captured on the UI thread (WM_GETFONT of the desktop ListView)
 // so the worker can render letter-shaped label silhouettes without ever
 // messaging Explorer's windows cross-thread.
@@ -1811,6 +2120,10 @@ HFONT g_snapshotLabelHFont = nullptr;
 bool g_snapshotRequestPending = false;
 HANDLE g_snapshotWorkerEvent = nullptr;
 SafeThread g_snapshotWorkerThread;
+// [MULTIMON v2.9.7] Wake/topology watchdog (defined after BuildMonitorTiles):
+// heals stale overlay/underlay union sizes. Called from the 1s heartbeat
+// (RevalidateDesktopWindows) and the WM_DISPLAYCHANGE handler.
+void RepairDesktopCoverage();
 // Retired label fonts: the UI thread stops owning a font the moment it
 // captures a new one, but an in-flight worker pass may still hold the old
 // HFONT. Deleting it immediately is a use-after-free race; parking it here
@@ -1822,7 +2135,10 @@ void SnapshotWorkerThreadProc();
 void PreflightShadowAssets(const Settings& localSettings);
 void ProcessSnapshotData(const std::vector<RawListItem>& rawItems, const std::wstring& userDesktop, const std::wstring& publicDesktop,
                          HFONT labelFont, const LOGFONTW& labelLogfont);
+void ProcessSnapshotData(const std::vector<RawListItem>& rawItems, const std::wstring& userDesktop, const std::wstring& publicDesktop,
+                         HFONT labelFont, const LOGFONTW& labelLogfont, bool mergeIntoExisting);
 void QueueFullSnapshot();
+void QueueFastPathPass(int itemIndex); // per-icon priority pass (click latency fix)
 
 // --- FOLDER WATCHER GLOBALS ---
 std::vector<std::wstring> g_watchedFolderPaths;
@@ -1852,6 +2168,51 @@ struct ShadowCache {
 // New Unified Combo Shadow Cache
 std::unordered_map<uint64_t, ShadowCache> g_comboShadowCache;
 std::mutex g_comboShadowCacheMutex;
+
+// [VRAM v2.4.4 — Doc ruling 2026-11-05: "keep them, screw that upload trail
+// delay"] Combo hashes of the MOST RECENTLY LEFT zoom level: the SILPERSIST
+// sweep keeps their GPU shadow layers instead of stripping (at least the
+// last level survives for instant shadow restore on accidental/return
+// zooms). Replaced on every zoom change — bounded at ~1 level (~80MB);
+// wider retention (10-60s window, user setting) queued for the settings
+// work on the windhawk2/standalone migration.
+std::unordered_set<uint64_t> g_layersKeepHashes;
+std::mutex g_layersKeepHashesMutex;
+
+// [SILFIRST v2.4.0] Publish a combo's silhouette GPU bitmap from CPU alpha,
+// if the cache entry has no sourceBmp yet. Shared by the build branch
+// (freshly rendered pc2), the P1.1 disk-hit skip (cached pc2) and the
+// Stage A zoom restore (mirror/file pc2) — one silhouette-first rule, one
+// implementation. Silhouette-only entries are upgraded in place later.
+static void PublishSilhouetteFromPc2(uint64_t comboHash, const SilhouetteData& pc2) {
+    if (!g_bakeDc || comboHash == 0) return;
+    if (pc2.width == 0 || pc2.height == 0 ||
+        pc2.alphaData.size() != (size_t)pc2.width * pc2.height) return;
+    bool needSilPub = false;
+    {
+        std::lock_guard<std::mutex> shadowLock(g_comboShadowCacheMutex);
+        auto entryIt = g_comboShadowCache.find(comboHash);
+        needSilPub = (entryIt == g_comboShadowCache.end() || !entryIt->second.sourceBmp);
+    }
+    if (!needSilPub) return;
+    std::vector<BYTE> silBgra(pc2.alphaData.size() * 4);
+    for (UINT i = 0; i < pc2.alphaData.size(); ++i) {
+        silBgra[i * 4 + 0] = 0;
+        silBgra[i * 4 + 1] = 0;
+        silBgra[i * 4 + 2] = 0;
+        silBgra[i * 4 + 3] = pc2.alphaData[i];
+    }
+    ComPtr<ID2D1Bitmap1> silBmp;
+    D2D1_BITMAP_PROPERTIES1 silProps = D2D1::BitmapProperties1(
+        D2D1_BITMAP_OPTIONS_NONE,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+    g_bakeDc->CreateBitmap(D2D1::SizeU(pc2.width, pc2.height), silBgra.data(), pc2.width * 4, &silProps, &silBmp);
+    if (silBmp) {
+        std::lock_guard<std::mutex> shadowLock(g_comboShadowCacheMutex);
+        auto& entry = g_comboShadowCache[comboHash];
+        if (!entry.sourceBmp) entry.sourceBmp = silBmp;
+    }
+}
 
 // Maps Windows imageIndex -> Silhouette Hash (lazy-loaded)
 std::unordered_map<uint64_t, uint64_t> g_iconHashCache;
@@ -1908,7 +2269,6 @@ void     UpdateSelectionRects();
 void     RevalidateDesktopWindows();
 bool     ApplyDesktopSubclasses(HWND hLV);
 void     RemoveDesktopSubclasses();
-void     CacheLabelBitmap(uint64_t cacheKey, int w, int h);
 void     BuildGenericBaselines();
 void     ExtractIconAlphaBaseline(HICON hIcon, int targetSize, SilhouetteData& outBaseline);
 
@@ -1919,6 +2279,7 @@ void ArmSnapRetry(UINT delayMs);
 bool UpdateDesktopIconsHiddenState(HWND hLV);
 void RegistryWatcherThread();
 void FolderWatcherThreadProc();
+void ConfigWatcherThreadProc();
 void SnapshotWorkerThreadProc();
 static void StartAuxThreads();
 
@@ -2300,6 +2661,14 @@ void RevalidateDesktopWindows() {
     // (this heartbeat is the only periodic caller when the desktop is idle).
     UpdateDesktopIconsHiddenState(hLV);
 
+    // [MULTIMON v2.9.7] Wake/topology watchdog: monitor power cycles and
+    // desktop-host recreation can leave the overlay/underlay at a stale
+    // union size with NO broadcast to heal them (no mode change -> no
+    // WM_DISPLAYCHANGE; parent growing doesn't resize children -> no
+    // WM_WINDOWPOSCHANGED). Field case: right quarter of the primary bare
+    // after display sleep (log: tiles built with origin=(0,0) at wake).
+    RepairDesktopCoverage();
+
     if (hLV == g_subclassedLV) return;
 
     RemoveDesktopSubclasses();
@@ -2556,7 +2925,7 @@ uint64_t GetEnvironmentHash() {
 // Bump whenever the label/shadow RENDERING math changes (not just settings):
 // baked composites are keyed by the bake hash, so renderer tweaks otherwise
 // keep serving stale disk-cached silhouettes.
-constexpr uint32_t LABEL_RENDERER_VERSION = 28;
+constexpr uint32_t LABEL_RENDERER_VERSION = 31;
 
 uint64_t GetShadowBakeHash(const Settings& s) {
     uint64_t hash = 14695981039346656037ULL;
@@ -2596,6 +2965,60 @@ uint64_t GetShadowBakeHash() {
     return GetShadowBakeHash(s);
 }
 
+// [MULTIMON v2.9.4, CORRECTED v2.9.5] Explorer draws desktop items at
+// PER-MONITOR DPI scale. Measured coherently on the field rig (125% primary
+// + 100% portrait secondary): LVIR_LABEL rects 20px vs 16px tall (the label
+// text itself scales), LVIR_ICON cells 94x50 vs 75x41, baselines/shapes
+// extract at image-list size (46x46), image-list cx cycles 41..51. So the
+// anchor is the MONITOR's DPI ratio — NOT rect-vs-imagelist (those rects are
+// per-monitor-scaled CELLS, ~2x the glyph at the current zoom): glyph =
+// imagelist cx on the system-DPI monitor, cx * monitorDpi/systemDpi
+// elsewhere. The primary is the system-DPI reference (g_dpiScale = its
+// dpi/96), so scale = monitorDpi / primaryDpi; 1.0 on the primary keeps the
+// byte-identical legacy path.
+static float GetItemMonitorScale(HWND hOverlay, const RECT& localRect) {
+    if (!hOverlay || !IsWindow(hOverlay)) return 1.0f;
+    if (localRect.right <= localRect.left || localRect.bottom <= localRect.top) return 1.0f;
+    POINT c = { (localRect.left + localRect.right) / 2, (localRect.top + localRect.bottom) / 2 };
+    if (!ClientToScreen(hOverlay, &c)) return 1.0f;
+    HMONITOR hMon = MonitorFromPoint(c, MONITOR_DEFAULTTONEAREST);
+    UINT dx = 96, dy = 96;
+    if (FAILED(GetDpiForMonitor(hMon, MDT_EFFECTIVE_DPI, &dx, &dy))) return 1.0f;
+    float primaryDpi = g_dpiScale.load(std::memory_order_relaxed) * 96.0f;
+    if (primaryDpi <= 0.0f) primaryDpi = 96.0f;
+    float s = (float)dx / primaryDpi;
+    if (s <= 0.3f || s > 2.0f) return 1.0f;           // degenerate: legacy path
+    if (std::fabs(s - 1.0f) < 0.02f) return 1.0f;     // primary-DPI monitor: byte-identical legacy path
+    return s;
+}
+
+// Box-filter downsample of a silhouette alpha array (area average — clean
+// edges for the 1.25->0.8 scale factors mixed-DPI setups produce).
+static void BoxDownsampleAlpha(const SilhouetteData& src, int dstW, int dstH, std::vector<uint8_t>& dst) {
+    dst.assign((size_t)((dstW > 0 ? dstW : 1)) * (dstH > 0 ? dstH : 1), 0);
+    int sw = (int)src.width, sh = (int)src.height;
+    if (sw <= 0 || sh <= 0 || dstW <= 0 || dstH <= 0 ||
+        src.alphaData.size() != (size_t)sw * (size_t)sh) return;
+    for (int dy = 0; dy < dstH; ++dy) {
+        int y0 = (int)((int64_t)dy * sh / dstH);
+        int y1 = (int)((int64_t)(dy + 1) * sh / dstH);
+        if (y1 <= y0) y1 = y0 + 1;
+        if (y1 > sh) y1 = sh;
+        for (int dx = 0; dx < dstW; ++dx) {
+            int x0 = (int)((int64_t)dx * sw / dstW);
+            int x1 = (int)((int64_t)(dx + 1) * sw / dstW);
+            if (x1 <= x0) x1 = x0 + 1;
+            if (x1 > sw) x1 = sw;
+            UINT acc = 0, n = 0;
+            for (int y = y0; y < y1; ++y) {
+                const uint8_t* row = &src.alphaData[(size_t)y * sw];
+                for (int x = x0; x < x1; ++x) { acc += row[x]; ++n; }
+            }
+            dst[(size_t)dy * dstW + dx] = (uint8_t)((acc + n / 2) / n);
+        }
+    }
+}
+
 float GetMonitorDpiScale(HMONITOR monitor) {
     UINT dpiX = 96, dpiY = 96;
     if (SUCCEEDED(GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY)))
@@ -2608,6 +3031,15 @@ HMONITOR GetWorkerWMonitor() {
     if (hParent)
         return MonitorFromWindow(hParent, MONITOR_DEFAULTTONEAREST);
     return MonitorFromPoint({0, 0}, MONITOR_DEFAULTTONEAREST);
+}
+
+// [MULTIMON v2.9.4] Settings px are tuned against the PRIMARY monitor (Doc's
+// physical-px law). GetWorkerWMonitor resolves by largest intersection — a
+// big enough secondary monitor would silently flip g_dpiScale to the wrong
+// scale. Pin to the primary explicitly.
+HMONITOR GetPrimaryMonitor() {
+    POINT ptZero = {0, 0};
+    return MonitorFromPoint(ptZero, MONITOR_DEFAULTTOPRIMARY);
 }
 
 EXTERN_C IMAGE_DOS_HEADER __ImageBase;
@@ -2789,6 +3221,14 @@ void RefreshWallpaperAndStyle() {
                 g_hasWallpaper = true;
                 g_currentWallpaperPath = newPath;
                 g_lastWallpaperWriteTime = newWriteTime;
+                // [MULTIMON v2.9.6] Wallpaper probe: the replica draws THIS
+                // path/position combo; compare against what the desktop
+                // shows when a fit looks wrong. Runs only on actual reloads.
+                {
+                    D2D1_SIZE_U wp = newBitmap ? newBitmap->GetPixelSize() : D2D1::SizeU(0, 0);
+                    DiagLog(L"[WALLPAPER] pos=%d img=%ux%u path='%s'",
+                            (int)g_wallpaperPosition, wp.width, wp.height, newPath.c_str());
+                }
             } else {
                 if (g_messageWnd) SetTimer(g_messageWnd, TIMER_ID_WALLPAPER_UPDATE, 300, nullptr);
             }
@@ -2918,6 +3358,7 @@ inline void QueueSnapshotUpdate(bool forceAllowDrag = false) {
 
         bool wasPending = g_snapshotUpdatePending.exchange(true, std::memory_order_relaxed);
         if (!wasPending || forceAllowDrag) {
+            DiagLog(L"[TRIG-QUEUE] snapshot update queued (pending was %d)", wasPending ? 1 : 0);
             PostMessageW(g_overlayWnd, WM_APP_SNAPSHOT_UPDATE, 0, 0);
         }
     }
@@ -3187,15 +3628,33 @@ LRESULT CALLBACK ShellViewSubclassProcInner(HWND hWnd, UINT uMsg, WPARAM wParam,
                     break;
             }
 
-        // Forward critical desktop redraw broadcasts directly to our monitor
+        // Forward critical desktop redraw broadcasts directly to our monitor.
+        // [VD-FIX 2026-11-01] VD switches broadcast a STRINGLESS WM_SETTINGCHANGE
+        // (lParam empty — Windows names no area; measured: uMsg=26 lParamStr=''
+        // twice per switch). Forwarding it wiped ALL icon + shadow caches twice
+        // per switch (white-rect fallbacks + ~1s of shadow re-uploads = the
+        // visible full reload). Only real theme strings earn the wipe;
+        // everything else is logged and ignored. WM_THEMECHANGED /
+        // WM_DISPLAYCHANGE keep forwarding (rare, genuinely theme/display-level).
         if (uMsg == WM_SETTINGCHANGE || uMsg == WM_THEMECHANGED || uMsg == WM_DISPLAYCHANGE) {
+            const wchar_t* fwdArea = (uMsg == WM_SETTINGCHANGE && lParam)
+                                     ? (const wchar_t*)lParam : L"";
+            bool fwdIsTheme = (uMsg != WM_SETTINGCHANGE) ||
+                              _wcsicmp(fwdArea, L"WindowsThemeElement") == 0 ||
+                              _wcsicmp(fwdArea, L"ImmersiveColorSet") == 0;
+            // [VD-DIAG] name the exact broadcast riding the desktop chain
+            DiagLog(L"[REFRESH-FWD] uMsg=%u lParamStr='%s' -> %s",
+                    uMsg, fwdArea,
+                    fwdIsTheme ? L"TRIGGER_REFRESH(FULL)" : L"ignored");
 
-        if (g_messageWnd) {
-            PostMessageW(g_messageWnd, WM_APP_TRIGGER_REFRESH, 0, 0);
-        }
-            // DPI or theme changes can alter icon sizes/visuals, force a deep snapshot pass
-            // Increased to 500ms to let the Shell completely rebuild the HIMAGELIST
-            ArmSnapRetry(500);
+            if (fwdIsTheme) {
+                if (g_messageWnd) {
+                    PostMessageW(g_messageWnd, WM_APP_TRIGGER_REFRESH, 0, 0);
+                }
+                // DPI or theme changes can alter icon sizes/visuals, force a deep snapshot pass
+                // Increased to 500ms to let the Shell completely rebuild the HIMAGELIST
+                ArmSnapRetry(500);
+            }
         }
 
         if (uMsg == WM_NOTIFY) {
@@ -3245,6 +3704,17 @@ LRESULT CALLBACK ShellViewSubclassProcInner(HWND hWnd, UINT uMsg, WPARAM wParam,
 
                         if (g_renderEvent) SetEvent(g_renderEvent);
 
+                        // 1b. PER-ICON FAST PATH: an item just BECAME selected.
+                        // Queue the priority single-icon pass immediately so the
+                        // expanded-label composite + shadow assets are ready
+                        // before the user can deselect into ghost — instead of
+                        // riding the full-pass convoy.
+                        if (pnmlv && (pnmlv->uChanged & LVIF_STATE) &&
+                            (pnmlv->uNewState & LVIS_SELECTED) &&
+                            !(pnmlv->uOldState & LVIS_SELECTED)) {
+                            QueueFastPathPass(pnmlv->iItem);
+                        }
+
                         // 2. Check if the actual ICON IMAGE changed (Heavy)
                         bool imageChanged = false;
                         if (pnmlv && (pnmlv->uChanged & LVIF_IMAGE)) {
@@ -3272,6 +3742,15 @@ LRESULT CALLBACK ShellViewSubclassProcInner(HWND hWnd, UINT uMsg, WPARAM wParam,
                                 }
                             }
                         }
+                        // [EDIT-SHADOW-OFF v2.7.3] Name the edited item so the
+                        // underlay skips its shadow while the label is being
+                        // typed. NO QueueFullSnapshot here — nothing needs
+                        // rebuilding; the skip is per-frame.
+                        {
+                            NMLVDISPINFOW* pnmdi = (NMLVDISPINFOW*)lParam;
+                            if (pnmdi)
+                                g_editingLvIndex.store(pnmdi->item.iItem, std::memory_order_relaxed);
+                        }
                         g_selectionJustChanged.store(true, std::memory_order_relaxed);
                         if (g_renderEvent) SetEvent(g_renderEvent);
                         break;
@@ -3294,6 +3773,13 @@ LRESULT CALLBACK ShellViewSubclassProcInner(HWND hWnd, UINT uMsg, WPARAM wParam,
                             }
                         }
                         g_editingOldText.clear();
+
+                        // [EDIT-SHADOW-OFF v2.7.3] Clear the skip on every exit
+                        // path (accept, ESC-cancel, no-change). Atomic store
+                        // only — NO QueueFullSnapshot (the v2.7.0 faint came
+                        // from calling it under this lock). Shadow redraws on
+                        // the next frame, nothing to rebuild.
+                        g_editingLvIndex.store(-1, std::memory_order_relaxed);
 
                         if (!textChanged) {
                             // Label didn't change (or edit was canceled), no need to re-bake anything
@@ -3608,13 +4094,46 @@ bool CreateSwapChainResources(UINT width, UINT height) {
     hr = g_compositionVisual->SetContent(g_swapChain.Get());
     if (FAILED(hr)) return false;
 
-    hr = g_compositionTarget->SetRoot(g_compositionVisual.Get());
+    // [TINT-SPLIT v2.9.26] Second surface: tint-only. Z-ORDER via the
+    // EXPLICIT reference form (MSDN receipt from the v2.9.24 field failure):
+    // replica as first child (NULL reference, only child so order moot), then
+    // tint added ABOVE the replica by name. Never use the NULL-reference
+    // convention here again — insertAbove=TRUE + NULL = BELOW all siblings.
+    hr = g_dxgiFactory->CreateSwapChainForComposition(g_dxgiDevice.Get(), &scd, nullptr, &g_tintSwapChain);
+    if (FAILED(hr)) return false;
+
+    hr = g_d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &g_tintDc);
+    if (FAILED(hr)) return false;
+
+    ComPtr<IDXGISurface2> tintSurface;
+    hr = g_tintSwapChain->GetBuffer(0, IID_PPV_ARGS(&tintSurface));
+    if (FAILED(hr)) return false;
+
+    hr = g_tintDc->CreateBitmapFromDxgiSurface(tintSurface.Get(), bitmapProperties, &g_tintTargetBitmap);
+    if (FAILED(hr)) return false;
+
+    hr = g_compositionDevice->CreateVisual(&g_rootVisual);
+    if (FAILED(hr)) return false;
+
+    hr = g_compositionDevice->CreateVisual(&g_tintCompVisual);
+    if (FAILED(hr)) return false;
+
+    hr = g_tintCompVisual->SetContent(g_tintSwapChain.Get());
+    if (FAILED(hr)) return false;
+
+    hr = g_rootVisual->AddVisual(g_compositionVisual.Get(), TRUE, nullptr); // replica: sole child
+    if (FAILED(hr)) return false;
+
+    hr = g_rootVisual->AddVisual(g_tintCompVisual.Get(), TRUE, g_compositionVisual.Get()); // tint ABOVE replica, by name
+    if (FAILED(hr)) return false;
+
+    hr = g_compositionTarget->SetRoot(g_rootVisual.Get());
     if (FAILED(hr)) return false;
 
     hr = g_compositionDevice->Commit();
     if (FAILED(hr)) return false;
 
-    g_dpiScale = GetMonitorDpiScale(GetWorkerWMonitor());
+    g_dpiScale = GetMonitorDpiScale(GetPrimaryMonitor());
 
     // Frame-1 bootstrap: load ONLY the layout manifest here (UI thread). The
     // heavy composite blobs load on the snapshot worker (LoadCompositesFromDisk).
@@ -3754,6 +4273,11 @@ void ReleaseSwapChainResources() {
     g_wallpaperBitmap.Reset();
     g_targetBitmap.Reset();
     g_intermediateTarget.Reset();
+    g_tintTargetBitmap.Reset();
+    g_tintDc.Reset();
+    g_tintSwapChain.Reset();
+    g_tintCompVisual.Reset();
+    g_rootVisual.Reset();
     g_compositionVisual.Reset();
     g_compositionTarget.Reset();
     g_compositionDevice.Reset();
@@ -3812,6 +4336,12 @@ void ReleaseAllDirectXResources() {
     g_compositionDevice.Reset();
     g_swapChain.Reset();
 
+    g_tintCompVisual.Reset();
+    g_rootVisual.Reset();
+    g_tintSwapChain.Reset();
+    g_tintTargetBitmap.Reset();
+    g_tintDc.Reset();
+
     g_underlayCompVisual.Reset();
     g_underlayCompTarget.Reset();
     g_underlayCompDevice.Reset();
@@ -3819,6 +4349,7 @@ void ReleaseAllDirectXResources() {
 
     // 5. Release Device Contexts
     g_dc.Reset();
+    g_tintDc.Reset();
     g_underlayDc.Reset();
     g_bakeDc.Reset();
     {
@@ -3855,6 +4386,20 @@ bool ResizeSwapChain(UINT width, UINT height) {
 
     hr = g_dc->CreateBitmapFromDxgiSurface(surface.Get(), bitmapProperties, &g_targetBitmap);
     if (FAILED(hr)) return false;
+
+    // [TINT-SPLIT v2.9.26] resize the tint surface in lockstep
+    if (g_tintSwapChain && g_tintDc) {
+        g_tintDc->SetTarget(nullptr);
+        g_tintTargetBitmap.Reset();
+        HRESULT hrT = g_tintSwapChain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
+        if (SUCCEEDED(hrT)) {
+            ComPtr<IDXGISurface2> tintSurface;
+            hrT = g_tintSwapChain->GetBuffer(0, IID_PPV_ARGS(&tintSurface));
+            if (SUCCEEDED(hrT)) {
+                g_tintDc->CreateBitmapFromDxgiSurface(tintSurface.Get(), bitmapProperties, &g_tintTargetBitmap);
+            }
+        }
+    }
 
     D2D1_BITMAP_PROPERTIES1 fp16Props = D2D1::BitmapProperties1(
         D2D1_BITMAP_OPTIONS_TARGET,
@@ -4002,30 +4547,86 @@ void UpdateMouseAndAnimations(float deltaTime) {
     bool overDesktop = g_isMouseOverDesktop.load(std::memory_order_relaxed);
     bool isEditing   = false;
     std::vector<RECT> currentSelectedRects;
+    // [MENU-HOLD v2.8.1] Cursor over the DESKTOP's own right-click menu must
+    // count as "on the desktop" — the menu is a separate #32768 popup window,
+    // so overDesktop went false the moment the menu opened and the spotlight
+    // faded out while the user browsed menu items. Identity-gated: the menu
+    // window must belong to the desktop ListView's thread (the shell view's
+    // TrackPopupMenu), so right-click menus of other apps never hold the
+    // light. Raw GetCursorPos — menu loops swallow WM_MOUSEMOVE.
+    bool overMenu = false;
     {
         std::lock_guard<std::mutex> lock(g_stateMutex);
         currentSelectedRects = g_selectedRects;
         isEditing            = g_isEditing;
+        if (!overDesktop && g_cachedHwndLV && IsWindow(g_cachedHwndLV)) {
+            HWND hMenu = FindWindowW(L"#32768", nullptr);
+            if (hMenu && IsWindowVisible(hMenu)) {
+                DWORD menuThread = GetWindowThreadProcessId(hMenu, nullptr);
+                DWORD lvThread   = GetWindowThreadProcessId(g_cachedHwndLV, nullptr);
+                if (menuThread == lvThread) {
+                    RECT mr;
+                    if (GetWindowRect(hMenu, &mr) && PtInRect(&mr, screenPos))
+                        overMenu = true;
+                }
+            }
+        }
     }
 
     {
         static bool s_wasOverDesktop = false;
-        if (overDesktop && !s_wasOverDesktop) {
+        if ((overDesktop || overMenu) && !s_wasOverDesktop) {
             g_smoothedMousePos = {(float)localPos.x, (float)localPos.y};
-            g_lastMouseTime    = GetTickCount64();
-            g_isIdle           = false;
-        } else if (overDesktop && mouseMoved) {
+            g_lastMouseTime = GetTickCount64();
+            g_isIdle        = false;
+        } else if ((overDesktop || overMenu) && mouseMoved) {
             g_lastMouseTime = GetTickCount64();
             g_isIdle        = false;
         }
-        s_wasOverDesktop = overDesktop;
+        s_wasOverDesktop = (overDesktop || overMenu);
+    }
+
+    // OLE drags stop WM_MOUSEMOVE delivery (and fire WM_MOUSELEAVE at drag
+    // start), so overDesktop/idle go stale mid-drag and the selection glow
+    // decayed at the OLD position while the user was still dragging. Raw
+    // cursor movement (GetCursorPos needs no messages) during an icon drag
+    // counts as activity.
+    bool dragActive = g_isDraggingItem.load(std::memory_order_relaxed) ||
+                      (g_draggedItemIndex.load(std::memory_order_relaxed) != -1);
+    if (dragActive && mouseMoved) {
+        g_lastMouseTime = GetTickCount64();
+        g_isIdle        = false;
+    }
+
+    // [FOCUS-STORM HACK — Doc 2026-10-24] The only trigger ever proven to make
+    // DWM recompose the desktop (so our lone drag-end frame surfaces) is a
+    // focus change — the "first drag after refocus always works" storm. So the
+    // instant a REAL drag's button is released (threshold passed — plain
+    // select-clicks must not storm), replay the storm: toggle foreground to
+    // our own overlay window and straight back to the desktop, same handler,
+    // no timer, no third app. Runs on the UI thread via WM_APP_FOCUSSTORM.
+    {
+        bool draggingReal = g_isDraggingItem.load(std::memory_order_relaxed);
+        bool leftDownNow = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+        static bool s_stormArmed = false;
+        if (draggingReal && leftDownNow) {
+            s_stormArmed = true;
+        } else if (s_stormArmed && (!leftDownNow || !dragActive)) {
+            s_stormArmed = false;
+            if (g_messageWnd && !g_unloading)
+                PostMessageW(g_messageWnd, WM_APP_FOCUSSTORM, 0, 0);
+        }
     }
 
     g_smoothedMousePos.x += ((float)localPos.x - g_smoothedMousePos.x) * lerpFactor;
     g_smoothedMousePos.y += ((float)localPos.y - g_smoothedMousePos.y) * lerpFactor;
 
     ULONGLONG timeSinceLastMove = GetTickCount64() - g_lastMouseTime;
-    if (!overDesktop || (g_settings.idleDelay > 0 && timeSinceLastMove > (ULONGLONG)g_settings.idleDelay))
+    // [MENU-HOLD v2.8.1] overMenu keeps the light alive while the cursor is
+    // on the desktop's context menu; the idle DELAY still applies normally,
+    // so a menu left untouched for the idle timeout fades like the desktop.
+    if ((!overDesktop && !overMenu) ||
+        (g_settings.idleDelay > 0 && timeSinceLastMove > (ULONGLONG)g_settings.idleDelay))
         g_isIdle = true;
 
     bool isBypassed = g_overlayBypassed.load(std::memory_order_relaxed);
@@ -4038,7 +4639,6 @@ void UpdateMouseAndAnimations(float deltaTime) {
 
     bool selChanged = g_selectionJustChanged.exchange(false, std::memory_order_relaxed);
 
-    // 1. ONLY update the cached geometry if there is an active selection.
     if (!currentSelectedRects.empty()) {
         g_cachedSelectedRects = currentSelectedRects;
         if (selChanged || !g_isIdle) {
@@ -4120,7 +4720,11 @@ void UpdateMouseAndAnimations(float deltaTime) {
     g_shadowFade = UpdateShadowFade(g_settings, g_shadowFade, shadowsVisible, deltaTime);
 
     // Master overlay toggle fade (independent of spotlight/selection)
-    float targetMasterFade = g_overlayBypassed.load(std::memory_order_relaxed) ? 0.0f : 1.0f;
+    float targetMasterFade =
+        (g_overlayBypassed.load(std::memory_order_relaxed) ||
+         !g_settings.overlayEnabled)
+            ? 0.0f
+            : 1.0f;
 
 
     g_masterFade = AnimateFade(g_masterFade, targetMasterFade, g_settings.toggleFadeInDuration, g_settings.toggleFadeOutDuration, deltaTime);
@@ -4490,56 +5094,104 @@ void RenderOverlay() {
             ClientToScreen(g_overlayWnd, &pt);
             float offsetX = (float)(pt.x - GetSystemMetrics(SM_XVIRTUALSCREEN));
             float offsetY = (float)(pt.y - GetSystemMetrics(SM_YVIRTUALSCREEN));
-            D2D1_SIZE_F imgSize = g_wallpaperBitmap->GetSize();
+            // [MULTIMON v2.9.4] GetPixelSize (physical px), not GetSize()
+            // (DIPs — bitmap-dpi-dependent, inflated 1.33x for 72-dpi jpgs);
+            // the per-monitor tile path below already used pixel dims.
+            D2D1_SIZE_U spanPx = g_wallpaperBitmap->GetPixelSize();
+            D2D1_SIZE_F imgSize = D2D1::SizeF((float)spanPx.width, (float)spanPx.height);
+            // [MULTIMON v2.9.12] SPAN SOLVED by Doc's landmark experiment
+            // (three images, exact-union/4K/square): Shell cover-fits the
+            // union (aspect preserved) but crops with the /3 QUIRK — the
+            // same Shell /3 divisor our FILL path already carries: top gets
+            // 1/3 of the vertical overflow, bottom 2/3. Doc's measured
+            // deltas (102px @2767.5 drawH, 460px @4920 drawH, 0 @exact)
+            // match -overflow/3 three for three, the square case exactly.
+            // Center-crop hypotheses were all wrong; the quirk generalizes
+            // across wallpaper positions. Horizontal overflow: same /3
+            // treatment (measured cases were width-driven, so this axis is
+            // inference — probe + Doc's eyes will verdict it).
             float scale = std::max(virtW / imgSize.width, virtH / imgSize.height);
             float drawW = imgSize.width * scale;
             float drawH = imgSize.height * scale;
-            float left = (virtW - drawW) / 2.0f;
-            float top  = (virtH - drawH) / 2.0f;
+            float left = -((drawW - virtW) / 3.0f);
+            float top  = -((drawH - virtH) / 3.0f);
             D2D1_RECT_F targetRect = D2D1::RectF(left - offsetX, top - offsetY, left - offsetX + drawW, top - offsetY + drawH);
+            // [MULTIMON v2.9.8] SPAN probe (one-shot per wallpaper draw session):
+            // every input of the anchor math. Doc field case: replica sits
+            // HIGHER than Shell's span, same scale — anchor is the variable.
+            // 458px delta = our top-crop misanchored; 116px = monitor-2 offset
+            // leak; something else = DPI-scaled virtual-screen metrics.
+            {
+                static ULONGLONG s_lastSpanProbe = 0;
+                ULONGLONG now = GetTickCount64();
+                if (now - s_lastSpanProbe > 15000) {
+                    s_lastSpanProbe = now;
+                    UINT sysDpi = GetDpiForWindow(g_overlayWnd);
+                    DiagLog(L"[SPAN] virt=%gx%g smXY=(%ld,%ld) overlayScreen=(%ld,%ld) off=(%g,%g) "
+                            L"img=%ux%u draw=%gx%g left/top=(%g,%g) overlayDpi=%u rect=[%g %g %g %g]",
+                            virtW, virtH,
+                            GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN),
+                            pt.x, pt.y, offsetX, offsetY,
+                            (unsigned)spanPx.width, (unsigned)spanPx.height,
+                            drawW, drawH, left, top, sysDpi,
+                            targetRect.left, targetRect.top, targetRect.right, targetRect.bottom);
+                }
+            }
             g_dc->DrawBitmap(g_wallpaperBitmap.Get(), targetRect, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
         } else {
             D2D1_SIZE_U pixelSize = g_wallpaperBitmap->GetPixelSize();
             D2D1_SIZE_F imgSize = D2D1::SizeF((float)pixelSize.width, (float)pixelSize.height);
-            D2D1_SIZE_F refSize = D2D1::SizeF((float)width, (float)height);
-            D2D1_RECT_F sourceRect, targetRect;
-            ComputeWallpaperRects(imgSize, refSize, g_wallpaperPosition, sourceRect, targetRect);
             float dpiX = 96.0f, dpiY = 96.0f;
             g_wallpaperBitmap->GetDpi(&dpiX, &dpiY);
-            D2D1_RECT_F sourceRectDips = D2D1::RectF(
-                sourceRect.left   * (96.0f / dpiX),
-                sourceRect.top    * (96.0f / dpiY),
-                sourceRect.right  * (96.0f / dpiX),
-                sourceRect.bottom * (96.0f / dpiY)
-            );
-            g_dc->DrawBitmap(g_wallpaperBitmap.Get(), targetRect, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, sourceRectDips);
+            // [MULTIMON v2.9.4] One tile PER MONITOR, each fit/cropped against
+            // its own dimensions exactly like the desktop renders it. The old
+            // single fit against the whole union rect matched NEITHER screen
+            // on mixed-DPI/aspect setups (measured: 125% landscape primary +
+            // 100% portrait secondary — both wrong).
+            if (!g_monitorTiles.empty()) {
+                for (const auto& tile : g_monitorTiles) {
+                    float tw = (float)(tile.rect.right - tile.rect.left);
+                    float th = (float)(tile.rect.bottom - tile.rect.top);
+                    if (tw <= 0.0f || th <= 0.0f) continue;
+                    g_dc->PushAxisAlignedClip(
+                        D2D1::RectF((float)tile.rect.left, (float)tile.rect.top,
+                                    (float)tile.rect.right, (float)tile.rect.bottom),
+                        D2D1_ANTIALIAS_MODE_ALIASED);
+                    D2D1_RECT_F sourceRect, targetRect;
+                    ComputeWallpaperRects(imgSize, D2D1::SizeF(tw, th), g_wallpaperPosition, sourceRect, targetRect);
+                    D2D1_RECT_F sourceRectDips = D2D1::RectF(
+                        sourceRect.left   * (96.0f / dpiX),
+                        sourceRect.top    * (96.0f / dpiY),
+                        sourceRect.right  * (96.0f / dpiX),
+                        sourceRect.bottom * (96.0f / dpiY)
+                    );
+                    targetRect.left   += (float)tile.rect.left;
+                    targetRect.top    += (float)tile.rect.top;
+                    targetRect.right  += (float)tile.rect.left;
+                    targetRect.bottom += (float)tile.rect.top;
+                    g_dc->DrawBitmap(g_wallpaperBitmap.Get(), targetRect, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, sourceRectDips);
+                    g_dc->PopAxisAlignedClip();
+                }
+            } else {
+                D2D1_SIZE_F refSize = D2D1::SizeF((float)width, (float)height);
+                D2D1_RECT_F sourceRect, targetRect;
+                ComputeWallpaperRects(imgSize, refSize, g_wallpaperPosition, sourceRect, targetRect);
+                D2D1_RECT_F sourceRectDips = D2D1::RectF(
+                    sourceRect.left   * (96.0f / dpiX),
+                    sourceRect.top    * (96.0f / dpiY),
+                    sourceRect.right  * (96.0f / dpiX),
+                    sourceRect.bottom * (96.0f / dpiY)
+                );
+                g_dc->DrawBitmap(g_wallpaperBitmap.Get(), targetRect, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, sourceRectDips);
+            }
         }
     }
 
     g_dc->PopLayer();
 
-    // --- "OUT OF THE DARKNESS" TINT VEIL ---
-    // Drawn OUTSIDE the icon-clip layer so it covers the whole desktop in both
-    // clip modes. The spotlight/selection DESTINATION_OUT stamps below erase it
-    // along with the rest of the overlay, which is what makes the revealed area
-    // read as "lit".
-    if ((g_settings.tintEnabled || g_settings.batSignalEnabled) && g_settings.tintStrength > 0) {
-        if (!g_tintBrush) {
-            g_dc->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 1.0f), &g_tintBrush);
-        }
-        if (g_tintBrush) {
-            D2D1_COLOR_F c = g_settings.tintColor;
-            // Follow the overlay's toggle fade for symmetric fade-in/out...
-            float tintFade = g_masterFade;
-            // ...unless the Bat-Signal is on: the signal needs its darkness
-            // even while the overlay is toggled off.
-            if (g_settings.batSignalEnabled) tintFade = 1.0f;
-            c.a = (g_settings.tintStrength / 100.0f) * tintFade;
-            g_tintBrush->SetColor(c);
-            g_dc->FillRectangle(D2D1::RectF(0.0f, 0.0f, (float)width, (float)height), g_tintBrush.Get());
-        }
-    }
-
+    // [TINT-SPLIT v2.9.26] The tint veil and bat ink live on the tint surface
+    // (pass 3 below). This surface carries only the wallpaper replica
+    // (opaque at the mask glyphs) and the punches that erase it.
 
     // SHOW: Apply spotlight and selection masks (destination out)
     // The Bat-Signal keeps this section alive even when the overlay is toggled
@@ -4571,35 +5223,6 @@ void RenderOverlay() {
             g_dc->DrawImage(g_spotlightStampEffect.Get(), &offset, nullptr,
                             D2D1_INTERPOLATION_MODE_LINEAR,
                             D2D1_COMPOSITE_MODE_DESTINATION_OUT);
-        }
-
-        // 🦇 PROJECT THE SIGNAL: dark silhouette floating in the lit circle.
-        // Ink opacity rides on the tint strength and fades with the spotlight.
-        // While the overlay is toggled off, the signal burns at full strength.
-        // Logo blur = 1/6 of edge blur: the spotlight rim stays blurrier
-        // than the silhouette, so the bat reads as INSIDE the light.
-        float batFade = isBypassed ? 1.0f : g_spotlightFade.load(std::memory_order_relaxed);
-        if (batActive && (g_spotlightFade.load(std::memory_order_relaxed) > 0.001f || isBypassed)) {
-            // Rebake happens before BeginDraw (see top of RenderOverlay)
-            if (g_batSignalBitmap) {
-                float batR = (float)g_settings.spotlightRadius * g_dpiScale;
-                float batW = batR * 1.7f;
-                float batH = batW * 0.5f;
-                float bmx = g_smoothedMousePos.x;
-                float bmy = g_smoothedMousePos.y;
-                D2D1_RECT_F batDst = D2D1::RectF(bmx - batW * 0.5f, bmy - batH * 0.5f,
-                                                 bmx + batW * 0.5f, bmy + batH * 0.5f);
-                float batOpacity = (g_settings.tintStrength / 100.0f) * batFade;
-                static int s_batDrawLogCounter = 0;
-                if ((s_batDrawLogCounter++ % 120) == 0) { // sample ~every 2s at 60fps
-                    Wh_Log(L"[BAT] draw: bmp=%p opacity=%.2f w=%.0f h=%.0f at (%.0f,%.0f)",
-                           (void*)g_batSignalBitmap.Get(), batOpacity, batW, batH, bmx, bmy);
-                }
-                if (batOpacity > 0.001f) {
-                    g_dc->DrawBitmap(g_batSignalBitmap.Get(), &batDst, batOpacity,
-                                     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-                }
-            }
         }
 
         if (g_selectionFade > 0.001f && !g_cachedSelectedRects.empty()) {
@@ -4658,6 +5281,7 @@ void RenderOverlay() {
                     g_dc->DrawImage(g_selectionStampEffect.Get(), &offset, nullptr,
                                     D2D1_INTERPOLATION_MODE_LINEAR,
                                     D2D1_COMPOSITE_MODE_DESTINATION_OUT);
+
                 }
             }
         }
@@ -4678,6 +5302,165 @@ void RenderOverlay() {
                     D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
                     D2D1_COMPOSITE_MODE_SOURCE_OVER);
     CheckEndDraw(g_dc->EndDraw(), L"RenderOverlay.pass2");
+
+    // [TINT-SPLIT v2.9.27] Present the replica surface HERE, immediately
+    // before the tint surface presents at the end of pass 3 — back-to-back
+    // presents in one call land in the same compositor batch. Previously the
+    // replica presented back in RenderLoopInner, microseconds AFTER the tint
+    // surface had already presented; mid-fade that skew showed as one
+    // surface's quantization step landing without the other's (Doc's
+    // spotlight fade-out blink, gray-on-gray maximizing it — the same
+    // visibility profile as the old 256-level bug).
+    if (g_swapChain) {
+        HRESULT hrA = g_swapChain->Present(0, 0);
+        if (hrA == DXGI_ERROR_DEVICE_REMOVED || hrA == DXGI_ERROR_DEVICE_RESET) {
+            if (g_messageWnd) PostMessage(g_messageWnd, WM_APP_DEVICE_LOST, 0, 0);
+        }
+    }
+
+    // 3. [TINT-SPLIT v2.9.26] TINT SURFACE — veil + bat ink + the same punches,
+    // on the TOP composition visual. DWM blends this over the replica in its
+    // own composition pass and color space — the same blend it applies to the
+    // real desktop everywhere else. One blend owner: the whole point.
+    if (g_tintDc && g_tintTargetBitmap) {
+        g_tintDc->SetTarget(g_tintTargetBitmap.Get());
+        g_tintDc->BeginDraw();
+        g_tintDc->Clear(D2D1::ColorF(0, 0, 0, 0));
+
+        // --- "OUT OF THE DARKNESS" TINT VEIL --- (moved verbatim from pass 1)
+        if ((g_settings.tintEnabled || g_settings.batSignalEnabled) && g_settings.tintStrength > 0) {
+            if (!g_tintBrush) {
+                g_tintDc->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 1.0f), &g_tintBrush);
+            }
+            if (g_tintBrush) {
+                D2D1_COLOR_F c = g_settings.tintColor;
+                // Follow the overlay's toggle fade for symmetric fade-in/out...
+                float tintFade = g_masterFade;
+                // ...unless the Bat-Signal is on: the signal needs its darkness
+                // even while the overlay is toggled off.
+                if (g_settings.batSignalEnabled) tintFade = 1.0f;
+                c.a = (g_settings.tintStrength / 100.0f) * tintFade;
+                g_tintBrush->SetColor(c);
+                g_tintDc->FillRectangle(D2D1::RectF(0.0f, 0.0f, (float)width, (float)height), g_tintBrush.Get());
+            }
+        }
+
+        bool batActive2 = g_settings.batSignalEnabled;
+        bool isBypassed2 = g_overlayBypassed.load(std::memory_order_relaxed);
+        if (g_masterFade > 0.001f || (batActive2 && isBypassed2)) {
+
+            // Noise transform: same field as pass 1 (shared effect object).
+            D2D1_MATRIX_3X2_F mat2 = D2D1::Matrix3x2F::Identity();
+            mat2 = mat2 * D2D1::Matrix3x2F::Rotation((float)g_noiseRotation * 90.0f, D2D1::Point2F(32.0f, 32.0f));
+            mat2 = mat2 * D2D1::Matrix3x2F::Translation(g_noiseOffsetX, g_noiseOffsetY);
+            if (g_noiseTransformEffect) {
+                g_noiseTransformEffect->SetValue(D2D1_2DAFFINETRANSFORM_PROP_TRANSFORM_MATRIX, mat2);
+            }
+
+            float spotFade2 = g_spotlightFade.load(std::memory_order_relaxed);
+            if (batActive2 && isBypassed2) spotFade2 = 1.0f;
+
+            if (spotFade2 > 0.001f && g_bakedSpotlight && g_spotlightStampEffect) {
+                g_spotlightStampEffect->SetValue(D2D1_COLORMATRIX_PROP_COLOR_MATRIX, CreateFadeMatrix(spotFade2));
+                float destX2 = std::round(g_smoothedMousePos.x - g_bakedSpotlightHalfW);
+                float destY2 = std::round(g_smoothedMousePos.y - g_bakedSpotlightHalfH);
+                D2D1_POINT_2F offset2 = D2D1::Point2F(destX2, destY2);
+
+                g_tintDc->DrawImage(g_spotlightStampEffect.Get(), &offset2, nullptr,
+                                    D2D1_INTERPOLATION_MODE_LINEAR,
+                                    D2D1_COMPOSITE_MODE_DESTINATION_OUT);
+            }
+
+            // 🦇 PROJECT THE SIGNAL (bat ink is part of the darkness system,
+            // not a punch — lives on the tint surface above the veil).
+            float batFade2 = isBypassed2 ? 1.0f : g_spotlightFade.load(std::memory_order_relaxed);
+            if (batActive2 && (g_spotlightFade.load(std::memory_order_relaxed) > 0.001f || isBypassed2)) {
+                if (g_batSignalBitmap) {
+                    float batR = (float)g_settings.spotlightRadius * g_dpiScale;
+                    float batW = batR * 1.7f;
+                    float batH = batW * 0.5f;
+                    float bmx = g_smoothedMousePos.x;
+                    float bmy = g_smoothedMousePos.y;
+                    D2D1_RECT_F batDst = D2D1::RectF(bmx - batW * 0.5f, bmy - batH * 0.5f,
+                                                     bmx + batW * 0.5f, bmy + batH * 0.5f);
+                    float batOpacity = (g_settings.tintStrength / 100.0f) * batFade2;
+                    static int s_batDrawLogCounter2 = 0;
+                    if ((s_batDrawLogCounter2++ % 120) == 0) {
+                        Wh_Log(L"[BAT] draw: bmp=%p opacity=%.2f w=%.0f h=%.0f at (%.0f,%.0f)",
+                               (void*)g_batSignalBitmap.Get(), batOpacity, batW, batH, bmx, bmy);
+                    }
+                    if (batOpacity > 0.001f) {
+                        g_tintDc->DrawBitmap(g_batSignalBitmap.Get(), &batDst, batOpacity,
+                                             D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+                    }
+                }
+            }
+
+            if (g_selectionFade > 0.001f && !g_cachedSelectedRects.empty()) {
+                if (g_selectionStampEffect && g_selNoiseComposite) {
+
+                    float activeAlpha = (g_settings.selectionOpacity / 255.0f) * g_selectionFade;
+                    g_selectionStampEffect->SetValue(D2D1_COLORMATRIX_PROP_COLOR_MATRIX, CreateFadeMatrix(activeAlpha));
+
+                    float pad = (float)g_settings.selectionPadding * g_dpiScale;
+                    float blurVal = ComputeSelectionBlurVal(pad);
+                    float blurPadding = blurVal * 3.0f;
+
+                    float strength = 1.0f;
+                    D2D1_VECTOR_4F selAddCoeffs = {0.0f, 1.0f, strength, 0.0f};
+
+                    for (const auto& rcBounds : g_cachedSelectedRects) {
+                        UINT targetW = (UINT)(rcBounds.right - rcBounds.left) + (UINT)(g_settings.selectionPadding * g_dpiScale * 2);
+                        UINT targetH = (UINT)(rcBounds.bottom - rcBounds.top) + (UINT)(g_settings.selectionPadding * g_dpiScale * 2);
+                        uint64_t key = ((uint64_t)targetW << 32) | targetH;
+
+                        ComPtr<ID2D1Bitmap1> bakedGlow;
+                        auto it = g_bakedSelectionGlows.find(key);
+                        if (it != g_bakedSelectionGlows.end() && it->second) {
+                            bakedGlow = it->second;
+                            g_bakedSelectionGlowUse[key] = GetTickCount64();
+                        } else {
+                            bakedGlow = BakeSelectionGlow(targetW, targetH);
+                            if (bakedGlow) {
+                                g_bakedSelectionGlows[key] = bakedGlow;
+                                g_bakedSelectionGlowUse[key] = GetTickCount64();
+                            }
+                        }
+
+                        if (!bakedGlow) continue;
+
+                        WireSensitivityMaskGraph(
+                            bakedGlow.Get(),
+                            g_selInvertEffect.Get(),
+                            g_selMaskMultiplyEffect.Get(),
+                            g_selNoiseMultiplyEffect.Get(),
+                            g_selNoiseComposite.Get(),
+                            g_selectionStampEffect.Get(),
+                            g_noiseTransformEffect.Get(),
+                            selAddCoeffs
+                        );
+
+                        float destX = std::round((float)rcBounds.left - pad - blurPadding);
+                        float destY = std::round((float)rcBounds.top - pad - blurPadding);
+                        D2D1_POINT_2F offset = D2D1::Point2F(destX, destY);
+
+                        g_tintDc->DrawImage(g_selectionStampEffect.Get(), &offset, nullptr,
+                                            D2D1_INTERPOLATION_MODE_LINEAR,
+                                            D2D1_COMPOSITE_MODE_DESTINATION_OUT);
+
+                    }
+                }
+            }
+        }
+
+        CheckEndDraw(g_tintDc->EndDraw(), L"RenderOverlay.tint");
+        if (g_tintSwapChain) {
+            HRESULT hrTint = g_tintSwapChain->Present(0, 0);
+            if (hrTint == DXGI_ERROR_DEVICE_REMOVED || hrTint == DXGI_ERROR_DEVICE_RESET) {
+                if (g_messageWnd) PostMessage(g_messageWnd, WM_APP_DEVICE_LOST, 0, 0);
+            }
+        }
+    }
 }
 
 // --- CRASH GUARDS -----------------------------------------------------------
@@ -4752,6 +5535,7 @@ void RenderLoopInner() {
                     (std::abs(g_smoothedMousePos.x - s_lastRenderedMousePos.x) > 0.1f ||
                     (std::abs(g_smoothedMousePos.y - s_lastRenderedMousePos.y) > 0.1f));
 
+
                 // 🦇 While the signal is active the overlay stays alive even when
                 // the overlay itself is toggled off (tint + bat keep rendering).
                 bool batActive = g_settings.batSignalEnabled;
@@ -4822,14 +5606,9 @@ void RenderLoopInner() {
         }
 
         if (frameRendered && currentSwapChain) {
-            HRESULT hr;
-            // DirectComposition handles V-Sync automatically.
-            // Using Present(0, 0) prevents the two threads from serializing and blocking each other on the DXGI queue.
-            hr = currentSwapChain->Present(0, 0);
-
-            if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
-                if (g_messageWnd) PostMessage(g_messageWnd, WM_APP_DEVICE_LOST,  0, 0);
-            }
+            // [TINT-SPLIT v2.9.27] The replica swapchain now presents inside
+            // RenderOverlay, back-to-back with the tint surface (see pass 2).
+            // This block keeps only the framerate cap.
 
             // PROPER FRAMERATE CAP FOR OVERLAY
             // Prevents the thread from spinning at 1000fps and choking the GPU when Present(0,0) is used.
@@ -4919,6 +5698,16 @@ bool CacheIconBitmap(HWND hLV, int imageIndex, uint64_t cacheKey, bool isFolder,
                 g_iconCache[cacheKey] = sharedBmp;
                 std::lock_guard<std::mutex> hLock(g_hashCacheMutex);
                 g_iconHashCache[cacheKey] = knownHash;
+
+                // [STAKEOUT] The blank-doc suspect: this bypass is the one path
+                // that can cache GENERIC pixels while leaving wasGeneric=false
+                // (shared shape from an earlier same-index icon). Log every
+                // ride with the baseline state so a stuck icon's history shows
+                // whether it boarded here.
+                DiagLog(L"[STAKEOUT-FR] free-ride imgIdx=%d key=%llu baselinesReady=%d fallbackFlagged=%d",
+                        imageIndex, (unsigned long long)cacheKey,
+                        g_baselinesReady ? 1 : 0,
+                        (outIsFallback && *outIsFallback) ? 1 : 0);
 
                 // Do not bypass placeholder detection: flag for retry if this shared shape is generic
                 if (outIsFallback && g_baselinesReady) {
@@ -5223,9 +6012,140 @@ bool CacheIconBitmap(HWND hLV, int imageIndex, uint64_t cacheKey, bool isFolder,
                 }
             }
 
+            // [PIXEL-GENERIC 2026-11-03] Index-based detection cannot survive
+            // ImageList churn. Stakeout evidence (zCode update repro): Explorer
+            // repopulates list slots during installs and serves GENERIC pixels
+            // at NON-generic indexes (icon indexes jumped 19->24->19 across the
+            // update while placeholder pixels were cached as good under fresh
+            // stable keys — fallback=0, no retries, stuck until a forced
+            // rebuild). So: byte-compare the extracted alpha against the
+            // generic baselines (both thresholded identically, 0/255). Pixels
+            // identical to the placeholder = placeholder, whatever the index.
+            // [v2.1.13] Lazy baseline top-up from the LV's OWN ImageList: the
+            // generic-doc icon as the desktop itself serves it — same list,
+            // same size, same rendering pipeline as the churn pixels, so the
+            // byte-compare below is apples-to-apples by construction. Runs
+            // whenever the eager BuildGenericBaselines attempt came up short
+            // (assoc failure at reload timing, or the list only became
+            // available later). Builds once; ignores repeats.
+            if (outIsFallback) {
+                // Top-up when NO file variant exists at the CURRENT extraction
+                // size: variants built from icon files come out at their
+                // native frames (40x40/51x51 measured) while ImageList
+                // extractions come out at the desktop's zoom size (46x46
+                // measured) — only a same-size variant can byte-match.
+                bool haveMatchingSize = false;
+                {
+                    // [PHASE 3 v2.4.5] Pool threads read this vector too now;
+                    // the top-up path below pushes under this same mutex.
+                    std::lock_guard<std::mutex> bLock(g_uniqueShapesMutex);
+                    for (const auto& e : g_genericFileBaselines)
+                        if (e.width == targetSize && e.height == targetSize) { haveMatchingSize = true; break; }
+                }
+                if (!haveMatchingSize) {
+                HIMAGELIST hIL = g_cachedImageList.load(std::memory_order_relaxed);
+                if (!hIL && hLV) hIL = ListView_GetImageList(hLV, LVSIL_NORMAL);
+                int gIdx = GetGenericDocSysIconIndex();
+                HICON hGen = (hIL && gIdx >= 0) ? ImageList_GetIcon(hIL, gIdx, ILD_TRANSPARENT) : nullptr;
+                static int s_topUpLogged = 0;
+                if (s_topUpLogged < 3) {
+                    DiagLog(L"[STAKEOUT] top-up attempt: hIL=%p gIdx=%d hGen=%p",
+                            (void*)hIL, gIdx, (void*)hGen);
+                    s_topUpLogged++;
+                }
+                if (hGen) {
+                        SilhouetteData v;
+                        ExtractIconAlphaBaseline(hGen, targetSize, v);
+                        DestroyIcon(hGen);
+                        if (v.width > 0) {
+                            bool already = false;
+                            std::lock_guard<std::mutex> uLock(g_uniqueShapesMutex);
+                            for (const auto& e : g_genericFileBaselines) {
+                                if (e.width == v.width && e.height == v.height &&
+                                    e.alphaData == v.alphaData) { already = true; break; }
+                            }
+                            if (!already) {
+                                g_genericFileBaselines.push_back(std::move(v));
+                                DiagLog(L"[STAKEOUT] baseline top-up from ImageList: %ux%u (idx %d)",
+                                        v.width, v.height, gIdx);
+                            }
+                            if (g_genericFolderBaseline.width > 0)
+                                g_baselinesReady = true;
+                        }
+                    }
+                }
+            }
+
+            if (outIsFallback && !*outIsFallback && g_baselinesReady) {
+                // [PHASE 3 v2.4.5] Baseline vectors are shared with the pool
+                // threads now (top-up pushes under this mutex); the unlocked
+                // reads below were single-thread-worker-safe, no longer.
+                std::lock_guard<std::mutex> cmpLock(g_uniqueShapesMutex);
+                auto matchesBaseline = [&](const SilhouetteData& b) {
+                    return b.width == w && b.height == h &&
+                           b.alphaData.size() == alphaOnly.size() &&
+                           memcmp(b.alphaData.data(), alphaOnly.data(), alphaOnly.size()) == 0;
+                };
+                bool pixelGeneric = false;
+                for (const auto& b : g_genericFileBaselines) {
+                    if (matchesBaseline(b)) { pixelGeneric = true; break; }
+                }
+                // [FLASH-FIX v2.9.22] A genuine uncustomized FOLDER's icon IS
+                // the generic folder baseline — matching it is not a
+                // placeholder. Flagging it set wasGeneric permanently ->
+                // forceReextract EVERY pass -> the 8433 erase wiped the
+                // folder combo's RAM silhouettes each pass -> the mask
+                // white-rected during the worker's busy window (Doc's
+                // selected-folders flash, 200x receipts; force-re generic=1
+                // folder=1 + br=D every pass). Exempt real folders from the
+                // folder-baseline match; files matching it stay flagged
+                // (that remains a poison signal — the blank-doc family).
+                bool isPlainFolder = isFolder && !hasCustomIcon;
+                if (!pixelGeneric && !isPlainFolder && matchesBaseline(g_genericFolderBaseline)) pixelGeneric = true;
+                // [v2.1.10] Thumbnails keep alpha gradations, so byte-compare
+                // against the 0/255 baselines can never match — compare a
+                // thresholded copy instead.
+                if (!pixelGeneric && isThumbnail && !isFolder) {
+                    std::vector<uint8_t> thr(alphaOnly.size());
+                    for (size_t i = 0; i < alphaOnly.size(); ++i)
+                        thr[i] = (alphaOnly[i] >= 16) ? 255 : 0;
+                    auto matchesThr = [&](const SilhouetteData& b) {
+                        return b.width == w && b.height == h &&
+                               b.alphaData.size() == thr.size() &&
+                               memcmp(b.alphaData.data(), thr.data(), thr.size()) == 0;
+                    };
+                    for (const auto& b : g_genericFileBaselines)
+                        if (matchesThr(b)) { pixelGeneric = true; break; }
+                    if (!pixelGeneric && matchesThr(g_genericFolderBaseline)) pixelGeneric = true;
+                }
+                if (pixelGeneric) {
+                    *outIsFallback = true;
+                    DiagLog(L"[STAKEOUT] PIXEL-GENERIC hit: imgIdx=%d key=%llu (index check missed, pixels == baseline)",
+                            imageIndex, (unsigned long long)cacheKey);
+                } else {
+                    // [v2.1.10] Probe: log the extracted dims + alpha hash for
+                    // the first extractions of the session. The baseline
+                    // variants built at reload came out 40x40 / 51x51 — if
+                    // ImageList extractions are a different size entirely,
+                    // byte-compare can never fire and the baselines must be
+                    // rebuilt from the SAME source (the LV's own ImageList).
+                    static int s_probeLogged = 0;
+                    if (s_probeLogged < 6) {
+                        uint64_t exHash = 14695981039346656037ULL;
+                        for (uint8_t a : alphaOnly) { exHash ^= a; exHash *= 1099511628211ULL; }
+                        DiagLog(L"[STAKEOUT] extracted %ux%u hash=%llu imgIdx=%d (baselines: %d file variants @ %ux%u)",
+                                w, h, (unsigned long long)exHash, imageIndex,
+                                (int)g_genericFileBaselines.size(),
+                                g_genericFileBaselines.empty() ? 0 : g_genericFileBaselines[0].width);
+                        s_probeLogged++;
+                    }
+                }
+            }
+
             // 4-Bucket Hash Comparison (running lightning fast on 1-byte arrays)
             // SHAPE DEDUPLICATION
             {
+                ULONGLONG tSad0 = GetTickCount64(); // [PERF-AUDIT v2.2.6]
                 std::lock_guard<std::mutex> lock(g_uniqueShapesMutex);
 
                 if (isThumbnail && !isFolder) {
@@ -5296,6 +6216,9 @@ bool CacheIconBitmap(HWND hLV, int imageIndex, uint64_t cacheKey, bool isFolder,
                     g_shapeToBitmap[matchedHash] = d2dBitmap;
 
                 }
+                // [PERF-AUDIT v2.2.6] SAD scan cost vs the whole shape store.
+                ULONGLONG sadMs = GetTickCount64() - tSad0;
+                if (sadMs > 0) DiagLog(L"[EXTRACT-SAD] %llums imgIdx=%d matched=%d", (unsigned long long)sadMs, imageIndex, matchedHash != cacheKey ? 1 : 0);
             }
         }
     }
@@ -5375,6 +6298,8 @@ void QuickSnapshotStatePoll() {
     {
         std::lock_guard<std::mutex> snapLock(g_snapshotMutex);
         if (count != (int)g_iconSnapshots.size()) {
+            DiagLog(L"[TRIG-COUNT] poll: %d items != %zu published -> full pass",
+                    count, g_iconSnapshots.size());
             if (g_overlayWnd) {
                 g_snapshotUpdatePending.store(true, std::memory_order_relaxed);
                 PostMessageW(g_overlayWnd, WM_APP_SNAPSHOT_UPDATE, 0, 0);
@@ -5428,20 +6353,21 @@ void QuickSnapshotStatePoll() {
         polled[i].valid = GetListViewItemRects(hLV, g_overlayWnd, i, polled[i].iconRect, polled[i].boundsRect, polled[i].labelRect);
     }
 
-    // Label bitmaps to create are collected here and baked AFTER the snapshot
-    // lock is released: CacheLabelBitmap takes g_cacheMutex/g_uniqueShapesMutex/
-    // g_resourceDcMutex and does D2D work, which must not run while the render
-    // threads block on g_snapshotMutex for a snapshot copy.
-    std::vector<std::pair<uint64_t, SIZE>> labelBakes;
     std::unique_lock<std::mutex> snapLock(g_snapshotMutex);
     if ((size_t)count != g_iconSnapshots.size()) return;
 
     bool collapseStateChanged = false;
     bool anyPending = false;
+    // [SLITHER-PROBE v2.5.1] Poll-side capture. Collected under snapLock,
+    // flushed after unlock (DiagLog does file I/O — never inside the lock).
+    std::vector<std::wstring> slitherFixLogs;
     for (size_t i = 0; i < g_iconSnapshots.size(); ++i) {
         bool diagIdentImageMismatch = (polled[i].imageIndex != g_iconSnapshots[i].imageIndex);
         bool diagIdentNameMismatch = (!polled[i].name.empty() && g_iconSnapshots[i].displayName != polled[i].name);
         if (diagIdentImageMismatch || diagIdentNameMismatch) {
+            DiagLog(L"[TRIG-IDENT] poll idx %zu: img %dvs%d nameMismatch=%d -> full pass",
+                    i, polled[i].imageIndex, g_iconSnapshots[i].imageIndex,
+                    diagIdentNameMismatch ? 1 : 0);
             if (g_overlayWnd) {
                 g_snapshotUpdatePending.store(true, std::memory_order_relaxed);
                 PostMessageW(g_overlayWnd, WM_APP_SNAPSHOT_UPDATE, 0, 0);
@@ -5453,33 +6379,71 @@ void QuickSnapshotStatePoll() {
         UINT oldPollState = snap.state;
         snap.state = polled[i].state;
 
-        // DIAGNOSTIC: ghost-focus investigation — log what Explorer actually
-        // reports when an item loses selection while the label stays expanded.
-        if ((oldPollState & LVIS_SELECTED) && !(snap.state & LVIS_SELECTED)) {
-            Wh_Log(L"[GHOST] '%s': flags %s%s -> rect %ldx%ld at (%ld,%ld), desktopActive=%d",
-                   polled[i].name.empty() ? L"?" : polled[i].name.c_str(),
-                   (snap.state & LVIS_FOCUSED) ? L"FOCUSED" : L"notFocused",
-                   (snap.state & LVIS_SELECTED) ? L"|SELECTED" : L"",
-                   polled[i].labelRect.right - polled[i].labelRect.left,
-                   polled[i].labelRect.bottom - polled[i].labelRect.top,
-                   polled[i].labelRect.left, polled[i].labelRect.top,
-                   (int)g_isDesktopActive.load(std::memory_order_relaxed));
-        }
-
-        // --- GHOST FOCUS FIX: Trigger snapshot update when expanded state changes ---
-        // When an icon enters ghost focus (or any expanded state) without having
-        // an expanded composite yet, trigger a deep pass so comboHash_e gets built.
+        // --- GHOST FOCUS FIX + COMPOSITE GEOMETRY VALIDATION ---
+        // The deep pass builds whichever composite matches the state at
+        // capture time, using the geometry captured at that same instant. If
+        // geometry and state drifted apart between capture and build (boot
+        // restore race: state said expanded, label rect was still collapsed),
+        // the composite holds the WRONG silhouette — that was the truncated
+        // "expanded" ghost-selected bug. The poll is the authority: compare
+        // each combo's stamped build-geometry against the live rect and
+        // invalidate + rebuild any composite baked from stale geometry.
+        // CAUTION: right after a deselect the LV transiently reports the
+        // COLLAPSED rect while the painted ghost label is still expanded — a
+        // single bad sample must not destroy a correct expanded composite.
+        // Every mismatch is therefore re-measured once, and only a FRESH read
+        // that still disagrees with the stamped geometry invalidates.
         {
-            IconSnapshot prevSnap = snap;
-            prevSnap.state = oldPollState;
-            bool wasExpanded = IsIconExpanded(prevSnap);
-            bool isNowExpanded = IsIconExpanded(snap);
-
-            if (!wasExpanded && isNowExpanded && snap.comboHash_e == 0) {
-                // We're now expanded but don't have an expanded composite - trigger rebuild
-                if (g_overlayWnd && !g_snapshotUpdatePending.load(std::memory_order_relaxed)) {
-                    g_snapshotUpdatePending.store(true, std::memory_order_relaxed);
-                    PostMessageW(g_overlayWnd, WM_APP_SNAPSHOT_UPDATE, 0, 0);
+            bool needComboRebuild = false;
+            auto liveRectDisagrees = [&](const RECT& built) -> bool {
+                RECT reIcon, reBounds, reLabel;
+                if (!GetListViewItemRects(hLV, g_overlayWnd, (int)i, reIcon, reBounds, reLabel)) return false;
+                int rw = reLabel.right - reLabel.left;
+                int rh = reLabel.bottom - reLabel.top;
+                return (rw != built.right - built.left) || (rh != built.bottom - built.top);
+            };
+            if (IsIconExpanded(snap)) {
+                if (snap.comboHash_e == 0) {
+                    // Expanded (incl. ghost focus) but no expanded composite yet.
+                    needComboRebuild = true;
+                } else {
+                    int bw = snap.comboRect_e.right - snap.comboRect_e.left;
+                    int bh = snap.comboRect_e.bottom - snap.comboRect_e.top;
+                    int lw = snap.labelRect.right - snap.labelRect.left;
+                    int lh = snap.labelRect.bottom - snap.labelRect.top;
+                    if (bw > 0 && bh > 0 && (bw != lw || bh != lh) &&
+                        liveRectDisagrees(snap.comboRect_e)) {
+                        DiagLog(L"[GHOST] '%s': expanded combo baked at %dx%d, live label rect %dx%d (re-measured) - invalidated for rebuild",
+                                polled[i].name.empty() ? L"?" : polled[i].name.c_str(), bw, bh, lw, lh);
+                        snap.comboHash_e = 0; // stale geometry: force rebuild
+                        needComboRebuild = true;
+                    }
+                }
+            } else if (snap.comboHash_c != 0) {
+                // Collapsed composite: only distrust it when the live rect is
+                // SMALLER than what it was built with (label shrank below its
+                // build geometry). Live being larger is just the expanded
+                // state, not staleness.
+                int bw = snap.comboRect_c.right - snap.comboRect_c.left;
+                int bh = snap.comboRect_c.bottom - snap.comboRect_c.top;
+                int lw = snap.labelRect.right - snap.labelRect.left;
+                int lh = snap.labelRect.bottom - snap.labelRect.top;
+                if (bw > 0 && bh > 0 && (lw < bw || lh < bh) &&
+                    liveRectDisagrees(snap.comboRect_c)) {
+                    snap.comboHash_c = 0; // stale geometry: force rebuild
+                    needComboRebuild = true;
+                }
+            }
+            if (needComboRebuild) {
+                ULONGLONG nowReq = GetTickCount64();
+                if (nowReq - snap.lastComboRebuildReq > 500) {
+                    snap.lastComboRebuildReq = nowReq;
+                    DiagLog(L"[TRIG-COMBO] poll idx %zu '%s': combo geometry invalidation -> full pass",
+                            i, polled[i].name.empty() ? L"?" : polled[i].name.c_str());
+                    if (g_overlayWnd && !g_snapshotUpdatePending.load(std::memory_order_relaxed)) {
+                        g_snapshotUpdatePending.store(true, std::memory_order_relaxed);
+                        PostMessageW(g_overlayWnd, WM_APP_SNAPSHOT_UPDATE, 0, 0);
+                    }
                 }
             }
         }
@@ -5576,12 +6540,9 @@ void QuickSnapshotStatePoll() {
         if (updateRect) {
             snap.labelRect = newLabelRect;
             if (sizeChanged || oldW == 0) {
-                if (newW > 0 && newH > 0) {
-                    snap.labelCacheKey = 0x1ABE00000000000ULL | ((uint64_t)newW << 16) | (uint64_t)newH;
-                    labelBakes.push_back({snap.labelCacheKey, {newW, newH}});
-                } else {
-                    snap.labelCacheKey = 0;
-                }
+                DiagLog(L"[TRIG-LABEL] poll idx %zu '%s': label %dx%d -> %dx%d -> full pass",
+                        i, polled[i].name.empty() ? L"?" : polled[i].name.c_str(),
+                        oldW, oldH, newW, newH);
                 if (!g_snapshotUpdatePending.load(std::memory_order_relaxed)) {
                     if (g_overlayWnd) {
                         g_snapshotUpdatePending.store(true, std::memory_order_relaxed);
@@ -5599,14 +6560,37 @@ void QuickSnapshotStatePoll() {
         if (cLabelW > 0 && cLabelH > 0) {
             UnionRect(&combinedRect, &snap.iconRect, &snap.labelRect);
         }
+        // [SLITHER-PROBE v2.5.1] The poll re-correcting a rect the pass
+        // published is the slither's "focus change re-corrects" event. Log
+        // only SMALL corrections (<=2px per edge, something nonzero) — the
+        // slither signature. Drags/zoom relayouts move by much more and
+        // stay silent. Bounded: first 40 per session.
+        {
+            static int s_slitherFixLogged = 0;
+            int dL = combinedRect.left - snap.combinedRect.left;
+            int dT = combinedRect.top - snap.combinedRect.top;
+            int dR = combinedRect.right - snap.combinedRect.right;
+            int dB = combinedRect.bottom - snap.combinedRect.bottom;
+            bool anyDiff = (dL || dT || dR || dB);
+            bool small = (dL >= -2 && dL <= 2) && (dT >= -2 && dT <= 2) &&
+                         (dR >= -2 && dR <= 2) && (dB >= -2 && dB <= 2);
+            if (anyDiff && small && s_slitherFixLogged < 40) {
+                ++s_slitherFixLogged;
+                wchar_t line[512];
+                swprintf_s(line,
+                    L"[SLITHER-FIX] poll re-correct '%s' idx %zu: (%ld,%ld,%ld,%ld)->(%ld,%ld,%ld,%ld) d=(%d,%d,%d,%d) label=%dx%d",
+                    snap.displayName.empty() ? L"?" : snap.displayName.c_str(), i,
+                    snap.combinedRect.left, snap.combinedRect.top, snap.combinedRect.right, snap.combinedRect.bottom,
+                    combinedRect.left, combinedRect.top, combinedRect.right, combinedRect.bottom,
+                    dL, dT, dR, dB, cLabelW, cLabelH);
+                slitherFixLogs.push_back(line);
+            }
+        }
         snap.combinedRect = combinedRect;
     }
     g_snapshotGeneration.fetch_add(1, std::memory_order_release);
-    // GPU label-bitmap work happens outside g_snapshotMutex (see labelBakes).
     snapLock.unlock();
-    for (const auto& lb : labelBakes) {
-        CacheLabelBitmap(lb.first, lb.second.cx, lb.second.cy);
-    }
+    for (const auto& l : slitherFixLogs) DiagLog(L"%s", l.c_str()); // [SLITHER-PROBE]
 
     // A hold starting/ending changes what the mask must stamp without changing
     // any snapshot geometry, so nudge the render loop into rebuilding the mask.
@@ -5628,6 +6612,143 @@ void QuickSnapshotStatePoll() {
     }
 }
 
+// Capture ONE desktop item's RawListItem (LV read + parsing name + rects).
+// UI thread only (documented rule: the worker never messages hLV). Shared by
+// the full pass and the per-icon fast path.
+static void CaptureRawListItem(HWND hLV, IFolderView2* pFolderView2, int i, RawListItem& item) {
+    item.index = i;
+
+    LVITEMW lvi = {};
+    lvi.mask = LVIF_IMAGE | LVIF_STATE | LVIF_TEXT;
+    lvi.stateMask = LVIS_SELECTED | LVIS_FOCUSED | LVIS_DROPHILITED | LVIS_OVERLAYMASK;
+    lvi.iItem = i;
+    WCHAR itemName[MAX_PATH] = {0};
+    lvi.pszText = itemName;
+    lvi.cchTextMax = MAX_PATH;
+
+    SendMessage(hLV, LVM_GETITEM, 0, (LPARAM)&lvi);
+    item.imageIndex = lvi.iImage;
+    item.state = lvi.state;
+    item.overlayIndex = (lvi.state & LVIS_OVERLAYMASK) >> 8;
+    item.text = itemName;
+
+    // Retrieve canonical parsing name directly from Desktop Shell View
+    if (pFolderView2) {
+        ComPtr<IShellItem> shellItem;
+        if (SUCCEEDED(pFolderView2->GetItem(i, IID_PPV_ARGS(&shellItem))) && shellItem) {
+            PWSTR pszParsing = nullptr;
+            if (SUCCEEDED(shellItem->GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING, &pszParsing)) && pszParsing) {
+                item.parsingName = pszParsing;
+                CoTaskMemFree(pszParsing);
+            }
+        }
+    }
+
+    RECT tempIcon, tempBounds, tempLabel;
+    if (GetListViewItemRects(hLV, g_overlayWnd, i, tempIcon, tempBounds, tempLabel)) {
+        item.iconRect = tempIcon;
+        item.boundsRect = tempBounds;
+        item.labelRect = tempLabel;
+    } else {
+        // Fallback to the last known good snapshot to prevent 0-sized cache keys
+        std::lock_guard<std::mutex> snapLock(g_snapshotMutex);
+        if (i < (int)g_iconSnapshots.size()) {
+            item.iconRect = g_iconSnapshots[i].iconRect;
+            item.boundsRect = g_iconSnapshots[i].boundsRect;
+            item.labelRect = g_iconSnapshots[i].labelRect;
+        } else {
+            item.iconRect = {0, 0, 0, 0};
+            item.boundsRect = {0, 0, 0, 0};
+            item.labelRect = {0, 0, 0, 0};
+        }
+    }
+}
+
+// --- PER-ICON FAST PATH (rebake-latency fix) ------------------------------
+// A click used to ride full deep passes (175 items, 0.5-2.3 s each, 2+ per
+// click per the [PASS] diag). The fast path is a priority slot the worker
+// drains BEFORE the normal queue: one item, captured at selection time,
+// processed + preflighted in a few ms — so the expanded-label composite and
+// its shadow assets exist while the selection glow is still fading in.
+struct FastPathRequest {
+    std::vector<RawListItem> items;
+    std::wstring userDesktop;
+    std::wstring publicDesktop;
+    HFONT labelFont = nullptr;
+    LOGFONTW labelLogfont = {};
+};
+std::mutex g_fastPathMutex;
+FastPathRequest g_fastPathRequest;
+
+void QueueFastPathPass(int itemIndex) {
+    if (!g_overlayWnd || !IsWindow(g_overlayWnd)) return;
+    HWND hLV = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        hLV = g_cachedHwndLV;
+    }
+    if (!hLV || !IsWindow(hLV) || g_unloading) return;
+    if (!IsWindowVisible(hLV)) return;
+
+    HFONT font = nullptr;
+    LOGFONTW lf = {};
+    {
+        std::lock_guard<std::mutex> lock(g_snapshotRequestMutex);
+        font = g_snapshotLabelHFont;
+        lf = g_snapshotLabelFont;
+    }
+    if (!font) return; // no boot pass yet — the normal pass covers us
+
+    // IFolderView2 for the canonical parsing name (same acquisition as the
+    // full pass; once per click, cheap).
+    ComPtr<IFolderView2> pFolderView2;
+    {
+        ComPtr<IShellWindows> shellWindows;
+        if (SUCCEEDED(CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&shellWindows)))) {
+            VARIANT vEmpty = {};
+            vEmpty.vt = VT_EMPTY;
+            long hwndDesktop = 0;
+            ComPtr<IDispatch> disp;
+            if (SUCCEEDED(shellWindows->FindWindowSW(&vEmpty, &vEmpty, SWC_DESKTOP, &hwndDesktop, SWFO_NEEDDISPATCH, &disp)) && disp) {
+                ComPtr<IServiceProvider> sp;
+                if (SUCCEEDED(disp.As(&sp))) {
+                    ComPtr<IShellBrowser> sb;
+                    if (SUCCEEDED(sp->QueryService(SID_STopLevelBrowser, IID_PPV_ARGS(&sb)))) {
+                        ComPtr<IShellView> sv;
+                        if (SUCCEEDED(sb->QueryActiveShellView(&sv))) {
+                            sv.As(&pFolderView2);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    FastPathRequest req;
+    req.labelFont = font;
+    req.labelLogfont = lf;
+    RawListItem item = {};
+    CaptureRawListItem(hLV, pFolderView2.Get(), itemIndex, item);
+    req.items.push_back(std::move(item));
+
+    PWSTR pUserDesktop = nullptr;
+    PWSTR pPublicDesktop = nullptr;
+    SHGetKnownFolderPath(FOLDERID_Desktop, 0, NULL, &pUserDesktop);
+    SHGetKnownFolderPath(FOLDERID_PublicDesktop, 0, NULL, &pPublicDesktop);
+    req.userDesktop = pUserDesktop ? pUserDesktop : L"";
+    req.publicDesktop = pPublicDesktop ? pPublicDesktop : L"";
+    if (pUserDesktop) CoTaskMemFree(pUserDesktop);
+    if (pPublicDesktop) CoTaskMemFree(pPublicDesktop);
+
+    {
+        std::lock_guard<std::mutex> lock(g_fastPathMutex);
+        // Replace, don't queue: only the most recent click matters — an older
+        // single-icon request would be stale by the time it runs.
+        g_fastPathRequest = std::move(req);
+    }
+    if (g_snapshotWorkerEvent) SetEvent(g_snapshotWorkerEvent);
+}
+
 void QueueFullSnapshot() {
     // Do not run a deep pass if the overlay is currently being recreated
     if (!g_overlayWnd || !IsWindow(g_overlayWnd)) return;
@@ -5640,6 +6761,31 @@ void QueueFullSnapshot() {
     if (!hLV || !IsWindow(hLV) || g_unloading) return;
     // Hidden LV = "Show desktop icons" off: no deep passes while icons are hidden
     if (!IsWindowVisible(hLV)) return;
+
+    // [STAMPEDE DEDUPE] One click used to queue 2-3 full passes (click +
+    // focus-retry timers), each blocking the UI thread 100-450 ms to capture
+    // 175 icons and processing 0.5-2.3 s serialized. Coalesce anything within
+    // 250 ms of the last queued pass: the fast path already covered the
+    // clicked icon, and the 1 s state poll re-detects any drift a skipped
+    // pass would have caught.
+    {
+        static std::atomic<ULONGLONG> s_lastFullQueueTick{0};
+        ULONGLONG nowTick = GetTickCount64();
+        ULONGLONG lastTick = s_lastFullQueueTick.exchange(nowTick, std::memory_order_relaxed);
+        if (lastTick != 0 && nowTick - lastTick < 250) {
+            // [PACING v2.5.1] The dedupe used to DROP the request silently,
+            // trusting "the 1s poll re-detects" — which deferred zoom passes
+            // by up to a full heartbeat (the 31ms-vs-921ms PASS-START spread)
+            // and could eat a zoom leg entirely (log proof 2026-11-06: the
+            // 46->51 zoom got no PASS-START at all). Re-arm instead of drop:
+            // the retry fires past the dedupe window and re-queues exactly
+            // once. Anti-stampede property intact (still one pass per
+            // 250ms window), the dropped-request hole is closed.
+            ArmSnapRetry(260);
+            DiagLog(L"[PACING] queue coalesced within 250ms window -> retry armed");
+            return;
+        }
+    }
 
     UpdateCachedImageList(hLV);
 
@@ -5703,6 +6849,8 @@ void QueueFullSnapshot() {
                 }
                 s_prevCaptured = CreateFontIndirectW(&lf); // created on UI thread = correct DPI mapping
                 s_prevCapturedLf = lf;
+                // [F2] New captured font: every cached glyph alpha is stale.
+                g_labelFontGen.fetch_add(1, std::memory_order_relaxed);
             } else {
                 s_prevCaptured = nullptr;
             }
@@ -5735,53 +6883,7 @@ void QueueFullSnapshot() {
 
     for (int i = 0; i < count; ++i) {
         RawListItem item = {};
-        item.index = i;
-
-        LVITEMW lvi = {};
-        lvi.mask = LVIF_IMAGE | LVIF_STATE | LVIF_TEXT;
-        lvi.stateMask = LVIS_SELECTED | LVIS_FOCUSED | LVIS_DROPHILITED | LVIS_OVERLAYMASK;
-        lvi.iItem = i;
-        WCHAR itemName[MAX_PATH] = {0};
-        lvi.pszText = itemName;
-        lvi.cchTextMax = MAX_PATH;
-
-        SendMessage(hLV, LVM_GETITEM, 0, (LPARAM)&lvi);
-        item.imageIndex = lvi.iImage;
-        item.state = lvi.state;
-        item.overlayIndex = (lvi.state & LVIS_OVERLAYMASK) >> 8;
-        item.text = itemName;
-
-        // Retrieve canonical parsing name directly from Desktop Shell View
-        if (pFolderView2) {
-            ComPtr<IShellItem> shellItem;
-            if (SUCCEEDED(pFolderView2->GetItem(i, IID_PPV_ARGS(&shellItem))) && shellItem) {
-                PWSTR pszParsing = nullptr;
-                if (SUCCEEDED(shellItem->GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING, &pszParsing)) && pszParsing) {
-                    item.parsingName = pszParsing;
-                    CoTaskMemFree(pszParsing);
-                }
-            }
-        }
-
-        RECT tempIcon, tempBounds, tempLabel;
-        if (GetListViewItemRects(hLV, g_overlayWnd, i, tempIcon, tempBounds, tempLabel)) {
-            item.iconRect = tempIcon;
-            item.boundsRect = tempBounds;
-            item.labelRect = tempLabel;
-        } else {
-            // Fallback to the last known good snapshot to prevent 0-sized cache keys
-            std::lock_guard<std::mutex> snapLock(g_snapshotMutex);
-            if (i < (int)g_iconSnapshots.size()) {
-                item.iconRect = g_iconSnapshots[i].iconRect;
-                item.boundsRect = g_iconSnapshots[i].boundsRect;
-                item.labelRect = g_iconSnapshots[i].labelRect;
-            } else {
-                item.iconRect = {0, 0, 0, 0};
-                item.boundsRect = {0, 0, 0, 0};
-                item.labelRect = {0, 0, 0, 0};
-            }
-        }
-
+        CaptureRawListItem(hLV, pFolderView2.Get(), i, item);
         rawItems.push_back(item);
     }
 
@@ -5860,7 +6962,18 @@ void CacheOverlayBitmap(int overlayIndex) {
         RegCloseKey(hKey);
     }
 
+    if (!settings.customArrowEnabled) found = false;
     g_isCustomShortcutArrow.store(found, std::memory_order_relaxed);
+
+    // [F1] The custom-arrow flip changes pc1's baked arrow with no combo-hash
+    // input changing — stand the skip guard down for this pass.
+    {
+        static bool s_prevCustomArrow = false;
+        if (s_prevCustomArrow != found) {
+            s_prevCustomArrow = found;
+            g_arrowGen.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
 
     // Custom arrow uses user-defined scale; Windows Default arrow extracts at full canvas size (100%)
     int overlaySize = targetSize;
@@ -5956,77 +7069,6 @@ void CacheOverlayBitmap(int overlayIndex) {
     }
 }
 
-void CacheLabelBitmap(uint64_t cacheKey, int w, int h) {
-    if (w <= 0 || h <= 0 || w > 512 || h > 512) return;
-
-    {
-        std::lock_guard<std::mutex> lock(g_cacheMutex);
-        if (g_iconCache.find(cacheKey) != g_iconCache.end()) return;
-    }
-
-    std::vector<uint8_t> alphaOnly(w * h, 255);
-    uint64_t matchedHash = cacheKey;
-    ComPtr<ID2D1Bitmap> d2dBitmap;
-
-    {
-        std::lock_guard<std::mutex> lock(g_uniqueShapesMutex);
-        for (const auto& shape : g_uniqueShapes) {
-            if (shape.width == (UINT)w && shape.height == (UINT)h) {
-                matchedHash = shape.hash;
-                auto bmpIt = g_shapeToBitmap.find(matchedHash);
-                if (bmpIt != g_shapeToBitmap.end()) d2dBitmap = bmpIt->second;
-                break;
-            }
-        }
-
-        if (!d2dBitmap) {
-            uint64_t h_hash = 14695981039346656037ULL;
-            for (UINT i = 0; i < (UINT)(w * h); ++i) {
-                h_hash ^= alphaOnly[i];
-                h_hash *= 1099511628211ULL;
-            }
-            matchedHash = h_hash;
-
-            std::vector<BYTE> bgraData(w * h * 4);
-            for (UINT i = 0; i < (UINT)(w * h); ++i) {
-                bgraData[i * 4 + 0] = 0;
-                bgraData[i * 4 + 1] = 0;
-                bgraData[i * 4 + 2] = 0;
-                bgraData[i * 4 + 3] = 255;
-            }
-
-            D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
-                D2D1_BITMAP_OPTIONS_NONE,
-                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED)
-            );
-
-            ComPtr<ID2D1Bitmap1> tempBitmap1;
-            {
-                std::lock_guard<std::mutex> dcLock(g_resourceDcMutex);
-                if (g_resourceDc) {
-                    g_resourceDc->CreateBitmap(D2D1::SizeU(w, h), bgraData.data(), w * 4, &props, &tempBitmap1);
-                }
-            }
-
-            d2dBitmap = tempBitmap1;
-
-            g_uniqueShapes.push_back({matchedHash, (UINT)w, (UINT)h, std::move(alphaOnly), 0, 0});
-            g_shapeToBitmap[matchedHash] = d2dBitmap;
-        }
-    }
-
-    if (!d2dBitmap) return; // Abort if D2D failed
-
-    {
-        std::lock_guard<std::mutex> lock(g_cacheMutex);
-        g_iconCache[cacheKey] = d2dBitmap;
-    }
-    {
-        std::lock_guard<std::mutex> hLock(g_hashCacheMutex);
-        g_iconHashCache[cacheKey] = matchedHash;
-    }
-}
-
 void ExtractIconAlphaBaseline(HICON hIcon, int targetSize, SilhouetteData& outBaseline) {
     if (!g_wicFactory) InitWIC();
     if (!g_wicFactory) return;
@@ -6063,6 +7105,7 @@ void BuildGenericBaselines() {
 
     g_baselinesReady = false;
     g_genericFileBaseline = {};
+    g_genericFileBaselines.clear();
     g_genericFolderBaseline = {};
 
     if (!g_wicFactory) InitWIC();
@@ -6080,6 +7123,45 @@ void BuildGenericBaselines() {
             if (hIconSmall) DestroyIcon(hIconSmall);
         }
     }
+    g_genericFileBaselines.push_back(g_genericFileBaseline);
+
+    // [v2.1.10] Variant 2: SIID_DOCNOASSOC stock doc (what the ImageList may
+    // hold during churn, even when the association path resolves elsewhere).
+    {
+        SHSTOCKICONINFO sii = { sizeof(sii) };
+        if (SUCCEEDED(SHGetStockIconInfo(SIID_DOCNOASSOC, SHGSI_ICON, &sii)) && sii.hIcon) {
+            SilhouetteData v;
+            ExtractIconAlphaBaseline(sii.hIcon, targetSize, v);
+            DestroyIcon(sii.hIcon);
+            g_genericFileBaselines.push_back(std::move(v));
+        }
+    }
+    // [v2.1.10] Variant 3: the classic shell32 blank doc (Win10-era rendering,
+    // still what several churn paths serve on Win11).
+    {
+        WCHAR sysDir2[MAX_PATH];
+        GetSystemDirectoryW(sysDir2, MAX_PATH);
+        UINT nIconSize2 = MAKELONG(targetSize, targetSize);
+        HICON hLarge2 = nullptr, hSmall2 = nullptr;
+        if (SUCCEEDED(SHDefExtractIconW((std::wstring(sysDir2) + L"\\shell32.dll").c_str(), 1, 0,
+                                        &hLarge2, &hSmall2, nIconSize2)) && hLarge2) {
+            SilhouetteData v;
+            ExtractIconAlphaBaseline(hLarge2, targetSize, v);
+            if (hSmall2) DestroyIcon(hSmall2);
+            DestroyIcon(hLarge2);
+            g_genericFileBaselines.push_back(std::move(v));
+        }
+    }
+
+    // Ground truth for the blank-doc hunt: every variant's dims + alpha hash,
+    // so a near-miss in the field can be compared against exactly what we hold.
+    for (const auto& v : g_genericFileBaselines) {
+        if (v.width == 0) continue;
+        uint64_t h = 14695981039346656037ULL;
+        for (uint8_t a : v.alphaData) { h ^= a; h *= 1099511628211ULL; }
+        DiagLog(L"[STAKEOUT] baseline variant %ux%u hash=%llu",
+                v.width, v.height, (unsigned long long)h);
+    }
 
     // Generic folder icon via imageres.dll index 3 (same as CacheIconBitmap)
     WCHAR sysDir[MAX_PATH];
@@ -6094,7 +7176,22 @@ void BuildGenericBaselines() {
     }
 
     g_baselineTargetSize = targetSize;
-    g_baselinesReady = (g_genericFileBaseline.width > 0 && g_genericFolderBaseline.width > 0);
+    // [v2.1.13] Ready = at least one file variant AND the folder baseline.
+    // The assoc variant can fail at reload timing (shell association engine
+    // not warm: assocDims=0x0 measured); the lazy ImageList top-up in
+    // CacheIconBitmap fills the gap from the LV's own list.
+    bool anyFileVariant = false;
+    for (const auto& v : g_genericFileBaselines) if (v.width > 0) anyFileVariant = true;
+    g_baselinesReady = (anyFileVariant && g_genericFolderBaseline.width > 0);
+    {
+        int builtCount = 0;
+        for (const auto& v : g_genericFileBaselines) if (v.width > 0) builtCount++;
+        DiagLog(L"[STAKEOUT] baselines built: targetSize=%d ready=%d fileVariants=%d/%d assocDims=%ux%u folderDims=%ux%u",
+                targetSize, g_baselinesReady ? 1 : 0, builtCount,
+                (int)g_genericFileBaselines.size(),
+                g_genericFileBaseline.width, g_genericFileBaseline.height,
+                g_genericFolderBaseline.width, g_genericFolderBaseline.height);
+    }
 }
 
 
@@ -6163,7 +7260,11 @@ static bool EnsureDWriteFactory() {
 
 // DirectWrite path: word wrap + character-granularity U+2026 trimming natively,
 // rendered through the bake context. Returns false if unavailable.
-static bool RenderGlyphSilhouetteD2D(const std::wstring& text, const LOGFONTW& lf, int w, int h, std::vector<uint8_t>& alphaOut) {
+// `truncated`: true = collapsed label (ellipsis truncation, Explorer's
+// DrawText DT_END_ELLIPSIS behavior); false = expanded label (whole name,
+// wrap-only, overlong words char-wrap mid-word onto the next row, NO ellipsis
+// anywhere — Explorer grows the rect to fit the full name).
+static bool RenderGlyphSilhouetteD2D(const std::wstring& text, const LOGFONTW& lf, int w, int h, std::vector<uint8_t>& alphaOut, bool truncated) {
     if (!g_bakeDc || g_unloading.load(std::memory_order_relaxed)) return false;
     if (!EnsureDWriteFactory()) return false;
 
@@ -6258,78 +7359,109 @@ static bool RenderGlyphSilhouetteD2D(const std::wstring& text, const LOGFONTW& l
         cleanText.pop_back();
     }
 
-    auto replaceDots = [](std::wstring& s) {
-        size_t pos = s.find(L"...");
-        if (pos != std::wstring::npos) {
-            s.replace(pos, 3, std::wstring(1, L'\u2026'));
-        }
-    };
-
     if (hdcTmp) {
-        // Greedy wrap, line by line, up to maxLines. Desktop expanded labels
-        // are NARROW and TALL (Explorer wraps the name into many short lines
-        // within the icon cell width), so the wrapper must fill every line —
-        // emitting only one split + one truncated remainder leaves the rest of
-        // the name cut off and vertically centered in the tall canvas.
+        // Explorer's label wrapper = DrawTextW(DT_WORDBREAK | DT_END_ELLIPSIS):
+        //   - ONLY spaces are break points (hyphens, periods, digits are not —
+        //     measured against Explorer: "2026-08-30qweq-qwe-asd" and
+        //     "Screensh.ot2026-.08-31" each stay one unbreakable token).
+        //   - Each line fills greedily with whole words.
+        //   - A word wider than the whole line is emergency-broken at
+        //     character granularity WITH an ellipsis, and the next line starts
+        //     at the NEXT word, not the remainder ("Antigravity IDE" renders
+        //     "Antigra…" / "IDE", never "Antigravit" / "y IDE").
+        //   - Every line truncates independently, each with its own ellipsis.
         // GDI measurement keeps wrap/truncation points aligned with what
-        // comctl32 actually draws.
-        size_t start = 0;
-        const size_t len = cleanText.length();
-        while (start < len && (int)lines.size() < maxLines) {
-            bool lastLine = ((int)lines.size() + 1) >= maxLines;
-            std::wstring rest = cleanText.substr(start);
-
-            // Does the remainder fit on this line? DT_NOPREFIX: '&' is a
-            // literal character in listview labels — without it DrawTextW
-            // strips it as an accelerator prefix and under-measures the text
-            // ("_milk&honey" measured as "_milkhoney").
-            RECT rcFit = {0, 0, availW, 1000};
-            DrawTextW(hdcTmp, rest.c_str(), (int)rest.length(), &rcFit,
+        // comctl32 actually draws. DT_NOPREFIX: '&' is a literal character in
+        // listview labels — without it DrawTextW strips it as an accelerator
+        // prefix and under-measures ("_milk&honey" measured as "_milkhoney").
+        auto fitsOnLine = [&](const std::wstring& s) {
+            RECT rc = {0, 0, availW, 1000};
+            DrawTextW(hdcTmp, s.c_str(), (int)s.length(), &rc,
                       DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
-            if (rcFit.right <= availW) {
-                lines.push_back(rest);
-                start = len;
+            return rc.right <= availW;
+        };
+        // Longest truncated form of `s` that fits one line, decided by GDI's
+        // own DT_END_ELLIPSIS machinery (DT_MODIFYSTRING) — the exact engine
+        // Explorer truncates with. Hand-measuring prefix+"…" disagrees by a
+        // character on boundary cases ("Everything" -> "Everyt…" vs Win's
+        // "Everyth...").
+        auto ellipsize = [&](const std::wstring& s) {
+            std::vector<wchar_t> buf(s.begin(), s.end());
+            buf.resize(buf.size() + 4, L'\0');
+            RECT rc = {0, 0, availW, 1000};
+            DrawTextW(hdcTmp, buf.data(), (int)s.length(), &rc,
+                      DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX | DT_MODIFYSTRING | DT_END_ELLIPSIS);
+            return std::wstring(buf.data());
+        };
+        std::vector<std::wstring> tokens;
+        {
+            std::wstring tok;
+            for (wchar_t c : cleanText) {
+                if (c == L' ') {
+                    if (!tok.empty()) tokens.push_back(std::move(tok));
+                    tok.clear();
+                } else {
+                    tok += c;
+                }
+            }
+            if (!tok.empty()) tokens.push_back(std::move(tok));
+        }
+        size_t ti = 0;
+        while (ti < tokens.size() && (int)lines.size() < maxLines) {
+            bool lastLine = ((int)lines.size() + 1) >= maxLines;
+            std::wstring cur = tokens[ti++];
+            if (!truncated) {
+                // --- EXPANDED MODE: whole name, wrap-only, no ellipsis ---
+                if (!fitsOnLine(cur)) {
+                    // Word wider than the line: char-fill each row and
+                    // CONTINUE mid-word on the next (Explorer's expanded
+                    // label keeps the entire name visible).
+                    size_t pos = 0;
+                    while (pos < cur.length() && (int)lines.size() < maxLines) {
+                        size_t fit = 0;
+                        for (size_t k = 1; pos + k <= cur.length(); ++k) {
+                            if (!fitsOnLine(cur.substr(pos, k))) break;
+                            fit = k;
+                        }
+                        if (fit == 0) fit = 1;
+                        lines.push_back(cur.substr(pos, fit));
+                        pos += fit;
+                    }
+                    continue;
+                }
+                // Greedy fill: add whole words while they fit.
+                while (ti < tokens.size()) {
+                    std::wstring cand = cur + L' ' + tokens[ti];
+                    if (!fitsOnLine(cand)) break;
+                    cur = std::move(cand);
+                    ++ti;
+                }
+                lines.push_back(std::move(cur));
+                continue;
+            }
+            if (!fitsOnLine(cur)) {
+                // Whole word wider than the line: emergency break with
+                // ellipsis; the word is consumed entirely.
+                lines.push_back(ellipsize(cur));
+                continue;
+            }
+            // Greedy fill: add whole words while they fit.
+            while (ti < tokens.size()) {
+                std::wstring cand = cur + L' ' + tokens[ti];
+                if (!fitsOnLine(cand)) break;
+                cur = std::move(cand);
+                ++ti;
+            }
+            if (lastLine && ti < tokens.size()) {
+                // Last allowed line: the remaining words stay on it, joined,
+                // truncated with an ellipsis.
+                std::wstring restLine = cur;
+                for (; ti < tokens.size(); ++ti) restLine += L' ' + tokens[ti];
+                if (!fitsOnLine(restLine)) restLine = ellipsize(restLine);
+                lines.push_back(std::move(restLine));
                 break;
             }
-
-            if (lastLine) {
-                // Final allowed line: truncate with an ellipsis
-                std::vector<wchar_t> bufE(rest.begin(), rest.end());
-                bufE.resize(bufE.size() + 4, L'\0');
-                RECT rE = {0, 0, availW, 1000};
-                DrawTextW(hdcTmp, bufE.data(), (int)rest.length(), &rE,
-                          DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX | DT_MODIFYSTRING | DT_END_ELLIPSIS);
-                lines.push_back(bufE.data());
-                replaceDots(lines.back());
-                break;
-            }
-
-            // Longest prefix that fits on this line
-            int fit = 0;
-            for (size_t i = 1; i <= rest.length(); ++i) {
-                RECT rc2 = {0, 0, availW, 1000};
-                std::wstring probe = rest.substr(0, i);
-                DrawTextW(hdcTmp, probe.c_str(), (int)probe.length(), &rc2,
-                          DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
-                if (rc2.right <= availW) fit = (int)i; else break;
-            }
-            if (fit <= 0) fit = 1;
-
-            // Prefer breaking at the last space within the fitted run.
-            // Hyphens are NOT break candidates — Explorer keeps hyphenated tokens whole.
-            size_t breakPos = std::wstring::npos;
-            for (size_t k = fit + 1; k > 0; --k) {
-                if (k - 1 < rest.length() && rest[k - 1] == L' ') { breakPos = k; break; }
-            }
-            if (breakPos != std::wstring::npos) {
-                std::wstring seg = rest.substr(0, breakPos);
-                while (!seg.empty() && seg.back() == L' ') seg.pop_back();
-                if (!seg.empty()) lines.push_back(seg);
-                start += breakPos;
-            } else {
-                lines.push_back(rest.substr(0, fit));
-                start += fit;
-            }
+            lines.push_back(std::move(cur));
         }
     }
 
@@ -6447,8 +7579,64 @@ static bool RenderGlyphSilhouetteD2D(const std::wstring& text, const LOGFONTW& l
     return ok;
 }
 
-static bool RenderGlyphSilhouette(const std::wstring& text, HFONT hFont, const LOGFONTW& lf, int w, int h, std::vector<uint8_t>& alphaOut) {
+// [F2 GLYPH CACHE] RenderGlyphSilhouette is expensive (GDI metrics probe +
+// O(n^2) wrap probes + DWrite layout/render/readback) and used to re-run for
+// EVERY icon on EVERY deep pass. Cache the rendered alpha per
+// (text, dims, truncation, font generation); the generation counter lives
+// next to g_arrowGen. Entries are pure CPU alpha (a few KB each), bounded
+// by a lazy clear.
+struct GlyphCacheKey {
+    uint64_t textHash;
+    int w;
+    int h;
+    int fontHeight; // [MULTIMON v2.9.4] LOGFONT height: per-monitor font sizes (20px primary vs 16px secondary) must never share an entry
+    uint32_t fontGen;
+    bool truncated;
+    bool operator==(const GlyphCacheKey& o) const {
+        return textHash == o.textHash && w == o.w && h == o.h &&
+               fontHeight == o.fontHeight &&
+               fontGen == o.fontGen && truncated == o.truncated;
+    }
+};
+struct GlyphCacheKeyHash {
+    size_t operator()(const GlyphCacheKey& k) const {
+        uint64_t h = 14695981039346656037ULL;
+        h ^= k.textHash;            h *= 1099511628211ULL;
+        h ^= (uint64_t)(uint32_t)k.w; h *= 1099511628211ULL;
+        h ^= (uint64_t)(uint32_t)k.h; h *= 1099511628211ULL;
+        h ^= (uint64_t)(int64_t)k.fontHeight; h *= 1099511628211ULL;
+        h ^= (uint64_t)k.fontGen;   h *= 1099511628211ULL;
+        h ^= (uint64_t)k.truncated; h *= 1099511628211ULL;
+        return (size_t)h;
+    }
+};
+static std::mutex s_glyphCacheMutex;
+static std::unordered_map<GlyphCacheKey, std::vector<uint8_t>, GlyphCacheKeyHash> s_glyphCache;
+
+static bool RenderGlyphSilhouette(const std::wstring& text, HFONT hFont, const LOGFONTW& lf, int w, int h, std::vector<uint8_t>& alphaOut, bool truncated) {
     if (text.empty() || !hFont || w <= 0 || h <= 0 || w > 512 || h > 512) return false;
+
+    // [F2] Exact-reuse cache: same text, dims, truncation mode and font
+    // generation => byte-identical alpha. Wrong predictions simply never hit.
+    GlyphCacheKey key{};
+    key.textHash = 14695981039346656037ULL;
+    for (wchar_t c : text) {
+        key.textHash ^= (uint64_t)c;
+        key.textHash *= 1099511628211ULL;
+    }
+    key.w = w;
+    key.h = h;
+    key.fontHeight = lf.lfHeight; // [MULTIMON v2.9.4]
+    key.fontGen = g_labelFontGen.load(std::memory_order_relaxed);
+    key.truncated = truncated;
+    {
+        std::lock_guard<std::mutex> lock(s_glyphCacheMutex);
+        auto it = s_glyphCache.find(key);
+        if (it != s_glyphCache.end()) {
+            alphaOut = it->second;
+            return true;
+        }
+    }
 
     // DirectWrite only — same text engine Explorer uses; GDI metrics round
     // advances differently per string and can never fully converge. (The old
@@ -6456,7 +7644,13 @@ static bool RenderGlyphSilhouette(const std::wstring& text, HFONT hFont, const L
     // ships on every Win10+ target, and a D2D failure degrades to the solid
     // rectangle label via the composite path's letterShaped check.)
     // hFont stays as the "a real LV font was captured" validity gate.
-    return RenderGlyphSilhouetteD2D(text, lf, w, h, alphaOut);
+    bool ok = RenderGlyphSilhouetteD2D(text, lf, w, h, alphaOut, truncated);
+    if (ok) {
+        std::lock_guard<std::mutex> lock(s_glyphCacheMutex);
+        if (s_glyphCache.size() > 1024) s_glyphCache.clear(); // lazy bound
+        s_glyphCache[key] = alphaOut;
+    }
+    return ok;
 }
 
 // ============================================================================
@@ -6499,12 +7693,16 @@ static std::wstring IconShapesFilePath() {
 struct IconShapesHeader { uint32_t magic; uint32_t version; uint32_t shapeCount; uint32_t indexCount; };
 struct IconShapeRecord { uint64_t hash; uint32_t w, h, thumbW, thumbH, alphaLen; };
 
-static void LoadIconShapes() {
+// Raw file parse shared by LoadIconShapes (boot) and SaveIconShapes
+// (cumulative merge). Returns false if the file is absent/corrupt.
+struct PersistedShapeBlob { uint64_t hash; uint32_t w, h, thumbW, thumbH; std::vector<uint8_t> alpha; };
+static bool ReadIconShapeFile(std::vector<PersistedShapeBlob>& outShapes,
+                              std::unordered_map<uint64_t, uint64_t>& outIndex) {
     std::wstring filePath = IconShapesFilePath();
-    if (filePath.empty()) return;
+    if (filePath.empty()) return false;
     HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) return;
+    if (hFile == INVALID_HANDLE_VALUE) return false;
 
     IconShapesHeader header = {};
     DWORD bytesRead = 0;
@@ -6512,34 +7710,44 @@ static void LoadIconShapes() {
         bytesRead != sizeof(header) || header.magic != 0x49435348 || header.version != 1 ||
         header.shapeCount > 10000 || header.indexCount > 100000) {
         CloseHandle(hFile);
-        return;
+        return false;
     }
 
+    for (uint32_t i = 0; i < header.shapeCount; ++i) {
+        IconShapeRecord rec = {};
+        if (!ReadFile(hFile, &rec, sizeof(rec), &bytesRead, nullptr) || bytesRead != sizeof(rec)) break;
+        if (rec.w == 0 || rec.h == 0 || rec.alphaLen != (uint32_t)rec.w * rec.h) break;
+        std::vector<uint8_t> alpha(rec.alphaLen);
+        if (!ReadFile(hFile, alpha.data(), rec.alphaLen, &bytesRead, nullptr) ||
+            bytesRead != rec.alphaLen) break;
+        outShapes.push_back({rec.hash, rec.w, rec.h, rec.thumbW, rec.thumbH, std::move(alpha)});
+    }
+    for (uint32_t i = 0; i < header.indexCount; ++i) {
+        uint64_t pair[2] = {};
+        if (!ReadFile(hFile, pair, sizeof(pair), &bytesRead, nullptr) || bytesRead != sizeof(pair)) break;
+        if (pair[0] != 0 && pair[1] != 0) outIndex[pair[0]] = pair[1];
+    }
+    CloseHandle(hFile);
+    return true;
+}
+
+static void LoadIconShapes() {
+    std::vector<PersistedShapeBlob> fileShapes;
     std::unordered_map<uint64_t, uint64_t> loadedIndex;
+    if (!ReadIconShapeFile(fileShapes, loadedIndex)) return;
+
     {
         std::lock_guard<std::mutex> uLock(g_uniqueShapesMutex);
-        for (uint32_t i = 0; i < header.shapeCount; ++i) {
-            IconShapeRecord rec = {};
-            if (!ReadFile(hFile, &rec, sizeof(rec), &bytesRead, nullptr) || bytesRead != sizeof(rec)) break;
-            if (rec.w == 0 || rec.h == 0 || rec.alphaLen != (uint32_t)rec.w * rec.h) break;
+        for (auto& blob : fileShapes) {
             // Skip shapes already known (the dedup store may have been warmed).
             bool exists = false;
             for (const auto& shape : g_uniqueShapes) {
-                if (shape.hash == rec.hash) { exists = true; break; }
+                if (shape.hash == blob.hash) { exists = true; break; }
             }
-            std::vector<uint8_t> alpha(rec.alphaLen);
-            if (!ReadFile(hFile, alpha.data(), rec.alphaLen, &bytesRead, nullptr) ||
-                bytesRead != rec.alphaLen) break;
             if (exists) continue;
-            g_uniqueShapes.push_back({rec.hash, rec.w, rec.h, std::move(alpha), rec.thumbW, rec.thumbH});
-        }
-        for (uint32_t i = 0; i < header.indexCount; ++i) {
-            uint64_t pair[2] = {};
-            if (!ReadFile(hFile, pair, sizeof(pair), &bytesRead, nullptr) || bytesRead != sizeof(pair)) break;
-            if (pair[0] != 0 && pair[1] != 0) loadedIndex[pair[0]] = pair[1];
+            g_uniqueShapes.push_back({blob.hash, blob.w, blob.h, std::move(blob.alpha), blob.thumbW, blob.thumbH});
         }
     }
-    CloseHandle(hFile);
 
     {
         std::lock_guard<std::mutex> pLock(g_persistedShapeIndexMutex);
@@ -6547,6 +7755,34 @@ static void LoadIconShapes() {
     }
     Wh_Log(L"[SHAPES] Loaded %zu persisted shapes, %zu index entries",
            g_uniqueShapes.size(), g_persistedShapeIndex.size());
+}
+
+// [POISON-GUARD v2.2.7] A shape matching a generic-doc baseline IS the
+// placeholder itself. The pixel tripwire guards EXTRACTION, but the
+// persisted-shape adoption path (below) trusted icon_shapes.bin blindly —
+// and the file had been poisoned once (boot 2026-11-05: 54 index keys
+// pointed at the placeholder shape), so every boot re-adopted the blank-doc
+// silhouette and nothing could fire: adoption never extracts pixels. Both
+// ends now compare content against g_genericFileBaselines.
+static bool IsGenericDocShape(const std::vector<uint8_t>& alpha, UINT w, UINT h) {
+    for (const auto& b : g_genericFileBaselines) {
+        if (b.width != w || b.height != h ||
+            b.alphaData.size() != alpha.size()) continue;
+        // [POISON-GUARD v2.2.15] The persisted poison is NOT byte-identical
+        // to today's baseline: measured 45/2601 flipped boundary pixels
+        // (1.7%) — a slightly different rendering of the same doc page (the
+        // same drift that let it slip past the pixel tripwire originally).
+        // Measured separation (v2.2.13/14 diags, SAD + threshold probes):
+        // poison = 45 flips (SAD 900), nearest legit shape = 80 flips (SAD
+        // 1600), real icons 260+ flips. Boundary placed at 2.5% of pixels.
+        // False positives are cheap (one honest re-extraction); false
+        // negatives resurrect the blank-doc loop.
+        size_t flips = 0;
+        for (size_t i = 0; i < alpha.size(); ++i)
+            if (alpha[i] != b.alphaData[i]) ++flips;
+        if (flips * 40 <= alpha.size()) return true;   // <= 2.5% flipped
+    }
+    return false;
 }
 
 static void SaveIconShapes(const std::vector<IconSnapshot>& manifest) {
@@ -6571,6 +7807,25 @@ static void SaveIconShapes(const std::vector<IconSnapshot>& manifest) {
     }
     if (index.empty()) return;
 
+    // 1b. [ZOOMFIX v2.2.2] CUMULATIVE merge: the old file holds every
+    // previously-visited zoom level's keys; replacing it on every save (old
+    // behavior) left only the current zoom in the index, so revisiting a
+    // zoom could never adopt its persisted shape and had to re-extract —
+    // whose pixels can differ from the original bake (ImageList churn),
+    // rekeying every combo hash and defeating the multi-zoom disk cache
+    // (proven 2026-11-03). Fresh entries win over stale ones per key.
+    std::vector<PersistedShapeBlob> oldFileShapes;
+    std::unordered_map<uint64_t, uint64_t> oldFileIndex;
+    bool hadOldFile = ReadIconShapeFile(oldFileShapes, oldFileIndex);
+    if (hadOldFile) {
+        for (const auto& pair : oldFileIndex) {
+            if (index.find(pair.first) == index.end()) {
+                index[pair.first] = pair.second;
+                usedShapes.insert(pair.second);
+            }
+        }
+    }
+
     // 2. Snapshot the used shapes (CPU alpha; GPU assets are rebuilt on adopt).
     struct ShapeBlob {
         uint64_t hash; uint32_t w, h, thumbW, thumbH; std::vector<uint8_t> alpha;
@@ -6582,6 +7837,55 @@ static void SaveIconShapes(const std::vector<IconSnapshot>& manifest) {
             if (usedShapes.find(shape.hash) == usedShapes.end()) continue;
             shapes.push_back({shape.hash, shape.width, shape.height,
                               shape.thumbW, shape.thumbH, shape.alphaData});
+        }
+    }
+    if (hadOldFile) {
+        // Shapes evicted from the dedup store (per-zoom GC) but still
+        // referenced by merged index entries: keep their alpha from the file.
+        std::unordered_set<uint64_t> haveShape;
+        for (const auto& s : shapes) haveShape.insert(s.hash);
+        for (auto& blob : oldFileShapes) {
+            if (usedShapes.find(blob.hash) != usedShapes.end() &&
+                haveShape.find(blob.hash) == haveShape.end()) {
+                shapes.push_back({blob.hash, blob.w, blob.h, blob.thumbW, blob.thumbH, std::move(blob.alpha)});
+                haveShape.insert(blob.hash);
+            }
+        }
+        // [POISON-ORPHAN v2.6.3] A merged index entry whose shape bytes exist
+        // in NEITHER g_uniqueShapes NOR oldFileShapes is adoption-impossible:
+        // nothing can ever read its shape, so it is a zombie that still gets
+        // written to disk (the 2026-11-06 forensic: REJECT-POISONED fired on
+        // a file that parsed clean — orphans survived door 2 because it only
+        // tests shapes present in the save snapshot). Drop them here.
+        size_t orphansErased = 0;
+        for (auto it = index.begin(); it != index.end(); ) {
+            if (haveShape.count(it->second) == 0) { it = index.erase(it); ++orphansErased; }
+            else ++it;
+        }
+        if (orphansErased > 0)
+            DiagLog(L"[POISON-ORPHAN] save: dropped %zu adoption-impossible index key(s)", orphansErased);
+    }
+    // [POISON-GUARD v2.3.0] Drop every index entry whose shape is the
+    // generic-doc placeholder itself (fresh entries AND cumulative-merge
+    // imports) — one bad write must not be immortal. The file self-heals
+    // on this save; affected keys re-extract once and re-persist honestly.
+    {
+        std::unordered_set<uint64_t> poisonedShapes;
+        for (const auto& s : shapes)
+            if (IsGenericDocShape(s.alpha, s.w, s.h)) poisonedShapes.insert(s.hash);
+        if (!poisonedShapes.empty()) {
+            size_t erasedKeys = 0;
+            for (auto it = index.begin(); it != index.end(); ) {
+                if (poisonedShapes.count(it->second)) { it = index.erase(it); ++erasedKeys; }
+                else ++it;
+            }
+            shapes.erase(std::remove_if(shapes.begin(), shapes.end(),
+                                        [&](const ShapeBlob& s) {
+                                            return poisonedShapes.count(s.hash) != 0;
+                                        }),
+                         shapes.end());
+            DiagLog(L"[POISON-GUARD] save: dropped %zu poisoned shape(s) / %zu index keys",
+                    poisonedShapes.size(), erasedKeys);
         }
     }
     if (shapes.empty()) return;
@@ -6611,6 +7915,10 @@ static void SaveIconShapes(const std::vector<IconSnapshot>& manifest) {
 
     if (ok) {
         MoveFileExW(tempPath.c_str(), filePath.c_str(), MOVEFILE_REPLACE_EXISTING);
+        // Keep the in-RAM index in sync so within-session zoom revisits can
+        // adopt without waiting for the next boot.
+        std::lock_guard<std::mutex> pLock(g_persistedShapeIndexMutex);
+        g_persistedShapeIndex = std::move(index);
     } else {
         DeleteFileW(tempPath.c_str());
     }
@@ -6618,6 +7926,11 @@ static void SaveIconShapes(const std::vector<IconSnapshot>& manifest) {
 
 void ProcessSnapshotData(const std::vector<RawListItem>& rawItems, const std::wstring& userDesktop, const std::wstring& publicDesktop,
                          HFONT labelFont, const LOGFONTW& labelLogfont) {
+    ProcessSnapshotData(rawItems, userDesktop, publicDesktop, labelFont, labelLogfont, false);
+}
+
+void ProcessSnapshotData(const std::vector<RawListItem>& rawItems, const std::wstring& userDesktop, const std::wstring& publicDesktop,
+                         HFONT labelFont, const LOGFONTW& labelLogfont, bool mergeIntoExisting) {
     // "Show desktop icons" off: nothing to process, and publishing stale
     // geometry would let the renderers cut holes for invisible icons.
     if (g_desktopIconsHidden.load(std::memory_order_relaxed)) return;
@@ -6706,6 +8019,21 @@ void ProcessSnapshotData(const std::vector<RawListItem>& rawItems, const std::ws
     std::vector<std::wstring> localWatchedPaths;
     std::unordered_map<int, uint64_t> passIndexMap;
 
+    // [MERGE MODE — fast path] The fast path hands us ONE raw item. A full
+    // rebuild would publish a 1-icon desktop (the v2.1.2 reset bug), so in
+    // merge mode newSnapshots starts as a copy of the live list and the loop
+    // below REPLACES the matching slot instead of appending. The publish at
+    // the end then swaps in the full list with just that one entry refreshed.
+    // All the per-item work (hashes, silhouette, disk cache) is identical.
+    bool mergeBail = false; // identity mismatch -> fall back to a full pass
+    if (mergeIntoExisting) {
+        std::lock_guard<std::mutex> lock(g_snapshotMutex);
+        newSnapshots = g_iconSnapshots;
+    }
+    if (mergeIntoExisting && newSnapshots.empty()) {
+        mergeBail = true; // nothing live yet — the full pass must run first
+    }
+
     bool iconSizeChanged = false;
     int currentIconSize = g_cachedIconSize.load(std::memory_order_relaxed);
     if (currentIconSize != g_lastSnapshotIconSize.load(std::memory_order_relaxed)) {
@@ -6714,36 +8042,117 @@ void ProcessSnapshotData(const std::vector<RawListItem>& rawItems, const std::ws
     }
 
     int countSlow = 0, countFast = 0;
+    int countDiskSkip = 0; // [P1.1] combos carried from cache instead of re-rendered
+
+    // [PERF-AUDIT v2.2.6] pass wall-clock + per-icon phase timing.
+    ULONGLONG passStartTick = GetTickCount64();
+    DiagLog(L"[PASS-START] items=%zu merge=%d", rawItems.size(), mergeIntoExisting ? 1 : 0);
 
     newSnapshots.reserve(rawItems.size());
+
+    // [PHASE 3 v2.4.5] Loop split (ZOOM_CACHE_REDESIGN.md §12): the per-icon
+    // body divides into DECISIONS (identity resolution, file/lnk resolution,
+    // cacheKey salt chain, force-reextract eviction, persisted-shape
+    // adoption) and EXECUTION (extraction, combo build). The decide loop
+    // below records everything the execute stage needs in one PassDecision
+    // per raw item — including the old-state fields the retry ladder reads,
+    // because the execute loop no longer resolves oldSnapPtr. decisions[i]
+    // corresponds to rawItems[i] one-to-one (the merge-bail return is the
+    // only early exit, and it fires before any decision is recorded).
+    struct PassDecision {
+        IconSnapshot snap;
+        int mergeSlot = -1;          // merge mode: newSnapshots slot to replace
+        bool fastPath = false;
+        bool forceReextract = false; // DECIDED value — pool tasks must carry it, never guess it
+        bool adoptedFromDisk = false;
+        bool hasOld = false;         // an old snapshot resolved for this item
+        bool oldWasGeneric = false;
+        bool oldWasEverNonGeneric = false;
+        uint32_t oldArrowGen = 0;    // F1 skip guard's old-state input
+        int oldRetryCount = 0;
+    };
+    std::vector<PassDecision> decisions;
+    decisions.reserve(rawItems.size());
 
     uint64_t dpiSalt = (uint64_t)(g_dpiScale * 1000.0f);
 
     // Preserve previously computed combo hashes so we don't lose the other state's hash
     std::unordered_map<uint64_t, uint64_t> oldComboHashes_c;
     std::unordered_map<uint64_t, uint64_t> oldComboHashes_e;
+    std::unordered_map<uint64_t, RECT> oldComboRects_c;
+    std::unordered_map<uint64_t, RECT> oldComboRects_e;
     std::unordered_map<std::wstring, IconSnapshot> oldSnapshotsByName;
 
+    // [NAMECOLL] Diagnostics (v2.1.16): identity keys that appeared more than
+    // once in the maps below — same display name + same lnk/item class means
+    // two visible items share one map slot, and every lookup for either twin
+    // resolves to the same (last-iterated) entry. Logging only — the maps'
+    // semantics are unchanged.
+    std::unordered_set<std::wstring> collidedNameKeys;
+    // [NAMECOLL FIX v2.1.17] All candidates for collided keys, so the lookup
+    // can tell same-named twins apart instead of silently keeping only the
+    // last-iterated one. Populated only for keys that actually collide.
+    std::unordered_map<std::wstring, std::vector<IconSnapshot>> oldSnapshotsMulti;
+    std::vector<std::wstring> nameCollLogs;   // formatted under lock, flushed after it
 
     {
         std::lock_guard<std::mutex> lock(g_snapshotMutex);
 
         for (const auto& oldSnap : g_iconSnapshots) {
-                if (oldSnap.comboHash_c != 0) oldComboHashes_c[oldSnap.cacheKey] = oldSnap.comboHash_c;
-                if (oldSnap.comboHash_e != 0) oldComboHashes_e[oldSnap.cacheKey] = oldSnap.comboHash_e;
+                if (oldSnap.comboHash_c != 0) { oldComboHashes_c[oldSnap.cacheKey] = oldSnap.comboHash_c; oldComboRects_c[oldSnap.cacheKey] = oldSnap.comboRect_c; }
+                if (oldSnap.comboHash_e != 0) { oldComboHashes_e[oldSnap.cacheKey] = oldSnap.comboHash_e; oldComboRects_e[oldSnap.cacheKey] = oldSnap.comboRect_e; }
             if (!oldSnap.displayName.empty()) {
                 // Key old snapshots by display name AND shortcut status so duplicate names don't collide
                 std::wstring oldKey = oldSnap.displayName + (oldSnap.overlayIndex > 0 ? L":lnk" : L":item");
+                auto nameCollIt = oldSnapshotsByName.find(oldKey);
+                if (nameCollIt != oldSnapshotsByName.end()) {
+                    collidedNameKeys.insert(oldKey);
+                    auto multiIt = oldSnapshotsMulti.find(oldKey);
+                    if (multiIt == oldSnapshotsMulti.end())
+                        oldSnapshotsMulti.emplace(oldKey, std::vector<IconSnapshot>{ nameCollIt->second });
+                    oldSnapshotsMulti[oldKey].push_back(oldSnap);
+                    wchar_t collLine[512];
+                    swprintf_s(collLine, L"[NAMECOLL] OLD-MAP key '%s' x2: kept pos(%ld,%ld) state=%u | dropped pos(%ld,%ld) state=%u",
+                               oldKey.c_str(),
+                               nameCollIt->second.iconRect.left, nameCollIt->second.iconRect.top,
+                               nameCollIt->second.state,
+                               oldSnap.iconRect.left, oldSnap.iconRect.top, oldSnap.state);
+                    nameCollLogs.push_back(collLine);
+                }
                 oldSnapshotsByName[oldKey] = oldSnap;
             }
         }
     }
+    for (const auto& collLine : nameCollLogs) DiagLog(L"%s", collLine.c_str());
 
     for (const auto& raw : rawItems) {
         if (g_unloading.load(std::memory_order_relaxed)) return;
 
+        // [MERGE MODE] Identity check against the live slot we're replacing:
+        // if the desktop changed since the snapshot list was built (different
+        // item at this index), don't merge — queue a full pass instead.
+        if (mergeIntoExisting) {
+            if (raw.index < 0 || raw.index >= (int)newSnapshots.size()) {
+                mergeBail = true;
+            } else {
+                const IconSnapshot& live = newSnapshots[raw.index];
+                bool sameName = (live.displayName == raw.text);
+                bool sameOverlay = (live.overlayIndex == raw.overlayIndex);
+                if (!sameName || !sameOverlay) mergeBail = true;
+            }
+            if (mergeBail) {
+                DiagLog(L"[FAST] merge bail (identity mismatch at %d) -> full pass", raw.index);
+                if (g_overlayWnd && !g_snapshotUpdatePending.load(std::memory_order_relaxed)) {
+                    g_snapshotUpdatePending.store(true, std::memory_order_relaxed);
+                    PostMessageW(g_overlayWnd, WM_APP_SNAPSHOT_UPDATE, 0, 0);
+                }
+                return;
+            }
+        }
+
         IconSnapshot snap = {};
         snap.imageIndex = raw.imageIndex;
+        snap.lvIndex = raw.index;
         snap.state = raw.state;
         snap.overlayIndex = raw.overlayIndex;
         // Only mark as dragged during a REAL drag. g_draggedItemIndex records the
@@ -6761,31 +8170,79 @@ void ProcessSnapshotData(const std::vector<RawListItem>& rawItems, const std::ws
         snap.hasCustomIcon = false;
 
         snap.labelRect = raw.labelRect;
-        int labelW = snap.labelRect.right - snap.labelRect.left;
-        int labelH = snap.labelRect.bottom - snap.labelRect.top;
-        if (labelW > 0 && labelH > 0) {
-            snap.labelCacheKey = 0x1ABE00000000000ULL | ((uint64_t)labelW << 16) | (uint64_t)labelH;
-            CacheLabelBitmap(snap.labelCacheKey, labelW, labelH);
-        } else {
-            snap.labelCacheKey = 0;
-        }
+
+        // [PHASE 3 v2.4.5] Decision outputs, hoisted so the decision-record
+        // block below (outside the slow branch) can read them. The fast path
+        // leaves both false — it never extracts.
+        bool forceReextract = false;
+        bool adoptedFromDisk = false;
 
         std::wstring currentLookupKey = raw.text + (raw.overlayIndex > 0 ? L":lnk" : L":item");
-        auto oldIt = oldSnapshotsByName.find(currentLookupKey);
+        // [NAMECOLL FIX v2.1.17] Identity resolution. For unique keys this is
+        // exactly the old map lookup (same entry as before). For collided keys
+        // (same display name + same lnk/item class — e.g. the same shortcut in
+        // both the user and the public desktop), the map slot alone cannot tell
+        // the twins apart, so resolve against ALL candidates of that key:
+        // exact LV index match first, then position-nearest (LV order shifts on
+        // add/remove; on-screen positions are what Explorer keeps stable), then
+        // first as last resort.
+        const IconSnapshot* oldSnapPtr = nullptr;
+        {
+            auto mapIt = oldSnapshotsByName.find(currentLookupKey);
+            if (mapIt != oldSnapshotsByName.end()) {
+                if (!collidedNameKeys.count(currentLookupKey)) {
+                    oldSnapPtr = &mapIt->second;
+                } else {
+                    auto multiIt = oldSnapshotsMulti.find(currentLookupKey);
+                    if (multiIt != oldSnapshotsMulti.end() && !multiIt->second.empty()) {
+                        int resolvedHow = 0; // 1=exact index, 2=nearest pos, 3=first
+                        for (const auto& cand : multiIt->second) {
+                            if (cand.lvIndex >= 0 && cand.lvIndex == raw.index) {
+                                oldSnapPtr = &cand; resolvedHow = 1; break;
+                            }
+                        }
+                        if (!oldSnapPtr) {
+                            long bestDist = 0;
+                            const IconSnapshot* best = nullptr;
+                            for (const auto& cand : multiIt->second) {
+                                long dx = (long)cand.iconRect.left - (long)raw.iconRect.left;
+                                long dy = (long)cand.iconRect.top - (long)raw.iconRect.top;
+                                long dist = dx * dx + dy * dy;
+                                if (!best || dist < bestDist) { bestDist = dist; best = &cand; }
+                            }
+                            oldSnapPtr = best; resolvedHow = 2;
+                        }
+                        if (!oldSnapPtr) { oldSnapPtr = &multiIt->second[0]; resolvedHow = 3; }
+                        DiagLog(L"[NAMECOLL] RESOLVE '%s' idx=%d -> old lvIdx=%d pos(%ld,%ld) how=%s",
+                                raw.text.c_str(), raw.index, oldSnapPtr->lvIndex,
+                                oldSnapPtr->iconRect.left, oldSnapPtr->iconRect.top,
+                                resolvedHow == 1 ? L"exact-index" :
+                                resolvedHow == 2 ? L"nearest-pos" : L"first");
+                    }
+                    if (!oldSnapPtr) oldSnapPtr = &mapIt->second;
+                }
+            }
+        }
 
         // --- COLLAPSE HOLD: carry across deep passes / engage on transition ---
         if (snap.state & LVIS_SELECTED) {
             snap.pendingCollapse = false;
-        } else if (oldIt != oldSnapshotsByName.end() && (oldIt->second.state & LVIS_SELECTED) && !IsIconExpanded(snap)) {
+        } else if (oldSnapPtr && (oldSnapPtr->state & LVIS_SELECTED) && !IsIconExpanded(snap)) {
             // Selection lost between passes AND label will collapse: hold the
             // selection-sized cutout. Ghost-focus excluded, same as the poll.
             snap.pendingCollapse = true;
             snap.pendingCollapseStart = GetTickCount64();
             snap.heldCollapseRect = snap.boundsRect;
-        } else if (oldIt != oldSnapshotsByName.end()) {
-            snap.pendingCollapse = oldIt->second.pendingCollapse;
-            snap.pendingCollapseStart = oldIt->second.pendingCollapseStart;
-            snap.heldCollapseRect = oldIt->second.heldCollapseRect;
+            if (collidedNameKeys.count(currentLookupKey)) {
+                DiagLog(L"[NAMECOLL] HOLD-ENGAGE '%s' this idx=%d pos(%ld,%ld) via old idx=%d pos(%ld,%ld)%s",
+                        raw.text.c_str(), raw.index, raw.iconRect.left, raw.iconRect.top,
+                        oldSnapPtr->lvIndex, oldSnapPtr->iconRect.left, oldSnapPtr->iconRect.top,
+                        (oldSnapPtr->lvIndex != raw.index) ? L"  <== WRONG TWIN" : L"");
+            }
+        } else if (oldSnapPtr) {
+            snap.pendingCollapse = oldSnapPtr->pendingCollapse;
+            snap.pendingCollapseStart = oldSnapPtr->pendingCollapseStart;
+            snap.heldCollapseRect = oldSnapPtr->heldCollapseRect;
             if (snap.pendingCollapse &&
                 (GetTickCount64() - snap.pendingCollapseStart > COLLAPSE_HOLD_MS)) {
                 snap.pendingCollapse = false;
@@ -6794,8 +8251,8 @@ void ProcessSnapshotData(const std::vector<RawListItem>& rawItems, const std::ws
 
         bool fastPath = false;
 
-        if (!raw.text.empty() && oldIt != oldSnapshotsByName.end() && oldIt->second.imageIndex == raw.imageIndex) {
-            const IconSnapshot& oldSnap = oldIt->second;
+        if (!raw.text.empty() && oldSnapPtr && oldSnapPtr->imageIndex == raw.imageIndex) {
+            const IconSnapshot& oldSnap = *oldSnapPtr;
             // Check if label rect size changed (collapsed <-> expanded transition)
             int oldLabelW = oldSnap.labelRect.right - oldSnap.labelRect.left;
             int oldLabelH = oldSnap.labelRect.bottom - oldSnap.labelRect.top;
@@ -6827,6 +8284,13 @@ void ProcessSnapshotData(const std::vector<RawListItem>& rawItems, const std::ws
                 snap.wasGeneric = oldSnap.wasGeneric;
                 snap.wasEverNonGeneric = oldSnap.wasEverNonGeneric;
                 fastPath = true;
+                if (collidedNameKeys.count(currentLookupKey)) {
+                    DiagLog(L"[NAMECOLL] FASTPATH '%s' this idx=%d pos(%ld,%ld) adopts old idx=%d pos(%ld,%ld) key=%llu%s",
+                            raw.text.c_str(), raw.index, raw.iconRect.left, raw.iconRect.top,
+                            oldSnap.lvIndex, oldSnap.iconRect.left, oldSnap.iconRect.top,
+                            (unsigned long long)oldSnap.cacheKey,
+                            (oldSnap.lvIndex != raw.index) ? L"  <== WRONG TWIN" : L"");
+                }
                 if (oldSnap.thumbnailRetryCount >= 6) {
                     Wh_Log(L"[GENERIC] FAST-PATH on retry-exhausted item '%s'", raw.text.c_str());
                 }
@@ -7138,26 +8602,30 @@ void ProcessSnapshotData(const std::vector<RawListItem>& rawItems, const std::ws
                 cacheKey *= 1099511628211ULL;
             }
 
-        bool wasPendingThumbnail = (oldIt != oldSnapshotsByName.end() &&
-                                    oldIt->second.isPendingThumbnail &&
-                                    oldIt->second.thumbnailRetryCount < 6);
+        bool wasPendingThumbnail = (oldSnapPtr &&
+                                    oldSnapPtr->isPendingThumbnail &&
+                                    oldSnapPtr->thumbnailRetryCount < 6);
 
         // Force fresh re-extraction if the item was previously holding a generic placeholder!
-        bool forceReextract = (oldIt != oldSnapshotsByName.end() &&
-                            (oldIt->second.cacheKey != cacheKey ||
-                            oldIt->second.imageIndex != snap.imageIndex ||
-                            oldIt->second.wasGeneric ||
+        // [PHASE 3 v2.4.5] forceReextract hoisted above the fast-path check.
+        forceReextract = (oldSnapPtr &&
+                            (oldSnapPtr->cacheKey != cacheKey ||
+                            oldSnapPtr->imageIndex != snap.imageIndex ||
+                            oldSnapPtr->wasGeneric ||
                             wasPendingThumbnail));
-
+        // [FLASH-PROBE v2.9.21] forceReextract erases the old combo's RAM
+        // entries (8433) on EVERY cause — key change was only one suspect.
+        // Log every fire with its cause bits; persistent folder re-extraction
+        // via the pixel-generic detector is the current suspect (folders only).
         if (forceReextract) {
-            if (oldIt != oldSnapshotsByName.end()) {
+            if (oldSnapPtr) {
                 std::lock_guard<std::mutex> lock(g_cacheMutex);
-                g_iconCache.erase(oldIt->second.cacheKey);
+                g_iconCache.erase(oldSnapPtr->cacheKey);
                 std::lock_guard<std::mutex> hLock(g_hashCacheMutex);
-                g_iconHashCache.erase(oldIt->second.cacheKey);
+                g_iconHashCache.erase(oldSnapPtr->cacheKey);
                 std::lock_guard<std::mutex> comboLock(g_comboShadowCacheMutex);
-                if (oldIt->second.comboHash_c != 0) g_comboShadowCache.erase(oldIt->second.comboHash_c);
-                if (oldIt->second.comboHash_e != 0) g_comboShadowCache.erase(oldIt->second.comboHash_e);
+                if (oldSnapPtr->comboHash_c != 0) g_comboShadowCache.erase(oldSnapPtr->comboHash_c);
+                if (oldSnapPtr->comboHash_e != 0) g_comboShadowCache.erase(oldSnapPtr->comboHash_e);
             }
             std::lock_guard<std::mutex> lock(g_cacheMutex);
             g_iconCache.erase(cacheKey);
@@ -7171,8 +8639,22 @@ void ProcessSnapshotData(const std::vector<RawListItem>& rawItems, const std::ws
         // / pending thumbnails, so an index hit means the shape is trustworthy
         // without re-extracting from the shell. forceReextract (key change,
         // image change, wasGeneric, pending retry) keeps its authority here.
-        bool adoptedFromDisk = false;
-        if (!forceReextract) {
+        // [PHASE 3 v2.4.5] adoptedFromDisk hoisted above the fast-path check.
+        // [ZOOMFIX v2.2.2] Adoption used to be skipped whenever forceReextract
+        // was set — and a zoom change ALWAYS sets it (the rect salt changes the
+        // key), forcing a fresh extraction whose pixels can differ from the
+        // original bake (ImageList churn at the zoom switch). That rekeys every
+        // combo hash at the revisited zoom and defeats the multi-zoom disk
+        // cache: same cacheKey + same label dims, different combo hash
+        // (proven in diag_log 2026-11-03). The persisted index is its own
+        // validator — entries exist only for validated non-generic shapes
+        // under the exact key (file identity + times + icon location + dpi/
+        // zoom + rect) — so consult it unless the PREVIOUS state was a
+        // placeholder/pending-thumbnail suspect. Identity changes still fail
+        // closed: file edits, timestamp bumps and imageIndex changes alter the
+        // key itself, and a changed key simply has no index entry.
+        bool adoptionBlocked = (oldSnapPtr && (oldSnapPtr->wasGeneric || wasPendingThumbnail));
+        if (!adoptionBlocked) {
             uint64_t persistedShapeHash = 0;
             {
                 std::lock_guard<std::mutex> pLock(g_persistedShapeIndexMutex);
@@ -7183,6 +8665,14 @@ void ProcessSnapshotData(const std::vector<RawListItem>& rawItems, const std::ws
                 std::lock_guard<std::mutex> uLock(g_uniqueShapesMutex);
                 for (const auto& shape : g_uniqueShapes) {
                     if (shape.hash != persistedShapeHash) continue;
+                    // [POISON-GUARD v2.2.7] Never adopt a shape that IS the
+                    // generic-doc placeholder — fall through to extraction,
+                    // where the pixel tripwire + retry ladder keep authority.
+                    if (IsGenericDocShape(shape.alphaData, shape.width, shape.height)) {
+                        DiagLog(L"[STAKEOUT] REJECT-POISONED key=%llu shape=%llu (generic-doc silhouette in persisted index)",
+                                (unsigned long long)cacheKey, (unsigned long long)persistedShapeHash);
+                        break;
+                    }
                     ComPtr<ID2D1Bitmap> bmp;
                     auto bmpIt = g_shapeToBitmap.find(shape.hash);
                     if (bmpIt != g_shapeToBitmap.end()) bmp = bmpIt->second;
@@ -7207,56 +8697,24 @@ void ProcessSnapshotData(const std::vector<RawListItem>& rawItems, const std::ws
                             g_iconHashCache[cacheKey] = persistedShapeHash;
                         }
                         adoptedFromDisk = true;
+                        DiagLog(L"[STAKEOUT] adopted persisted shape for key=%llu (shape %llu)",
+                                (unsigned long long)cacheKey, (unsigned long long)persistedShapeHash);
                     }
                     break;
                 }
             }
         }
 
-        bool isFallback = false;
-        if (!adoptedFromDisk) {
-            CacheIconBitmap(hLV, snap.imageIndex, snap.cacheKey, snap.isFolder, snap.isThumbnail, snap.hasCustomIcon, snap.isFolderWithSubfolders, snap.filePath, passIndexMap, forceReextract, &isFallback, snap.customIconPath, snap.customIconIndex);
+        // [PHASE 3 v2.4.5] Extraction moved to the execute stage below
+        // (extraction pool + serial finish). Everything from here to the
+        // end of the slow branch is pure decision/recording.
+
+        // [PHASE 3 v2.4.5] The STAKEOUT trail, generic tracking, retry ladder
+        // and overlay cache fill moved to the execute stage — they need the
+        // extraction result (isFallback), which now comes from the pool.
+
         }
-
-        // Update progressive generic placeholder tracking
-        snap.wasGeneric = isFallback;
-        if (!isFallback) {
-            snap.wasEverNonGeneric = true;
-        }
-        if (isFallback || (oldIt != oldSnapshotsByName.end() && oldIt->second.wasGeneric)) {
-            Wh_Log(L"[GENERIC] fallback=%d '%s' imgIdx=%d key=0x%llX",
-                   isFallback ? 1 : 0, raw.text.c_str(), snap.imageIndex,
-                   (unsigned long long)snap.cacheKey);
-        }
-
-        // --- 6-STEP PROGRESSIVE SELF-HEALING LADDER ---
-        // 200ms -> 500ms -> 1s -> 2s -> 4s -> 8s (Total ~16s coverage for slow machines)
-        static const UINT s_retryDelays[] = { 200, 500, 1000, 2000, 4000, 8000 };
-        const int kMaxRetrySteps = (int)(sizeof(s_retryDelays) / sizeof(s_retryDelays[0]));
-
-        int prevRetries = (oldIt != oldSnapshotsByName.end()) ? oldIt->second.thumbnailRetryCount : 0;
-        bool inGracePeriod = (oldIt == oldSnapshotsByName.end()) || g_startupGracePeriod.load(std::memory_order_relaxed);
-        bool shouldRetry = isFallback && ((oldIt != oldSnapshotsByName.end() && oldIt->second.wasEverNonGeneric) || inGracePeriod);
-
-        if (shouldRetry && prevRetries < kMaxRetrySteps) {
-            snap.isPendingThumbnail = true;
-            snap.thumbnailRetryCount = prevRetries + 1;
-            UINT delayMs = s_retryDelays[prevRetries];
-            Wh_Log(L"[GENERIC] retry #%d in %ums '%s'", prevRetries + 1, delayMs, raw.text.c_str());
-            ArmSnapRetry(delayMs);
-        } else {
-            if (shouldRetry && prevRetries >= kMaxRetrySteps) {
-                Wh_Log(L"[GENERIC] RETRY EXHAUSTED '%s' (still fallback)", raw.text.c_str());
-            }
-            snap.isPendingThumbnail = false;
-            snap.thumbnailRetryCount = (prevRetries >= kMaxRetrySteps) ? kMaxRetrySteps : 0;
-        }
-
-        if (snap.overlayIndex > 0) {
-            CacheOverlayBitmap(snap.overlayIndex);
-        }
-
-        } else {
+        if (fastPath) {
             countFast++;
             // --- FAST PATH (Instant Geometry Update) ---
             if (snap.overlayIndex > 0) {
@@ -7268,10 +8726,207 @@ void ProcessSnapshotData(const std::vector<RawListItem>& rawItems, const std::ws
             }
         }
 
+        // [PHASE 3 v2.4.5] Decide stage complete for this item: record it.
+        {
+            PassDecision dec;
+            dec.snap = std::move(snap);
+            dec.mergeSlot = mergeIntoExisting ? raw.index : -1;
+            dec.fastPath = fastPath;
+            dec.forceReextract = forceReextract;
+            dec.adoptedFromDisk = adoptedFromDisk;
+            dec.hasOld = (oldSnapPtr != nullptr);
+            if (oldSnapPtr) {
+                dec.oldWasGeneric = oldSnapPtr->wasGeneric;
+                dec.oldWasEverNonGeneric = oldSnapPtr->wasEverNonGeneric;
+                dec.oldArrowGen = oldSnapPtr->arrowGen;
+                dec.oldRetryCount = oldSnapPtr->thumbnailRetryCount;
+            }
+            decisions.push_back(std::move(dec));
+        }
+    }
+
+    DiagLog(L"[PASS-DECIDE] %zu decisions in %llu ms", decisions.size(),
+            GetTickCount64() - passStartTick);
+
+    // ======================================================================
+    // [PHASE 3 v2.4.5] EXECUTE STAGE — extraction pool + serial finish.
+    // The decide stage above ran the whole per-icon decision chain
+    // serially. What remains is per-icon EXECUTION: extraction (poolable —
+    // leaf-mutex writes only, hLV touched solely behind the
+    // g_cachedImageList atomic) and the combo build (stays serial: GPU
+    // publishes + RAM mirror writes + publish-order stability).
+    // §12 rule: pool tasks carry the DECIDED forceReextract, never a guess
+    // — a force=true icon extracted with force=false would poison the
+    // cache with pixels the decision chain explicitly rejected.
+    // ======================================================================
+    struct ExtrResult {
+        bool ran = false;        // a pool thread completed this item
+        bool isFallback = false;
+        ULONGLONG extrMs = 0;
+    };
+    std::vector<ExtrResult> extrResults(decisions.size());
+    std::vector<size_t> poolTasks;
+    poolTasks.reserve(decisions.size());
+    for (size_t di = 0; di < decisions.size(); ++di) {
+        if (!decisions[di].fastPath && !decisions[di].adoptedFromDisk)
+            poolTasks.push_back(di);
+    }
+
+    // Pool gate: pool threads pass hLV=nullptr (documented rule: pool
+    // threads never touch the LV). CacheIconBitmap only needs hLV when the
+    // g_cachedImageList atomic is NOT serving — so if the atomic is null,
+    // extraction stays on this worker thread, byte-identical to pre-2.4.5.
+    const unsigned int kExtractionPoolThreads = 3; // Doc ruling 2026-11-05: 2-4
+    bool poolOk = !poolTasks.empty() &&
+                  (g_cachedImageList.load(std::memory_order_relaxed) != nullptr) &&
+                  !g_unloading.load(std::memory_order_relaxed);
+
+    if (poolOk) {
+        ULONGLONG tPool0 = GetTickCount64();
+        // Eager WIC factory init BEFORE the pool: CacheIconBitmap lazy-inits
+        // it with no lock — N pool threads would race CoCreateInstance on
+        // the first pooled pass and leak all but one factory. Serial here
+        // makes the race structurally dead.
+        if (!g_workerWicFactory) {
+            CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                             CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&g_workerWicFactory));
+        }
+
+        std::atomic<size_t> nextTask(0);
+        std::vector<std::unordered_map<int, uint64_t>> tlMaps(kExtractionPoolThreads);
+        std::vector<std::thread> pool;
+        unsigned int nThreads = (unsigned int)std::min<size_t>(kExtractionPoolThreads, poolTasks.size());
+        pool.reserve(nThreads);
+        for (unsigned int slot = 0; slot < nThreads; ++slot) {
+            pool.emplace_back([&, slot]() {
+                try {
+                    // MTA per pool thread — the worker's own apartment model.
+                    bool comHere = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+                    for (;;) {
+                        size_t ti = nextTask.fetch_add(1, std::memory_order_relaxed);
+                        if (ti >= poolTasks.size()) break;
+                        PassDecision& dec = decisions[poolTasks[ti]];
+                        IconSnapshot& snap = dec.snap;
+                        ULONGLONG tExtr0 = GetTickCount64();
+                        bool fb = false;
+                        CacheIconBitmap(nullptr, snap.imageIndex, snap.cacheKey,
+                                        snap.isFolder, snap.isThumbnail, snap.hasCustomIcon,
+                                        snap.isFolderWithSubfolders, snap.filePath,
+                                        tlMaps[slot], dec.forceReextract, &fb,
+                                        snap.customIconPath, snap.customIconIndex);
+                        ExtrResult& r = extrResults[poolTasks[ti]];
+                        r.ran = true;
+                        r.isFallback = fb;
+                        r.extrMs = GetTickCount64() - tExtr0;
+                    }
+                    if (comHere) CoUninitialize();
+                } catch (const std::exception& e) {
+                    Wh_Log(L"[CRASH-GUARD] extraction pool exception: %hs", e.what());
+                } catch (...) {
+                    Wh_Log(L"[CRASH-GUARD] extraction pool unknown exception");
+                }
+            });
+        }
+        for (auto& t : pool) t.join();
+        // Thread-local free-ride maps merge post-join (§12: imageIndex is
+        // unique per icon in a pass, so per-thread maps merge cleanly).
+        for (auto& tl : tlMaps)
+            for (const auto& entry : tl)
+                passIndexMap[entry.first] = entry.second;
+        DiagLog(L"[PASS-POOL] %zu pooled extractions on %u threads in %llu ms", poolTasks.size(), nThreads, GetTickCount64() - tPool0);
+    }
+
+    // SERIAL FINISH — decision order preserved for the publish (the
+    // index-aligned stale-state guard trusts the staged order). Extraction
+    // results come from the pool when it ran; the direct CacheIconBitmap
+    // call below is the fallback for anything the pool did not complete.
+    for (size_t di = 0; di < decisions.size(); ++di) {
+        if (g_unloading.load(std::memory_order_relaxed)) return;
+
+        PassDecision& dec = decisions[di];
+        const RawListItem& raw = rawItems[di];
+        IconSnapshot& snap = dec.snap;
+        bool fastPath = dec.fastPath;
+
+        // [PERF-AUDIT v2.2.6] per-icon phase timers (combo runs below).
+        ULONGLONG extrMs = 0, tCombo0 = 0;
+
+        if (!fastPath) {
+            bool isFallback = false;
+            if (!dec.adoptedFromDisk) {
+                if (poolOk && extrResults[di].ran) {
+                    isFallback = extrResults[di].isFallback;
+                    extrMs = extrResults[di].extrMs;
+                } else {
+                    ULONGLONG tExtr0 = GetTickCount64();
+                    CacheIconBitmap(hLV, snap.imageIndex, snap.cacheKey, snap.isFolder, snap.isThumbnail, snap.hasCustomIcon, snap.isFolderWithSubfolders, snap.filePath, passIndexMap, dec.forceReextract, &isFallback, snap.customIconPath, snap.customIconIndex);
+                    extrMs = GetTickCount64() - tExtr0;
+                }
+            }
+
+            // [STAKEOUT] Blank-doc hunt: the full decision trail for every
+            // slow-path icon. Fired only on the slow path (fast-path icons are
+            // known-good), so normal operation stays quiet and an install/update
+            // writes the whole story: what the shell served, what we flagged,
+            // what we adopted, what we forced.
+            {
+                int stakeoutGenericIdx = GetGenericDocSysIconIndex();
+                DiagLog(L"[STAKEOUT] '%s' imgIdx=%d genericIdx=%d fallback=%d adopt=%d forced=%d br=%d key=%llu path='%s'",
+                        raw.text.c_str(), snap.imageIndex, stakeoutGenericIdx,
+                        isFallback ? 1 : 0, dec.adoptedFromDisk ? 1 : 0,
+                        dec.forceReextract ? 1 : 0,
+                        g_baselinesReady ? 1 : 0,
+                        (unsigned long long)snap.cacheKey, snap.filePath.c_str());
+            }
+
+            // Update progressive generic placeholder tracking
+            snap.wasGeneric = isFallback;
+            if (!isFallback) {
+                snap.wasEverNonGeneric = true;
+            }
+            if (isFallback || (dec.hasOld && dec.oldWasGeneric)) {
+                Wh_Log(L"[GENERIC] fallback=%d '%s' imgIdx=%d key=0x%llX",
+                       isFallback ? 1 : 0, raw.text.c_str(), snap.imageIndex,
+                       (unsigned long long)snap.cacheKey);
+            }
+
+            // --- 6-STEP PROGRESSIVE SELF-HEALING LADDER ---
+            // 200ms -> 500ms -> 1s -> 2s -> 4s -> 8s (Total ~16s coverage for slow machines)
+            static const UINT s_retryDelays[] = { 200, 500, 1000, 2000, 4000, 8000 };
+            const int kMaxRetrySteps = (int)(sizeof(s_retryDelays) / sizeof(s_retryDelays[0]));
+
+            int prevRetries = dec.hasOld ? dec.oldRetryCount : 0;
+            bool inGracePeriod = (!dec.hasOld) || g_startupGracePeriod.load(std::memory_order_relaxed);
+            bool shouldRetry = isFallback && ((dec.hasOld && dec.oldWasEverNonGeneric) || inGracePeriod);
+
+            if (shouldRetry && prevRetries < kMaxRetrySteps) {
+                snap.isPendingThumbnail = true;
+                snap.thumbnailRetryCount = prevRetries + 1;
+                UINT delayMs = s_retryDelays[prevRetries];
+                Wh_Log(L"[GENERIC] retry #%d in %ums '%s'", prevRetries + 1, delayMs, raw.text.c_str());
+                DiagLog(L"[STAKEOUT] retry #%d in %ums '%s'", prevRetries + 1, delayMs, raw.text.c_str());
+                ArmSnapRetry(delayMs);
+            } else {
+                if (shouldRetry && prevRetries >= kMaxRetrySteps) {
+                    Wh_Log(L"[GENERIC] RETRY EXHAUSTED '%s' (still fallback)", raw.text.c_str());
+                    DiagLog(L"[STAKEOUT] RETRY EXHAUSTED '%s' (still fallback)", raw.text.c_str());
+                }
+                snap.isPendingThumbnail = false;
+                snap.thumbnailRetryCount = (prevRetries >= kMaxRetrySteps) ? kMaxRetrySteps : 0;
+            }
+
+            if (snap.overlayIndex > 0) {
+                CacheOverlayBitmap(snap.overlayIndex);
+            }
+        }
+
         snap.comboHash_c = oldComboHashes_c[snap.cacheKey];
         snap.comboHash_e = oldComboHashes_e[snap.cacheKey];
+        snap.comboRect_c = oldComboRects_c[snap.cacheKey];
+        snap.comboRect_e = oldComboRects_e[snap.cacheKey];
 
         // --- NEW PIPELINE: COMPOSITE p-c_1 AND p-c_2_c ---
+        tCombo0 = GetTickCount64();
      uint64_t baseShapeHash = 0;
      {
          std::lock_guard<std::mutex> hLock(g_hashCacheMutex);
@@ -7301,7 +8956,112 @@ void ProcessSnapshotData(const std::vector<RawListItem>& rawItems, const std::ws
                        raw.text.c_str(), (unsigned long long)baseShapeHash, (unsigned long long)snap.cacheKey);
         }
 
-        if (gotBaseSil) {
+        // [F1 SKIP GUARD] If the composite for the CURRENT state was built
+        // with exactly the inputs a rebuild would use (shape, overlay, label
+        // dims, text, shadow profile, arrow generation), the rebuild would
+        // produce identical bytes — skip the pc1 copy, pc2 blits, label
+        // render, and cache writes entirely. Before this guard every icon on
+        // every pass re-did all of it (164k [COMBO] rebuilds in one diag
+        // session; ~15-30 ms each was the deep-pass floor).
+        bool skipComboRebuild = false;
+        if (gotBaseSil && baseShapeHash != 0) {
+            int skipLabelW = snap.labelRect.right - snap.labelRect.left;
+            int skipLabelH = snap.labelRect.bottom - snap.labelRect.top;
+            UINT skipComboLabelW = (skipLabelW > 0) ? (UINT)skipLabelW : 0;
+            UINT skipComboLabelH = (skipLabelH > 0) ? (UINT)skipLabelH : 0;
+            RECT skipCombined = snap.iconRect;
+            if (skipComboLabelW > 0 && skipComboLabelH > 0) {
+                UnionRect(&skipCombined, &snap.iconRect, &snap.labelRect);
+            }
+            snap.combinedRect = skipCombined;
+
+            bool skipExpanded = IsIconExpanded(snap);
+            uint64_t skipProfile = GetShadowBakeHash(localSettings);
+            uint64_t skipTextHash = 14695981039346656037ULL;
+            for (wchar_t c : raw.text) {
+                skipTextHash ^= (uint64_t)c;
+                skipTextHash *= 1099511628211ULL;
+            }
+            UINT skipScalePermille = (UINT)std::lround(GetItemMonitorScale(g_overlayWnd, snap.iconRect) * 1000.0f); // [MULTIMON v2.9.4]
+            uint64_t skipCandidate = GenerateComboHash(baseShapeHash, snap.overlayIndex,
+                                                       skipComboLabelW, skipComboLabelH,
+                                                       skipProfile, skipTextHash, skipScalePermille);
+            uint64_t skipStored = skipExpanded ? snap.comboHash_e : snap.comboHash_c;
+            // [PHASE 3 v2.4.5] oldSnapPtr no longer exists here — the F1
+            // guard reads the decision-carried old state instead.
+            if (dec.hasOld && skipStored != 0 && skipCandidate == skipStored &&
+                dec.oldArrowGen == g_arrowGen.load(std::memory_order_relaxed)) {
+                // [FLASH-FIX v2.9.18] F1 assumed the RAM entry survives as long
+                // as the stored hash matches. It doesn't: the SILPERSIST budget
+                // sweep erases inactive silhouette-only entries past 1200 (183
+                // items x 2 states x visited zoom levels overflows it), and a
+                // later F1 skip then publishes hash-bearing snapshots against a
+                // RAM hole — the mask white-rects until preflight repopulates
+                // (~750ms window = Doc's selected-folders flash; 200x
+                // [FLASH] white-rect ramEntry=0 diskHas=1 receipts). Verify RAM
+                // presence; a hole falls through to the disk-hit branch, which
+                // republishes the silhouette from the mirror on this same pass.
+                bool ramHasBmp = false;
+                {
+                    std::lock_guard<std::mutex> shadowLock(g_comboShadowCacheMutex);
+                    auto rit = g_comboShadowCache.find(skipCandidate);
+                    ramHasBmp = (rit != g_comboShadowCache.end() && rit->second.sourceBmp != nullptr);
+                }
+                if (ramHasBmp) {
+                    skipComboRebuild = true;
+                    snap.arrowGen = dec.oldArrowGen;
+                }
+            }
+            // [DISK-HIT SKIP P1.1] The F1 guard needs session-previous state
+            // (oldSnapPtr + a stored combo hash) — exactly what a zoom revisit
+            // does NOT have (fresh snapshots, comboHash 0 under the new zoom's
+            // keys), which is why revisit legs re-rendered every combo. Let
+            // the RAM composite mirror prove the content instead: same hash
+            // inputs + a populated pc2 for the current state + an entry baked
+            // by the CURRENT arrow generation. Disk-loaded entries carry
+            // arrowGen=0 (unknown) and conservatively rebuild.
+            if (!skipComboRebuild && skipCandidate != 0) {
+                CompositeData cached;
+                if (g_diskCache.GetComposite(skipCandidate, cached)) {
+                    const SilhouetteData& curPc2 = skipExpanded ? cached.pc2_e : cached.pc2_c;
+                    bool pc2ok = curPc2.width > 0 && curPc2.height > 0 &&
+                                 curPc2.alphaData.size() == (size_t)curPc2.width * curPc2.height;
+                    bool genOk = cached.arrowGen != 0 &&
+                                 cached.arrowGen == g_arrowGen.load(std::memory_order_relaxed);
+                    if (pc2ok && genOk) {
+                        skipComboRebuild = true;
+                        snap.arrowGen = cached.arrowGen;
+                        if (skipExpanded) {
+                            snap.comboHash_e = skipCandidate;
+                            snap.comboRect_e = snap.labelRect; // geometry the cached composite was built from
+                        } else {
+                            snap.comboHash_c = skipCandidate;
+                            snap.comboRect_c = snap.labelRect;
+                        }
+                        ++countDiskSkip;
+                        static int s_diskSkipLogged = 0;
+                        if (s_diskSkipLogged++ < 8)
+                            DiagLog(L"[COMBO] '%s': carried %c composite from cache (disk-hit skip)",
+                                    raw.text.c_str(), skipExpanded ? L'E' : L'C');
+                        // [SILFIRST on skip, v2.3.4] The build branch's SILFIRST
+                        // publish doesn't run on a carried combo — and the GC
+                        // may have evicted this hash's sourceBmp since the
+                        // composite was last live. Without it the mask has
+                        // nothing to stamp: shadows render first and the
+                        // overlays sit on rectangles until the pre-sweep
+                        // rebuild (the regression Doc saw on-screen). Publish
+                        // the silhouette from the CACHED pc2 the same way the
+                        // build branch publishes its fresh one.
+                        PublishSilhouetteFromPc2(skipCandidate, curPc2);
+                    }
+                }
+            }
+        }
+
+        if (skipComboRebuild) {
+            // Combo bytes unchanged; hashes, rects and combinedRect are
+            // already in place on snap. Nothing to do.
+        } else if (gotBaseSil) {
             // 1. Calculate unified bounding box
             int labelW = snap.labelRect.right - snap.labelRect.left;
             int labelH = snap.labelRect.bottom - snap.labelRect.top;
@@ -7326,8 +9086,15 @@ void ProcessSnapshotData(const std::vector<RawListItem>& rawItems, const std::ws
             if (cellW <= 0) cellW = (int)baseSil.width;
             if (cellH <= 0) cellH = (int)baseSil.height;
 
-            int drawW = (int)baseSil.width;
-            int drawH = (int)baseSil.height;
+            // [MULTIMON v2.9.4] Explorer draws this item at PER-MONITOR DPI
+            // scale (glyph = imagelist cx * monitorDpi/primaryDpi). Bake the
+            // composite at the item's real render scale — otherwise the
+            // silhouette is an oversize glyph on secondary monitors (the
+            // monitor-2 bug). itemScale == 1.0 on the primary keeps the
+            // byte-identical legacy 1:1 path.
+            float itemScale = GetItemMonitorScale(g_overlayWnd, combinedRect);
+            int drawW = (int)std::lround((float)baseSil.width * itemScale);
+            int drawH = (int)std::lround((float)baseSil.height * itemScale);
             if (drawW <= 0) drawW = 1;
             if (drawH <= 0) drawH = 1;
 
@@ -7339,8 +9106,14 @@ void ProcessSnapshotData(const std::vector<RawListItem>& rawItems, const std::ws
             SilhouetteData pc1;
             pc1.width = (UINT)drawW;
             pc1.height = (UINT)drawH;
-            // Direct 1:1 copy of native alpha bytes (zero scaling distortion)
-            pc1.alphaData = baseSil.alphaData;
+            if (itemScale == 1.0f) {
+                // Direct 1:1 copy of native alpha bytes (zero scaling distortion)
+                pc1.alphaData = baseSil.alphaData;
+            } else {
+                // [MULTIMON v2.9.4] Per-monitor render scale: area-average
+                // downsample so the glyph matches the physically smaller icon.
+                BoxDownsampleAlpha(baseSil, drawW, drawH, pc1.alphaData);
+            }
 
             // Blit Shortcut Overlay Arrow into pc1
             if (snap.overlayIndex > 0) {
@@ -7419,14 +9192,50 @@ void ProcessSnapshotData(const std::vector<RawListItem>& rawItems, const std::ws
                 }
             }
 
+            // Check if the label is visually expanded (Selected, OR Focused
+            // while desktop is active). Needed BEFORE the label blit: the two
+            // states render text differently (see truncated flag below).
+            bool isExpanded = IsIconExpanded(snap);
+
             // Blit Label Text into pc2_c — letter-shaped when we can render
             // the text with Explorer's own font, solid rectangle otherwise.
+            // Collapsed labels use Explorer's DrawText(DT_WORDBREAK |
+            // DT_END_ELLIPSIS) truncation; EXPANDED labels never ellipsize —
+            // expanding exists to show the whole name (the rect grows to fit
+            // it), overlong words just char-wrap mid-word onto the next row.
             if (comboLabelW > 0 && comboLabelH > 0) {
                 int labelOffsetX = snap.labelRect.left - combinedRect.left;
                 int labelOffsetY = snap.labelRect.top - combinedRect.top;
                 std::vector<uint8_t> labelAlpha;
+                // [MULTIMON v2.9.4] Scale the LOGFONT to the item's per-
+                // monitor render size — the D2D label renderer self-calibrates
+                // from GDI-realized metrics of the passed LOGFONT, so a scaled
+                // lfHeight flows through em size and row advance correctly.
+                // (20px-tall primary metrics squeezed into a 16px secondary
+                // rect used to top-clip the glyphs.)
+                LOGFONTW scaledLabelLf = labelLogfont;
+                if (itemScale != 1.0f) {
+                    scaledLabelLf.lfHeight = (LONG)std::lround((float)labelLogfont.lfHeight * itemScale);
+                    if (scaledLabelLf.lfHeight == labelLogfont.lfHeight)
+                        scaledLabelLf.lfHeight += (labelLogfont.lfHeight < 0) ? -1 : 1;
+                    if (labelLogfont.lfWidth != 0)
+                        scaledLabelLf.lfWidth = (LONG)std::lround((float)labelLogfont.lfWidth * itemScale);
+                }
                 bool letterShaped = labelFont &&
-                    RenderGlyphSilhouette(raw.text, labelFont, labelLogfont, (int)comboLabelW, (int)comboLabelH, labelAlpha);
+                    RenderGlyphSilhouette(raw.text, labelFont, scaledLabelLf, (int)comboLabelW, (int)comboLabelH, labelAlpha, !isExpanded);
+                // [FLASH-PROBE v2.9.14] A failed glyph render stamps the label
+                // as a SOLID RECTANGLE in the silhouette — the only remaining
+                // un-instrumented rectangle source after the collapse-hold
+                // and white-rect paths logged nothing during Doc's folder
+                // flash repro. This probe arbitrates.
+                if (!letterShaped) {
+                    static std::unordered_map<uint64_t, int> s_glyphFailLogged;
+                    if (s_glyphFailLogged[snap.cacheKey]++ < 8) {
+                        DiagLog(L"[FLASH] glyph-rect '%s' font=%d scale=%.2f label=%ux%u expanded=%d",
+                                raw.text.c_str(), labelFont ? 1 : 0,
+                                itemScale, comboLabelW, comboLabelH, isExpanded ? 1 : 0);
+                    }
+                }
                 for (int y = 0; y < (int)comboLabelH; ++y) {
                     int destY = labelOffsetY + y;
                     if (destY < 0 || destY >= totalH) continue;
@@ -7439,8 +9248,6 @@ void ProcessSnapshotData(const std::vector<RawListItem>& rawItems, const std::ws
             }
 
             // 3. Generate Combo Hash & Store State-Specific Composite
-            // Check if the label is visually expanded (Selected, OR Focused while desktop is active)
-            bool isExpanded = IsIconExpanded(snap);
             uint64_t currentProfile = GetShadowBakeHash(localSettings);
             // Letter-shaped labels make the composite text-dependent, so the
             // combo must distinguish same-size labels with different text.
@@ -7449,51 +9256,105 @@ void ProcessSnapshotData(const std::vector<RawListItem>& rawItems, const std::ws
                 labelTextHash ^= (uint64_t)c;
                 labelTextHash *= 1099511628211ULL;
             }
-            uint64_t currentComboHash = GenerateComboHash(baseShapeHash, snap.overlayIndex, comboLabelW, comboLabelH, currentProfile, labelTextHash);
+            UINT itemScalePermille = (UINT)std::lround(itemScale * 1000.0f); // [MULTIMON v2.9.4]
+            uint64_t currentComboHash = GenerateComboHash(baseShapeHash, snap.overlayIndex, comboLabelW, comboLabelH, currentProfile, labelTextHash, itemScalePermille);
 
             CompositeData compData;
             // Fetch existing data so we don't wipe the other state's composite if it's already cached
-            g_diskCache.GetComposite(currentComboHash, compData);
+            bool fetchedExisting = g_diskCache.GetComposite(currentComboHash, compData);
+            // [ZOOMDIAG v2.2.1] What the build saw. If an entry that a prior
+            // [SAVEBACK] filled with layers reads back silhouette-only
+            // (fetched=1, c_lay=0), the RAM mirror lost layers in between.
+            DiagLog(L"[COMBOSAVE] '%s' hash=%llu fetched=%d c_lay=%u e_lay=%u",
+                    raw.text.c_str(), (unsigned long long)currentComboHash,
+                    fetchedExisting ? 1 : 0,
+                    (unsigned)compData.shadows_c.size(), (unsigned)compData.shadows_e.size());
             compData.pc1 = pc1;
+            snap.arrowGen = g_arrowGen.load(std::memory_order_relaxed); // [F1]
+            compData.arrowGen = snap.arrowGen; // [P1.1] stamp gen for disk-hit skip trust
             if (isExpanded) {
                 snap.comboHash_e = currentComboHash;
+                snap.comboRect_e = snap.labelRect; // geometry the e-composite was built from
+                DiagLog(L"[COMBO] '%s': built E composite at %dx%d (state expanded)",
+                        raw.text.c_str(), (int)comboLabelW, (int)comboLabelH);
                 compData.pc2_e = pc2_c; // pc2_c holds the unified silhouette for the current state
                 g_diskCache.SetComposite(snap.comboHash_e, compData, currentProfile);
             } else {
                 snap.comboHash_c = currentComboHash;
+                snap.comboRect_c = snap.labelRect; // geometry the c-composite was built from
+                DiagLog(L"[COMBO] '%s': built C composite at %dx%d (state collapsed)",
+                        raw.text.c_str(), (int)comboLabelW, (int)comboLabelH);
                 compData.pc2_c = pc2_c;
                 g_diskCache.SetComposite(snap.comboHash_c, compData, currentProfile);
             }
+
+            // [SILFIRST v2.2.5] Publish the silhouette GPU bitmap the moment
+            // the combo exists — during the pass, not at preflight/bake. The
+            // mask stamps sourceBmp out of the combo cache, so every icon's
+            // overlay cutout lands as soon as its composite is built (first
+            // visit to a zoom level / cold boot), instead of waiting for the
+            // whole bake pipeline to reach it. [v2.4.0] via shared helper.
+            PublishSilhouetteFromPc2(currentComboHash, pc2_c);
         }
 
-        newSnapshots.push_back(snap);
+        // [PERF-AUDIT v2.2.6] per-icon slow-path phases on the pass timeline.
+        DiagLog(L"[PASSTICK] '%s' extr=%llums combo=%llums t+%llums fast=%d",
+                raw.text.c_str(), extrMs,
+                tCombo0 ? (GetTickCount64() - tCombo0) : 0,
+                GetTickCount64() - passStartTick,
+                fastPath ? 1 : 0);
+
+        if (mergeIntoExisting) {
+            newSnapshots[dec.mergeSlot] = std::move(snap);
+        } else {
+            newSnapshots.push_back(std::move(snap));
+        }
 
     }
 
     bool anyLiveHold = false;
     size_t publishedCount = 0;
+    std::vector<std::wstring> publishCollLogs;   // [NAMECOLL] flushed after the lock scope
     {
         std::lock_guard<std::mutex> lock(g_snapshotMutex);
-        // STALE-STATE GUARD: the staged `state` was captured on the UI thread
-        // when the deep pass STARTED; the poll keeps writing fresher state
-        // while staging runs. Publishing the stale copy resurrects finished
-        // selections (mask stamps a selection rectangle, shadow vanishes)
-        // until the next pass. The poll re-reads the LV on every selection
-        // change, so the live entry's state is always at least as fresh.
+        // STALE-STATE GUARD (v2.1.17, index-aligned): the staged `state` was
+        // captured on the UI thread when the deep pass STARTED; the poll keeps
+        // writing fresher state while staging runs. Publishing the stale copy
+        // resurrects finished selections (mask stamps a selection rectangle,
+        // shadow vanishes) until the next pass. The poll re-reads the LV on
+        // every selection change, so the live entry's state is always at least
+        // as fresh.
+        // The old name-keyed lookup ("displayName:lnk/item" -> one live entry)
+        // merged SAME-NAMED icons into one slot: every publish copied one
+        // twin's state onto the other (the YTDownloader shadow flicker,
+        // proven in diag_log 2026-11-03). The live list is index-aligned with
+        // the staged list by construction (both enumerate the LV in order —
+        // the same spine the poll already trusts), so copy live[i] ->
+        // staged[i] and VERIFY identity (name + lnk class) before trusting
+        // the slot. A mid-pass reorder fails the name check: nothing is
+        // copied (safe) and the poll's own per-index identity check forces a
+        // full re-pass, so worst case is one pass of staged-start state.
         if (!g_iconSnapshots.empty()) {
-            std::unordered_map<std::wstring, const IconSnapshot*> liveByName;
-            liveByName.reserve(g_iconSnapshots.size());
-            for (const auto& live : g_iconSnapshots) {
-                if (!live.displayName.empty()) {
-                    liveByName[live.displayName + (live.overlayIndex > 0 ? L":lnk" : L":item")] = &live;
-                }
-            }
             constexpr UINT kPollStateMask = LVIS_SELECTED | LVIS_FOCUSED | LVIS_DROPHILITED;
-            for (auto& s : newSnapshots) {
+            const size_t liveCount = g_iconSnapshots.size();
+            // [NAMECOLL] Same-name twins are legitimate as long as each staged
+            // slot validates against its OWN live slot. Count duplicated
+            // identity keys so their aligned copies stay visible in the log
+            // (proof the fix runs); unique names stay silent.
+            std::unordered_map<std::wstring, int> nameDups;
+            for (const auto& live : g_iconSnapshots) {
+                if (!live.displayName.empty())
+                    nameDups[live.displayName + (live.overlayIndex > 0 ? L":lnk" : L":item")]++;
+            }
+            for (size_t stagedIdx = 0; stagedIdx < newSnapshots.size(); ++stagedIdx) {
+                if (stagedIdx >= liveCount) break; // staged grew (new items): no live counterpart yet
+                auto& s = newSnapshots[stagedIdx];
                 if (s.displayName.empty()) continue;
-                auto it = liveByName.find(s.displayName + (s.overlayIndex > 0 ? L":lnk" : L":item"));
-                if (it == liveByName.end()) continue;
-                const IconSnapshot& live = *it->second;
+                const IconSnapshot& live = g_iconSnapshots[stagedIdx];
+                if (s.displayName != live.displayName ||
+                    (s.overlayIndex > 0) != (live.overlayIndex > 0)) {
+                    continue; // reordered mid-pass: copy nothing, mismatch detector re-passes
+                }
                 s.state = (s.state & ~kPollStateMask) | (live.state & kPollStateMask);
                 // Transient selection state: the poll is the authority (it
                 // engages/expires holds and self-heals drag flags every pass).
@@ -7503,6 +9364,52 @@ void ProcessSnapshotData(const std::vector<RawListItem>& rawItems, const std::ws
                 s.isDragged = live.isDragged;
                 s.isPendingDrop = live.isPendingDrop;
                 s.preDragBoundsRect = live.preDragBoundsRect;
+                auto dupIt = nameDups.find(s.displayName + (s.overlayIndex > 0 ? L":lnk" : L":item"));
+                if (dupIt != nameDups.end() && dupIt->second > 1) {
+                    wchar_t collLine[512];
+                    swprintf_s(collLine, L"[NAMECOLL] PUBLISH-ALIGNED '%s' idx %zu state=%u (twin x%d, own slot)",
+                               s.displayName.c_str(), stagedIdx, s.state, dupIt->second);
+                    publishCollLogs.push_back(collLine);
+                }
+                // [SLITHER-GUARD v2.5.3] Geometry arbitration on tiny deltas.
+                // The probe (v2.5.1) proved the deep pass — now fast enough
+                // to beat Explorer's post-zoom layout settle — captures
+                // rects ~2px above the settled positions and republishes
+                // them OVER Stage A's correct manifest geometry (the
+                // "correct first, then slither" sequence). Rule: when the
+                // staged rect agrees with live to within 2px on every edge
+                // at the SAME size, the live value wins — it is either the
+                // settled Stage A manifest or the poll's fresher re-measure
+                // (poll authority, invariant 1, now extended to geometry).
+                // Big deltas (real zoom relayout, real moves) still take the
+                // staged measurement untouched.
+                {
+                    int dL = s.combinedRect.left - live.combinedRect.left;
+                    int dT = s.combinedRect.top - live.combinedRect.top;
+                    int dR = s.combinedRect.right - live.combinedRect.right;
+                    int dB = s.combinedRect.bottom - live.combinedRect.bottom;
+                    bool anyDiff = (dL || dT || dR || dB);
+                    bool small = (dL >= -2 && dL <= 2) && (dT >= -2 && dT <= 2) &&
+                                 (dR >= -2 && dR <= 2) && (dB >= -2 && dB <= 2);
+                    if (anyDiff && small) {
+                        static int s_slitherGuardLogged = 0;
+                        if (s_slitherGuardLogged < 40) {
+                            ++s_slitherGuardLogged;
+                            wchar_t line[512];
+                            swprintf_s(line,
+                                L"[SLITHER-GUARD] live wins '%s' idx %zu: (%ld,%ld,%ld,%ld) over staged (%ld,%ld,%ld,%ld) d=(%d,%d,%d,%d)",
+                                s.displayName.c_str(), stagedIdx,
+                                live.combinedRect.left, live.combinedRect.top, live.combinedRect.right, live.combinedRect.bottom,
+                                s.combinedRect.left, s.combinedRect.top, s.combinedRect.right, s.combinedRect.bottom,
+                                dL, dT, dR, dB);
+                            publishCollLogs.push_back(line);
+                        }
+                        s.iconRect = live.iconRect;
+                        s.boundsRect = live.boundsRect;
+                        s.labelRect = live.labelRect;
+                        s.combinedRect = live.combinedRect;
+                    }
+                }
             }
         }
         // The deep pass stages items over hundreds of ms; a hold that was live when
@@ -7521,6 +9428,24 @@ void ProcessSnapshotData(const std::vector<RawListItem>& rawItems, const std::ws
         publishedCount = newSnapshots.size(); // log after the move reads a moved-from vector
         g_iconSnapshots = std::move(newSnapshots);
         g_snapshotGeneration.fetch_add(1, std::memory_order_release);
+    }
+    for (const auto& collLine : publishCollLogs) DiagLog(L"%s", collLine.c_str());
+    // [PERF-AUDIT v2.2.6] pass wall clock. [P1.3] printed newSnapshots.size()
+    // AFTER the move (always 0) — publishCount is captured pre-move at 8423.
+    DiagLog(L"[PASS-END] %zu published in %llu ms (slow=%d fast=%d diskSkip=%d)",
+            publishedCount, GetTickCount64() - passStartTick, countSlow, countFast, countDiskSkip);
+
+    // [SLITHER v2.5.3] A post-zoom pass can outlast the 800ms settle re-poll
+    // (passes run 469ms-3.6s) and republish mid-settle geometry AFTER the
+    // re-poll already healed — with nothing behind it (Doc's "sometimes it
+    // doesn't heal until I select"). If this pass follows a zoom, re-arm
+    // one settle re-poll so the last writer is always followed by a
+    // settled re-measure.
+    {
+        ULONGLONG sinceZoom = GetTickCount64() - g_lastZoomTick.load(std::memory_order_relaxed);
+        if (sinceZoom < 3000 && g_overlayWnd && IsWindow(g_overlayWnd)) {
+            SetTimer(g_overlayWnd, TIMER_ID_ZOOM_SETTLE, 400, nullptr);
+        }
     }
 
     // A hold survived publishing, but this thread may run while the fast collapse
@@ -7555,15 +9480,10 @@ void ProcessSnapshotData(const std::vector<RawListItem>& rawItems, const std::ws
     // We use the snapshot copy because it holds the exact list of what the Windows Shell is currently displaying
     for (const auto& snap : gcSnapshotCopy) {
         activeCacheKeys.insert(snap.cacheKey);
-        if (snap.labelCacheKey != 0) activeCacheKeys.insert(snap.labelCacheKey);
 
         auto it = localHashCache.find(snap.cacheKey);
         if (it != localHashCache.end()) {
             activeShapeHashes.insert(it->second);
-        }
-        auto itLabel = localHashCache.find(snap.labelCacheKey);
-        if (itLabel != localHashCache.end()) {
-            activeShapeHashes.insert(itLabel->second);
         }
 
         if (snap.comboHash_c != 0) activeComboHashes.insert(snap.comboHash_c);
@@ -7595,9 +9515,36 @@ void ProcessSnapshotData(const std::vector<RawListItem>& rawItems, const std::ws
 
     {
         std::lock_guard<std::mutex> lock(g_comboShadowCacheMutex);
+        // [SILPERSIST v2.2.3] Inactive entries lose their shadow LAYERS (the
+        // expensive GPU part, re-uploaded on revisit) but KEEP sourceBmp —
+        // the mask stamps it, so a zoom revisit shows true silhouettes
+        // instantly instead of a white-rect wave while preflight re-uploads.
+        // Hard cap on silhouette-only entries (dead zooms/label variants)
+        // keeps the map bounded; realistic worst case ~7 zoom levels.
+        size_t silOnlyBudget = 1200;
         for (auto it = g_comboShadowCache.begin(); it != g_comboShadowCache.end(); ) {
             if (activeComboHashes.find(it->first) == activeComboHashes.end()) {
-                it = g_comboShadowCache.erase(it);
+                // [SILPERSIST v2.2.4] Retain silhouette-only entries within
+                // budget (each retained entry consumes budget, whether it was
+                // just stripped or kept from an earlier sweep — the previous
+                // logic erased already-stripped entries on the very next
+                // sweep, destroying the persistence it was meant to provide).
+                if (silOnlyBudget > 0) {
+                    // [VRAM v2.4.4] hashes of the most recently left zoom keep
+                    // their GPU layers — the re-upload trail on a return zoom
+                    // dies (Doc ruling). Only hashes OUTSIDE the keep set are
+                    // stripped to silhouette-only.
+                    bool keepLayers = false;
+                    {
+                        std::lock_guard<std::mutex> keepLock(g_layersKeepHashesMutex);
+                        keepLayers = g_layersKeepHashes.count(it->first) != 0;
+                    }
+                    if (!keepLayers && !it->second.layers.empty()) it->second.layers.clear();
+                    --silOnlyBudget;
+                    ++it;
+                } else {
+                    it = g_comboShadowCache.erase(it);
+                }
             } else {
                 ++it;
             }
@@ -7605,16 +9552,27 @@ void ProcessSnapshotData(const std::vector<RawListItem>& rawItems, const std::ws
     }
 
     {
+        // [ZOOMFIX v2.2.2] Shapes referenced by the persisted index survive
+        // the sweep: other zoom levels' shapes are not "active" right now but
+        // are exactly what a zoom revisit adopts (stable shape hash -> stable
+        // combo hash -> disk cache hit). Bounded by visited zoom levels.
+        std::unordered_set<uint64_t> persistedShapeHashes;
+        {
+            std::lock_guard<std::mutex> pLock(g_persistedShapeIndexMutex);
+            for (const auto& pair : g_persistedShapeIndex) persistedShapeHashes.insert(pair.second);
+        }
         std::lock_guard<std::mutex> lock(g_uniqueShapesMutex);
         for (auto it = g_uniqueShapes.begin(); it != g_uniqueShapes.end(); ) {
-            if (activeShapeHashes.find(it->hash) == activeShapeHashes.end()) {
+            if (activeShapeHashes.find(it->hash) == activeShapeHashes.end() &&
+                persistedShapeHashes.find(it->hash) == persistedShapeHashes.end()) {
                 it = g_uniqueShapes.erase(it); // Frees CPU RAM (alpha arrays)
             } else {
                 ++it;
             }
         }
         for (auto it = g_shapeToBitmap.begin(); it != g_shapeToBitmap.end(); ) {
-            if (activeShapeHashes.find(it->first) == activeShapeHashes.end()) {
+            if (activeShapeHashes.find(it->first) == activeShapeHashes.end() &&
+                persistedShapeHashes.find(it->first) == persistedShapeHashes.end()) {
                 it = g_shapeToBitmap.erase(it); // Frees shared 8-bit GPU texture
             } else {
                 ++it;
@@ -7647,7 +9605,11 @@ void ProcessSnapshotData(const std::vector<RawListItem>& rawItems, const std::ws
     // composite dirty flag — shapes and composites change on different cues.
     static ULONGLONG s_lastShapeSave = 0;
     ULONGLONG nowShapeSave = GetTickCount64();
-    if (nowShapeSave - s_lastShapeSave > 30000) {
+    // [P1.2] A zoom change forces the next pass-end save past the throttle:
+    // each visited zoom's keys reach the file at its own arrival pass, so a
+    // quick A->B leg can no longer orphan A's shapes before adoption.
+    bool forceShapeSave = g_shapeSaveForced.exchange(false, std::memory_order_relaxed);
+    if (forceShapeSave || nowShapeSave - s_lastShapeSave > 30000) {
         s_lastShapeSave = nowShapeSave;
         SaveIconShapes(manifestCopy);
     }
@@ -7669,6 +9631,130 @@ void SnapshotWorkerThreadProc() {
     }
 }
 
+// [STAGE A v2.4.0] Zoom fast path: restore the target zoom's cached layout
+// + silhouettes so display flips near-instantly, then let the deep pass
+// validate behind it. Runs on the worker (serialized with passes), BEFORE
+// any queued full pass. Invariants: publish goes through the poll-authority
+// index-aligned guard (no side door); silhouette-first (silhouettes stamp
+// before the geometry swap wakes the renderers); first visit (no cache
+// file) falls through to the deep pass unchanged.
+static void RunStageARestore(int zoom) {
+    if (g_unloading.load(std::memory_order_relaxed) || !g_bakeDc) return;
+    ULONGLONG t0 = GetTickCount64();
+    float dpi = g_dpiScale.load(std::memory_order_relaxed);
+    // [STAGE A v2.4.1] Persist the LEAVING zoom's layout before anything
+    // swaps: its manifest is still live right now, and its cache file may
+    // not exist yet (files are only written for the zoom current at save
+    // time). Runs even when this restore is superseded — the leaving zoom
+    // of an aborted leg is exactly the intermediate zoom that would
+    // otherwise never reach disk.
+    int leavingZoom = g_stageALeavingZoom.exchange(0, std::memory_order_relaxed);
+    if (leavingZoom > 0) {
+        std::vector<IconSnapshot> leaving;
+        {
+            std::lock_guard<std::mutex> snapLock(g_snapshotMutex);
+            leaving = g_iconSnapshots;
+        }
+        if (!leaving.empty()) {
+            // [VRAM v2.4.4] the leaving zoom's combos keep their GPU layers
+            // through the next sweep(s) — shadows restore instantly on return.
+            {
+                std::unordered_set<uint64_t> keep;
+                for (const auto& s : leaving) {
+                    if (s.comboHash_c) keep.insert(s.comboHash_c);
+                    if (s.comboHash_e) keep.insert(s.comboHash_e);
+                }
+                std::lock_guard<std::mutex> keepLock(g_layersKeepHashesMutex);
+                g_layersKeepHashes = std::move(keep);
+            }
+            size_t leavingCount = leaving.size();
+            g_diskCache.QueueSave(dpi, leavingZoom, GetEnvironmentHash(), std::move(leaving));
+            DiagLog(L"[STAGEA] leaving zoom %d: %zu snapshots queued for cache save", leavingZoom, leavingCount);
+        }
+    }
+    if (GetCurrentIconZoom() != zoom) return; // superseded by a newer zoom
+    std::vector<IconSnapshot> manifest = g_diskCache.LoadManifestOnly(dpi, zoom, GetEnvironmentHash());
+    if (manifest.empty()) {
+        // [STAGEA-DIAG] name the miss: file absent vs file present with an
+        // empty manifest section (different fixes).
+        CacheFileHeader dbgHeader = {};
+        HANDLE dbgFile = g_diskCache.DebugOpenCacheFile(dpi, zoom, GetEnvironmentHash(), dbgHeader);
+        if (dbgFile) {
+            CloseHandle(dbgFile);
+            DiagLog(L"[STAGEA] zoom %d: cache file EXISTS but manifestCount=%u (save never wrote layout)", zoom, dbgHeader.manifestCount);
+        } else {
+            DiagLog(L"[STAGEA] zoom %d: no cache file (first visit - deep pass owns it)", zoom);
+        }
+        return;
+    }
+
+    // Silhouette-first: stamp sourceBmp for every restored combo hash we can
+    // prove, BEFORE the geometry swap wakes the mask. RAM mirror first; the
+    // zoom file fills holes via merge-load (keeps session entries intact).
+    int silPublished = 0;
+    std::vector<uint64_t> missingHashes;
+    auto publishSil = [&](uint64_t h, bool preferE) -> bool {
+        if (h == 0) return true;
+        {
+            std::lock_guard<std::mutex> shadowLock(g_comboShadowCacheMutex);
+            auto it = g_comboShadowCache.find(h);
+            if (it != g_comboShadowCache.end() && it->second.sourceBmp) return true;
+        }
+        CompositeData cd;
+        if (!g_diskCache.GetComposite(h, cd)) return false;
+        const SilhouetteData& pc2 = (preferE && !cd.pc2_e.alphaData.empty()) ? cd.pc2_e : cd.pc2_c;
+        PublishSilhouetteFromPc2(h, pc2);
+        return true;
+    };
+    for (const auto& snap : manifest) {
+        const uint64_t hashes[2] = { snap.comboHash_c, snap.comboHash_e };
+        for (int hi = 0; hi < 2; ++hi) {
+            uint64_t h = hashes[hi];
+            if (h == 0) continue;
+            if (!publishSil(h, hi == 1)) missingHashes.push_back(h);
+            else ++silPublished;
+        }
+    }
+    if (!missingHashes.empty()) {
+        // [STAGE A v2.4.3] mirror missed: pull the zoom file's composites in
+        // (merge, not replace), then retry the holes.
+        g_diskCache.MergeCompositesFromDisk(dpi, zoom, GetEnvironmentHash());
+        size_t recovered = 0;
+        for (uint64_t h : missingHashes) {
+            if (publishSil(h, false)) { ++silPublished; ++recovered; }
+        }
+        DiagLog(L"[STAGEA] zoom %d: mirror missed %zu, file merge recovered %zu",
+                zoom, missingHashes.size(), recovered);
+    }
+
+    const size_t restoredCount = manifest.size();
+    // Geometry swap through the SAME poll-authority rules as the deep pass
+    // publish (index-aligned stale-state guard, v2.1.17/v2.2.0): copy live
+    // selection state onto staged slots only when identity (name + overlay
+    // class) verifies; a count mismatch or reorder leaves staged state at 0
+    // (safe: deselected flash at worst, the pass re-corrects).
+    {
+        std::lock_guard<std::mutex> snapLock(g_snapshotMutex);
+        if (!g_iconSnapshots.empty()) {
+            const size_t liveCount = g_iconSnapshots.size();
+            for (size_t i = 0; i < manifest.size() && i < liveCount; ++i) {
+                const auto& live = g_iconSnapshots[i];
+                auto& staged = manifest[i];
+                if (staged.displayName == live.displayName &&
+                    (staged.overlayIndex > 0) == (live.overlayIndex > 0)) {
+                    staged.state = live.state;
+                }
+            }
+        }
+        g_iconSnapshots = std::move(manifest);
+        g_snapshotGeneration.fetch_add(1, std::memory_order_release);
+    }
+    if (g_underlayRenderEvent) SetEvent(g_underlayRenderEvent);
+    if (g_renderEvent) SetEvent(g_renderEvent);
+    DiagLog(L"[STAGEA] zoom %d: %zu snapshots restored, %d silhouettes in %llu ms",
+            zoom, restoredCount, silPublished, GetTickCount64() - t0);
+}
+
 void SnapshotWorkerThreadProcInner() {
     // MTA by recorded review decision (see to-do 📌): STA shell extension
     // handlers called from MTA get hosted/marshaled by COM — the failure mode
@@ -7688,11 +9774,97 @@ void SnapshotWorkerThreadProcInner() {
     g_diskCache.LoadCompositesFromDisk(g_dpiScale.load(std::memory_order_relaxed),
                                        GetCurrentIconZoom(), GetEnvironmentHash());
 
+    // [STAGE A v2.4.4 — boot amendment] The Frame-1 bootstrap restored the
+    // boot zoom's layout, but its mask stamped white rects because nothing
+    // had published silhouettes yet. The composites are in the mirror now:
+    // stamp sourceBmp for every restored combo and wake the mask, so boot
+    // shows true silhouettes BEFORE the first deep pass finishes.
+    {
+        std::vector<IconSnapshot> bootManifest;
+        {
+            std::lock_guard<std::mutex> snapLock(g_snapshotMutex);
+            bootManifest = g_iconSnapshots;
+        }
+        int bootSil = 0;
+        for (const auto& snap : bootManifest) {
+            const uint64_t hashes[2] = { snap.comboHash_c, snap.comboHash_e };
+            for (int hi = 0; hi < 2; ++hi) {
+                uint64_t h = hashes[hi];
+                if (h == 0) continue;
+                {
+                    std::lock_guard<std::mutex> shadowLock(g_comboShadowCacheMutex);
+                    auto it = g_comboShadowCache.find(h);
+                    if (it != g_comboShadowCache.end() && it->second.sourceBmp) continue;
+                }
+                CompositeData cd;
+                if (g_diskCache.GetComposite(h, cd)) {
+                    const SilhouetteData& pc2 = (hi == 1 && !cd.pc2_e.alphaData.empty()) ? cd.pc2_e : cd.pc2_c;
+                    PublishSilhouetteFromPc2(h, pc2);
+                    ++bootSil;
+                }
+            }
+        }
+        if (bootSil > 0) {
+            DiagLog(L"[STAGEA] boot: %d silhouettes published from mirror for Frame-1 layout", bootSil);
+            if (g_underlayRenderEvent) SetEvent(g_underlayRenderEvent);
+            if (g_renderEvent) SetEvent(g_renderEvent);
+        }
+    }
+
     while (!g_unloading) {
         WaitForSingleObject(g_snapshotWorkerEvent, INFINITE);
         if (g_unloading) break;
 
         while (true) {
+            // FAST PATH first: drain the priority single-icon slot before any
+            // queued full pass, so a click's expanded composite + shadow assets
+            // land in ms instead of riding the full-pass convoy.
+            {
+                FastPathRequest fastReq;
+                bool haveFast = false;
+                {
+                    std::lock_guard<std::mutex> lock(g_fastPathMutex);
+                    if (!g_fastPathRequest.items.empty()) {
+                        fastReq = std::move(g_fastPathRequest);
+                        g_fastPathRequest = FastPathRequest{};
+                        haveFast = true;
+                    }
+                }
+                if (haveFast) {
+                    try {
+                        ProcessSnapshotData(fastReq.items, fastReq.userDesktop,
+                                            fastReq.publicDesktop,
+                                            fastReq.labelFont, fastReq.labelLogfont,
+                                            /*mergeIntoExisting=*/true);
+                    } catch (...) {
+                        Wh_Log(L"[SNAPSHOT] Caught unexpected exception in fast path");
+                    }
+                    if (!g_unloading && g_bakeDc) {
+                        try {
+                            PreflightShadowAssets(SnapshotSettings());
+                        } catch (...) {
+                            Wh_Log(L"[SNAPSHOT] Caught unexpected exception in fast-path preflight");
+                        }
+                    }
+                    continue; // re-check the fast slot before touching the queue
+                }
+            }
+
+            // [STAGE A v2.4.0] Zoom fast path: restore the cached state for a
+            // known zoom BEFORE any queued deep pass. After it, re-check the
+            // fast slot (a click may have raced the restore).
+            {
+                int stageA = g_stageARequestZoom.exchange(0, std::memory_order_relaxed);
+                if (stageA != 0) {
+                    try {
+                        RunStageARestore(stageA);
+                    } catch (...) {
+                        Wh_Log(L"[SNAPSHOT] Caught unexpected exception in Stage A restore");
+                    }
+                    continue;
+                }
+            }
+
             std::vector<RawListItem> items;
             std::wstring userDesktop, publicDesktop;
             HFONT labelFont = nullptr;
@@ -7736,19 +9908,13 @@ void SnapshotWorkerThreadProcInner() {
     if (SUCCEEDED(hrCom)) CoUninitialize();
 }
 
-void BakeUnifiedShadows(const Settings& settings, uint64_t comboHash, const SilhouetteData& silhouette) {
+void BakeUnifiedShadows(const Settings& settings, uint64_t comboHash, const SilhouetteData& silhouette, float itemScale) {
     if (!g_bakeDc || silhouette.width == 0 || silhouette.height == 0) return;
     if (silhouette.alphaData.size() != silhouette.width * silhouette.height) return;
 
-    // 1. Check if we already baked this exact combo
-    {
-        std::lock_guard<std::mutex> lock(g_comboShadowCacheMutex);
-        if (g_comboShadowCache.find(comboHash) != g_comboShadowCache.end()) return;
-    }
-
     D2D1_SIZE_U origSize = D2D1::SizeU(silhouette.width, silhouette.height);
 
-    // 2. Upload the unified CPU alpha array to a temporary GPU bitmap
+    // 1. Upload the unified CPU alpha array to a temporary GPU bitmap
     std::vector<BYTE> bgraData(origSize.width * origSize.height * 4);
     for (UINT i = 0; i < origSize.width * origSize.height; ++i) {
         bgraData[i * 4 + 0] = 0;
@@ -7765,8 +9931,35 @@ void BakeUnifiedShadows(const Settings& settings, uint64_t comboHash, const Silh
     g_bakeDc->CreateBitmap(origSize, bgraData.data(), origSize.width * 4, &props, &sourceBmp);
     if (!sourceBmp) return;
 
+    // 1b. [SILPERSIST v2.2.3] Layers-aware existence check + EARLY silhouette
+    // publish: the mask stamps sourceBmp out of this cache, so the entry goes
+    // in BEFORE the (slow) layer bake — icons get their true silhouette cutout
+    // immediately and shadows fill in when the layers land. Fully-baked
+    // entries still short-circuit; silhouette-only entries (GC strip or an
+    // interrupted bake) are adopted and upgraded in place at the end, which
+    // also makes a dead bake self-healing on the next preflight.
+    {
+        std::lock_guard<std::mutex> lock(g_comboShadowCacheMutex);
+        auto it = g_comboShadowCache.find(comboHash);
+        if (it != g_comboShadowCache.end()) {
+            if (!it->second.layers.empty()) return; // fully baked already
+            if (!it->second.sourceBmp) it->second.sourceBmp = sourceBmp;
+        } else {
+            ShadowCache silOnly;
+            silOnly.sourceBmp = sourceBmp;
+            g_comboShadowCache[comboHash] = std::move(silOnly);
+        }
+    }
+
     // --- BLUR & BAKE LOGIC ---
-    float sharpBlur = (std::min)((float)settings.shadowBlur * g_dpiScale, 250.0f);
+    // [MULTIMON v2.9.6] The silhouette canvas (pc2) is in MONITOR-LOCAL
+    // units (it derives from the live per-monitor-scaled cell), so the
+    // blur sigma must shrink with it on secondary monitors (D2 ruling:
+    // proportionate shadows). v2.9.5 scaled the LAYER DRAW instead, which
+    // shrank the whole layer canvas a second time — Doc field-caught
+    // "shadows smaller than the icon" on the 100% secondary. Sigma scales
+    // here, at the bake; the draw anchors layers natively.
+    float sharpBlur = (std::min)((float)settings.shadowBlur * g_dpiScale, 250.0f) * itemScale;
     float tailRate = settings.shadowTailSoftness / 100.0f;
     float tailAddition = std::max(20.0f, sharpBlur * 9.0f);
     float softBlur = sharpBlur + (tailRate * tailAddition);
@@ -7925,8 +10118,18 @@ void BakeUnifiedShadows(const Settings& settings, uint64_t comboHash, const Silh
             sl.bmp = layerBmp;
             sl.width = layerW;
             sl.height = layerH;
-            sl.offsetX = anchorX;
-            sl.offsetY = anchorY;
+            // [CORE-CENTER GROWTH v2.8.3] The render loop places the layer so
+            // the stored offset lands at combinedRect.topLeft + stepOffset —
+            // a fixed point for ALL layers. Storing the anchor (core TOP-LEFT
+            // inside the bitmap) pinned every scaled layer's growth to that
+            // corner: with tail scale up, bigger cores grew right+down only,
+            // faking a bottom-right drift regardless of light direction (Doc
+            // field report). Storing plain layerPad instead makes the CORE'S
+            // CENTER the fixed point: growth is symmetric around the
+            // silhouette, and only stepOffset carries direction. At
+            // tailScale=0 anchor==layerPad, so the default look is unchanged.
+            sl.offsetX = layerPad;
+            sl.offsetY = layerPad;
             sl.cpuAlpha = std::move(cpuAlpha);
             cache.layers.push_back(sl);
         }
@@ -8006,122 +10209,233 @@ void PreflightShadowAssets(const Settings& localSettings) {
     ULONGLONG tBakeStart = GetTickCount64();
     bool assetsAdded = false;
 
-    for (const auto& snap : snapshots) {
-        if (snap.isDragged) continue;
-
-        // Bake the shadow for the currently active visual state
-        uint64_t targetHash = PickComboHash(snap);
-        if (targetHash == 0) continue;
-
-        bool isTargetExpanded = (targetHash == snap.comboHash_e);
-
-        bool hasCache = false;
-        {
-            std::lock_guard<std::mutex> lock(g_comboShadowCacheMutex);
-            hasCache = g_comboShadowCache.find(targetHash) != g_comboShadowCache.end();
-        }
-        if (!hasCache) {
-            CompositeData compData;
-            bool hasDiskCache = g_diskCache.GetComposite(targetHash, compData);
-            if (hasDiskCache) {
-                const auto& savedLayers = isTargetExpanded ? compData.shadows_e : compData.shadows_c;
-                const auto& sil = isTargetExpanded ? compData.pc2_e : compData.pc2_c;
-                if (sil.width == 0 || sil.height == 0) {
-                    static std::unordered_map<uint64_t,int> s_silEmptyLogged;
-                    if (s_silEmptyLogged[targetHash]++ < 3)
-                        Wh_Log(L"[PRE] combo %llu has empty silhouette (c=%llu e=%llu) '%s'",
-                               (unsigned long long)targetHash, (unsigned long long)snap.comboHash_c,
-                               (unsigned long long)snap.comboHash_e, snap.displayName.c_str());
-                    if (g_overlayWnd && !g_snapshotUpdatePending.load(std::memory_order_relaxed)) {
-                        g_snapshotUpdatePending.store(true, std::memory_order_relaxed);
-                        PostMessageW(g_overlayWnd, WM_APP_SNAPSHOT_UPDATE, 0, 0);
-                    }
-                    continue;
-                }
-                if (!savedLayers.empty()) {
-                    countDisk++;
-                    assetsAdded = true;
-                    ShadowCache cache;
-                    cache.layers.reserve(savedLayers.size());
-                    D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
-                        D2D1_BITMAP_OPTIONS_NONE,
-                        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
-
-                    // Upload the master composite bitmap from disk silhouette
-                    if (sil.width > 0 && sil.height > 0 && !sil.alphaData.empty()) {
-                        std::vector<BYTE> silBgra(sil.width * sil.height * 4);
-                        for (UINT i = 0; i < sil.width * sil.height; ++i) {
-                            silBgra[i * 4 + 0] = 0;
-                            silBgra[i * 4 + 1] = 0;
-                            silBgra[i * 4 + 2] = 0;
-                            silBgra[i * 4 + 3] = sil.alphaData[i];
-                        }
-                        g_bakeDc->CreateBitmap(D2D1::SizeU(sil.width, sil.height), silBgra.data(), sil.width * 4, &props, &cache.sourceBmp);
-                    }
-
-                    for (const auto& saved : savedLayers) {
-                        ShadowLayer sl;
-                        sl.offsetX = saved.offsetX;
-                        sl.offsetY = saved.offsetY;
-                        sl.width = saved.width;
-                        sl.height = saved.height;
-                        sl.cpuAlpha = saved.alphaData;
-                        std::vector<BYTE> bgraData(saved.width * saved.height * 4);
-                        for (UINT i = 0; i < saved.width * saved.height; ++i) {
-                            bgraData[i * 4 + 0] = 0;
-                            bgraData[i * 4 + 1] = 0;
-                            bgraData[i * 4 + 2] = 0;
-                            bgraData[i * 4 + 3] = saved.alphaData[i];
-                        }
-                        ComPtr<ID2D1Bitmap1> tempBmp;
-                        g_bakeDc->CreateBitmap(D2D1::SizeU(saved.width, saved.height), bgraData.data(), saved.width * 4, &props, &tempBmp);
-                        sl.bmp = tempBmp;
-                        cache.layers.push_back(std::move(sl));
-                    }
-                    std::lock_guard<std::mutex> shadowLock(g_comboShadowCacheMutex);
-                    g_comboShadowCache[targetHash] = std::move(cache);
-                } else {
-                    countGPU++;
-                    assetsAdded = true;
-                    BakeUnifiedShadows(localSettings, targetHash, sil);
-                }
-                auto& targetSaved = isTargetExpanded ? compData.shadows_e : compData.shadows_c;
-                if (targetSaved.empty()) {
-                    std::lock_guard<std::mutex> shadowLock(g_comboShadowCacheMutex);
-                    auto it = g_comboShadowCache.find(targetHash);
-                    if (it != g_comboShadowCache.end() && !it->second.layers.empty()) {
-                        for (const auto& sl : it->second.layers) {
-                            SavedShadowLayer saved;
-                            saved.offsetX = sl.offsetX;
-                            saved.offsetY = sl.offsetY;
-                            saved.width = sl.width;
-                            saved.height = sl.height;
-                            saved.alphaData = sl.cpuAlpha;
-                            targetSaved.push_back(std::move(saved));
-                        }
-                        uint64_t currentProfile = GetShadowBakeHash(localSettings); // Lock-free!
-                        g_diskCache.SetComposite(targetHash, compData, currentProfile);
-                    }
-                }
-            } else {
-                static std::unordered_map<uint64_t,int> s_noCompLogged;
-                if (s_noCompLogged[targetHash]++ < 3)
-                    Wh_Log(L"[PRE] no composite for combo %llu (c=%llu e=%llu) expanded=%d '%s'",
-                           (unsigned long long)targetHash, (unsigned long long)snap.comboHash_c,
-                           (unsigned long long)snap.comboHash_e, (int)IsIconExpanded(snap),
-                           snap.displayName.c_str());
-                if (g_overlayWnd && !g_snapshotUpdatePending.load(std::memory_order_relaxed)) {
-                    g_snapshotUpdatePending.store(true, std::memory_order_relaxed);
-                    PostMessageW(g_overlayWnd, WM_APP_SNAPSHOT_UPDATE, 0, 0);
-                }
+    // RADIAL BAKE ORDER (Doc's wave-killer, variant 2 — radial pop): sort bake
+    // targets closest-to-mouse first. Preflight runs on the worker within ~ms
+    // of the [ZOOM] event, so cursor position here is effectively the T0
+    // capture. The existing progressive display then draws the cold wave as
+    // an expanding circle from the cursor instead of the snapshot vector's
+    // arbitrary order. Total bake time unchanged (GPU-bound serial) — only
+    // ARRIVAL ORDER moves. Stable sort: equal distances keep snapshot order.
+    {
+        POINT mouse;
+        if (GetCursorPos(&mouse)) {
+            auto centerDist2 = [&mouse](const IconSnapshot& s) -> long long {
+                // Widest live rect wins; empty rects fall through to the next.
+                const RECT* r = &s.combinedRect;
+                if (r->right <= r->left || r->bottom <= r->top) r = &s.boundsRect;
+                if (r->right <= r->left || r->bottom <= r->top) r = &s.iconRect;
+                if (r->right <= r->left || r->bottom <= r->top) return LLONG_MAX;
+                long long cx = ((long long)r->left + r->right) / 2;
+                long long cy = ((long long)r->top + r->bottom) / 2;
+                long long dx = cx - mouse.x;
+                long long dy = cy - mouse.y;
+                return dx * dx + dy * dy;
+            };
+            std::stable_sort(snapshots.begin(), snapshots.end(),
+                             [&centerDist2](const IconSnapshot& a, const IconSnapshot& b) {
+                                 return centerDist2(a) < centerDist2(b);
+                             });
+            if (!snapshots.empty()) {
+                long long dFirst = centerDist2(snapshots.front());
+                long long dLast = centerDist2(snapshots.back());
+                Wh_Log(L"[RADIAL] mouse=(%ld,%ld) sorted %zu targets, nearest ~%.0fpx, farthest ~%.0fpx",
+                       mouse.x, mouse.y, snapshots.size(),
+                       sqrt((double)dFirst),
+                       dLast == LLONG_MAX ? -1.0 : sqrt((double)dLast));
             }
         } else {
-            countRAM++;
+            Wh_Log(L"[RADIAL] GetCursorPos failed - keeping snapshot order");
         }
     }
 
+    // BOTH states are ensured per icon, not just the active one. Preflight
+    // used to bake only PickComboHash(snap): an icon that changed state
+    // between its composite publishing and the preflight pass never got GPU
+    // assets for the other state, and NOTHING re-triggered the bake — ghost
+    // select then drew the truncated collapsed silhouette (mask alt-fallback)
+    // with no shadow until a re-select happened to run another batch.
+    // Expanded is ensured FIRST: a fresh selection needs it ready before the
+    // user can deselect into ghost.
+    // [SILFIRST v2.2.5] Preflight runs in TWO sweeps so every silhouette is
+    // in the GPU combo cache before ANY shadow-layer work starts. The mask
+    // stamps sourceBmp out of this cache, so sweep 1 (cheap ~30KB uploads,
+    // ~150ms for the whole desktop) completes the overlay cutouts for all
+    // icons; sweep 2 (the expensive 12-layer uploads, ~600-1000ms) then fills
+    // shadows in. Old single-sweep interleaved them per icon: icon N+1's
+    // silhouette waited for icon N's layers — the visible left-to-right wave.
+    auto ensureSilhouetteAssets = [&](const IconSnapshot& snap, uint64_t targetHash, bool isTargetExpanded) -> bool {
+        if (targetHash == 0) return true;
+        {
+            std::lock_guard<std::mutex> lock(g_comboShadowCacheMutex);
+            auto entryIt = g_comboShadowCache.find(targetHash);
+            if (entryIt != g_comboShadowCache.end() && entryIt->second.sourceBmp) return true;
+        }
+        CompositeData compData;
+        if (!g_diskCache.GetComposite(targetHash, compData)) {
+            static std::unordered_map<uint64_t,int> s_noCompLogged;
+            if (s_noCompLogged[targetHash]++ < 3)
+                Wh_Log(L"[PRE] no composite for combo %llu (c=%llu e=%llu) expanded=%d '%s'",
+                       (unsigned long long)targetHash, (unsigned long long)snap.comboHash_c,
+                       (unsigned long long)snap.comboHash_e, (int)IsIconExpanded(snap),
+                       snap.displayName.c_str());
+            DiagLog(L"[PRE] REQUEUE: no composite for combo %llu '%s' -> full pass",
+                    (unsigned long long)targetHash, snap.displayName.c_str());
+            if (g_overlayWnd && !g_snapshotUpdatePending.load(std::memory_order_relaxed)) {
+                g_snapshotUpdatePending.store(true, std::memory_order_relaxed);
+                PostMessageW(g_overlayWnd, WM_APP_SNAPSHOT_UPDATE, 0, 0);
+            }
+            return false;
+        }
+        const auto& sil = isTargetExpanded ? compData.pc2_e : compData.pc2_c;
+        if (sil.width == 0 || sil.height == 0) {
+            static std::unordered_map<uint64_t,int> s_silEmptyLogged;
+            if (s_silEmptyLogged[targetHash]++ < 3)
+                Wh_Log(L"[PRE] combo %llu has empty silhouette (c=%llu e=%llu) '%s'",
+                       (unsigned long long)targetHash, (unsigned long long)snap.comboHash_c,
+                       (unsigned long long)snap.comboHash_e, snap.displayName.c_str());
+            DiagLog(L"[PRE] REQUEUE: empty silhouette combo %llu '%s' -> full pass",
+                    (unsigned long long)targetHash, snap.displayName.c_str());
+            if (g_overlayWnd && !g_snapshotUpdatePending.load(std::memory_order_relaxed)) {
+                g_snapshotUpdatePending.store(true, std::memory_order_relaxed);
+                PostMessageW(g_overlayWnd, WM_APP_SNAPSHOT_UPDATE, 0, 0);
+            }
+            return false;
+        }
+        // [ZOOMDIAG v2.2.1] What preflight read from the disk mirror.
+        DiagLog(L"[PREFETCH] '%s' hash=%llu sil=%ux%u lay_c=%u lay_e=%u",
+                snap.displayName.c_str(), (unsigned long long)targetHash,
+                sil.width, sil.height,
+                (unsigned)compData.shadows_c.size(), (unsigned)compData.shadows_e.size());
+        if (sil.alphaData.empty()) return false;
+        ComPtr<ID2D1Bitmap1> silBmp;
+        {
+            std::vector<BYTE> silBgra(sil.width * sil.height * 4);
+            for (UINT i = 0; i < sil.width * sil.height; ++i) {
+                silBgra[i * 4 + 0] = 0;
+                silBgra[i * 4 + 1] = 0;
+                silBgra[i * 4 + 2] = 0;
+                silBgra[i * 4 + 3] = sil.alphaData[i];
+            }
+            D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
+                D2D1_BITMAP_OPTIONS_NONE,
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+            g_bakeDc->CreateBitmap(D2D1::SizeU(sil.width, sil.height), silBgra.data(), sil.width * 4, &props, &silBmp);
+        }
+        if (silBmp) {
+            std::lock_guard<std::mutex> shadowLock(g_comboShadowCacheMutex);
+            auto& entry = g_comboShadowCache[targetHash];
+            if (!entry.sourceBmp) entry.sourceBmp = silBmp;
+        }
+        return true;
+    };
+
+    auto ensureLayerAssets = [&](const IconSnapshot& snap, uint64_t targetHash, bool isTargetExpanded) {
+        if (targetHash == 0) return;
+
+        bool hasFull = false;
+        {
+            std::lock_guard<std::mutex> lock(g_comboShadowCacheMutex);
+            auto entryIt = g_comboShadowCache.find(targetHash);
+            // [SILPERSIST v2.2.3] "RAM hit" means LAYERS present.
+            hasFull = (entryIt != g_comboShadowCache.end() && !entryIt->second.layers.empty());
+        }
+        if (hasFull) {
+            countRAM++;
+            return;
+        }
+        CompositeData compData;
+        if (!g_diskCache.GetComposite(targetHash, compData)) return; // REQUEUE already fired in sweep 1
+        const auto& savedLayers = isTargetExpanded ? compData.shadows_e : compData.shadows_c;
+        const auto& sil = isTargetExpanded ? compData.pc2_e : compData.pc2_c;
+        if (savedLayers.empty()) {
+            countGPU++;
+            assetsAdded = true;
+            BakeUnifiedShadows(localSettings, targetHash, sil,
+                               GetItemMonitorScale(g_overlayWnd, snap.combinedRect)); // [MULTIMON v2.9.6]
+            return;
+        }
+        countDisk++;
+        assetsAdded = true;
+        ShadowCache cache;
+        cache.layers.reserve(savedLayers.size());
+        D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
+            D2D1_BITMAP_OPTIONS_NONE,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+
+        for (const auto& saved : savedLayers) {
+            ShadowLayer sl;
+            sl.offsetX = saved.offsetX;
+            sl.offsetY = saved.offsetY;
+            sl.width = saved.width;
+            sl.height = saved.height;
+            sl.cpuAlpha = saved.alphaData;
+            std::vector<BYTE> bgraData(saved.width * saved.height * 4);
+            for (UINT i = 0; i < saved.width * saved.height; ++i) {
+                bgraData[i * 4 + 0] = 0;
+                bgraData[i * 4 + 1] = 0;
+                bgraData[i * 4 + 2] = 0;
+                bgraData[i * 4 + 3] = saved.alphaData[i];
+            }
+            ComPtr<ID2D1Bitmap1> tempBmp;
+            g_bakeDc->CreateBitmap(D2D1::SizeU(saved.width, saved.height), bgraData.data(), saved.width * 4, &props, &tempBmp);
+            sl.bmp = tempBmp;
+            cache.layers.push_back(std::move(sl));
+        }
+        {
+            std::lock_guard<std::mutex> shadowLock(g_comboShadowCacheMutex);
+            auto& entry = g_comboShadowCache[targetHash];
+            if (entry.layers.empty()) entry.layers = std::move(cache.layers);
+        }
+        auto& targetSaved = isTargetExpanded ? compData.shadows_e : compData.shadows_c;
+        if (targetSaved.empty()) {
+            std::lock_guard<std::mutex> shadowLock(g_comboShadowCacheMutex);
+            auto it = g_comboShadowCache.find(targetHash);
+            if (it != g_comboShadowCache.end() && !it->second.layers.empty()) {
+                for (const auto& sl : it->second.layers) {
+                    SavedShadowLayer saved;
+                    saved.offsetX = sl.offsetX;
+                    saved.offsetY = sl.offsetY;
+                    saved.width = sl.width;
+                    saved.height = sl.height;
+                    saved.alphaData = sl.cpuAlpha;
+                    targetSaved.push_back(std::move(saved));
+                }
+                uint64_t currentProfile = GetShadowBakeHash(localSettings); // Lock-free!
+                g_diskCache.SetComposite(targetHash, compData, currentProfile);
+                // [ZOOMDIAG v2.2.1] proof the upgrade to full landed.
+                DiagLog(L"[SAVEBACK] hash=%llu layers=%u sil=%ux%u",
+                        (unsigned long long)targetHash, (unsigned)targetSaved.size(),
+                        (isTargetExpanded ? compData.pc2_e.width : compData.pc2_c.width),
+                        (isTargetExpanded ? compData.pc2_e.height : compData.pc2_c.height));
+            }
+        }
+    };
+
+    // Sweep 1: silhouettes for EVERY icon first — the mask completes here.
+    ULONGLONG tSweep1 = GetTickCount64(); // [PERF-AUDIT v2.2.6]
+    for (const auto& snap : snapshots) {
+        if (snap.isDragged) continue;
+        ensureSilhouetteAssets(snap, snap.comboHash_e, true);
+        ensureSilhouetteAssets(snap, snap.comboHash_c, false);
+    }
+    ULONGLONG sweep1Ms = GetTickCount64() - tSweep1;
+    // Sweep 2: shadow layers (upload or bake) — shadows trail the cutouts.
+    ULONGLONG tSweep2 = GetTickCount64();
+    for (const auto& snap : snapshots) {
+        if (snap.isDragged) continue;
+        ensureLayerAssets(snap, snap.comboHash_e, true);
+        ensureLayerAssets(snap, snap.comboHash_c, false);
+    }
+    ULONGLONG sweep2Ms = GetTickCount64() - tSweep2;
+    // [PERF-AUDIT v2.2.6] sweep split for the zoom timeline.
+    DiagLog(L"[PRE-SWEEPS] sil %llu ms, layers %llu ms (ram=%d disk=%d gpu=%d)",
+            (unsigned long long)sweep1Ms, (unsigned long long)sweep2Ms,
+            countRAM, countDisk, countGPU);
+
     Wh_Log(L"[UNDERLAY] Shadow Pre-flight in %llums -> RAM Hits: %d, Disk Cache Hits: %d, GPU Bakes: %d",
             GetTickCount64() - tBakeStart, countRAM, countDisk, countGPU);
+    DiagLog(L"[PRE] preflight done in %lu ms (ram=%d disk=%d gpu=%d)",
+            (unsigned long)(GetTickCount64() - tBakeStart), countRAM, countDisk, countGPU);
     // Warm the render-loop missing-assets diagnostics: before this point the
     // cache is legitimately empty on cold start.
     g_shadowDiagWarm.store(true, std::memory_order_release);
@@ -8291,10 +10605,30 @@ void RenderUnderlayLoopInner() {
     uint64_t currentGen = g_snapshotGeneration.load(std::memory_order_acquire);
     bool iconsChanged = false;
     if (currentGen != localSnapGen) {
+        ULONGLONG tCopy0 = GetTickCount64();
         std::lock_guard<std::mutex> snapLock(g_snapshotMutex);
         snapshots = g_iconSnapshots;
         localSnapGen = currentGen;
         iconsChanged = true;
+        // [TEARDOWN v2.6.1] Measure the perceived teardown latency: the
+        // frame that FIRST draws the post-zoom snapshot list. Old shadows
+        // die exactly here — T+X after [ZOOM] IS the removal delay. Also
+        // times the vector copy itself and catches slow copies on
+        // non-zoom publishes (bounded, session-capped).
+        ULONGLONG copyMs = GetTickCount64() - tCopy0;
+        ULONGLONG zTick = g_lastZoomTick.load(std::memory_order_relaxed);
+        ULONGLONG sinceZoom = zTick ? (GetTickCount64() - zTick) : 0;
+        static int s_teardownLogged = 0;
+        if (s_teardownLogged < 24) {
+            if (zTick && sinceZoom < 5000) {
+                ++s_teardownLogged;
+                DiagLog(L"[TEARDOWN] post-zoom swap frame: T+%llums after [ZOOM], copy %llums, %zu snaps",
+                        sinceZoom, copyMs, snapshots.size());
+            } else if (copyMs > 3) {
+                ++s_teardownLogged;
+                DiagLog(L"[TEARDOWN] slow snapshot copy %llums (%zu snaps)", copyMs, snapshots.size());
+            }
+        }
     }
 
     bool forceRender = g_underlayForceRender.exchange(false, std::memory_order_relaxed);
@@ -8354,10 +10688,25 @@ void RenderUnderlayLoopInner() {
 
         // --- PASS 1: DRAW UNIFIED SHADOWS (NEW PIPELINE) ---
         if (shadowsVisible) {
+            // [TEARDOWN v2.6.1] Contention probe: this leaf mutex is held
+            // for the ENTIRE draw loop, and the post-zoom worker hammers
+            // it (177 SILFIRST publishes + preflight + GC). A stall here
+            // delays the teardown frame — the number tells us whether the
+            // perceived slow removal is lock racing or just frame cadence.
+            ULONGLONG tShadowLock0 = GetTickCount64();
             std::lock_guard<std::mutex> shadowLock(g_comboShadowCacheMutex);
+            ULONGLONG shadowLockStallMs = GetTickCount64() - tShadowLock0;
+            if (shadowLockStallMs > 5) {
+                DiagLog(L"[TEARDOWN] comboCache mutex stalled %llums before draw pass", shadowLockStallMs);
+            }
 
             for (const auto & snap : snapshots) {
                 if (snap.isDragged || snap.isPendingDrop) continue; // Suppress shadow at old spot during move
+                // [EDIT-SHADOW-OFF v2.7.3] While this item's label is being
+                // edited, no shadow at all: the glyph-shaped cutout was built
+                // from the pre-edit text and never tracks keystrokes. Skips
+                // regardless of LV state quirks during edit mode.
+                if (snap.lvIndex >= 0 && snap.lvIndex == g_editingLvIndex.load(std::memory_order_relaxed)) continue;
                 // Explorer keeps LVIS_SELECTED after the desktop deactivates, but
                 // the label collapses and no active selection box is drawn —
                 // shadow it like a normal collapsed icon there.
@@ -8374,7 +10723,7 @@ void RenderUnderlayLoopInner() {
                     static std::unordered_map<uint64_t, int> s_missingLogged;
                     if (g_shadowDiagWarm.load(std::memory_order_relaxed)) {
                         if (s_missingLogged[targetHash]++ < 3) {
-                            Wh_Log(L"[SHADOW] no assets for combo %llu (c=%llu e=%llu) expanded=%d '%s'",
+                            DiagLog(L"[SHADOW] no assets for combo %llu (c=%llu e=%llu) expanded=%d '%s'",
                                    (unsigned long long)targetHash,
                                    (unsigned long long)snap.comboHash_c,
                                    (unsigned long long)snap.comboHash_e,
@@ -8385,6 +10734,11 @@ void RenderUnderlayLoopInner() {
                     continue;
                 }
                 const ShadowCache& cache = it->second;
+                // [MULTIMON v2.9.4] Per-monitor render scale (D2 ruling:
+                // shadows stay PROPORTIONATE on secondary monitors — blur was
+                // baked primary-physical and is scaled down with the layer
+                // bitmaps below; length cap and stretch offset scale here).
+                float itemScale = GetItemMonitorScale(g_overlayWnd, snap.combinedRect);
 
                 float ix = snap.combinedRect.left + (snap.combinedRect.right - snap.combinedRect.left) / 2.0f;
                 float iy = snap.combinedRect.top + (snap.combinedRect.bottom - snap.combinedRect.top) / 2.0f;
@@ -8394,7 +10748,7 @@ void RenderUnderlayLoopInner() {
 
                 if (applyCull && dist > shadowCullRadius) continue;
 
-                float dynamicShadowLength = std::min(dist * 0.2f, maxShadowLength);
+                float dynamicShadowLength = std::min(dist * 0.2f, maxShadowLength * itemScale);
                 float edgeFade = 1.0f;
                 if (spotlightCull) {
                     // Fade completes at 40% of the cull radius; the rest is
@@ -8421,7 +10775,14 @@ void RenderUnderlayLoopInner() {
 
                 if (!cache.layers.empty()) {
                     int actualPasses = (int)cache.layers.size();
-                    float dynamicOffset = std::min((float)localSettings.shadowOffset * (dist / 800.0f), dynamicShadowLength);
+                    // [LENGTH-OFFSET DECOUPLE v2.8.2 — TEST] The offset used to
+                    // be clamped to dynamicShadowLength, welding the two
+                    // settings together: offset past the length silently did
+                    // nothing. Now the offset answers only to shadowOffset ×
+                    // (dist/800) — independent of shadowLength. Offset > length
+                    // = the tail STARTS away from the icon (detached-shadow
+                    // regime); Doc judges whether independence looks better.
+                    float dynamicOffset = (float)localSettings.shadowOffset * (dist / 800.0f) * itemScale;
 
                     for (int p = 1; p <= actualPasses; ++p) {
                         float stretchFraction = (float)p / actualPasses;
@@ -8448,6 +10809,12 @@ void RenderUnderlayLoopInner() {
                         if (!sl.bmp) continue;
 
                         // Anchor directly to the unified bounding box (icon + label)
+                        // [MULTIMON v2.9.6] Layers anchor NATIVE: the baked
+                        // canvas is already monitor-local (pc2 derives from
+                        // the live per-monitor cell) and the blur sigma is
+                        // now scaled at bake time. Only the settings-derived
+                        // stretch (stepOffset above) and the length cap stay
+                        // itemScale-scaled.
                         D2D1_POINT_2F targetOffset = D2D1::Point2F(
                             (float)snap.combinedRect.left + stepOffsetX - sl.offsetX,
                             (float)snap.combinedRect.top + stepOffsetY - sl.offsetY
@@ -8485,6 +10852,7 @@ void RenderUnderlayLoopInner() {
             int writeIdx = g_underlayWriteMaskIdx;
             ComPtr<ID2D1Bitmap1> maskTarget = g_sharedMask[writeIdx];
             if (maskTarget && g_maskScratchBitmap) {
+                ULONGLONG tMask0 = GetTickCount64(); // [PERF-AUDIT v2.2.6]
                 // 1. Draw all elements into the scratch mask using the single master composite texture!
             dc->SetTarget(g_maskScratchBitmap.Get());
             dc->Clear(D2D1::ColorF(0, 0, 0, 0));
@@ -8496,7 +10864,17 @@ void RenderUnderlayLoopInner() {
                 // — stamp the silhouette there, not a collapsed-sized RECT.
                 bool isSelected = (snap.state & LVIS_SELECTED) != 0 &&
                                   g_isDesktopActive.load(std::memory_order_relaxed);
-                if (isSelected || snap.pendingCollapse) {
+                // [FLASH-FIX v2.9.15] The collapse-hold RECT exists to cover
+                // Explorer's still-visible SELECTION BOX during a live label
+                // collapse — that box only exists while the desktop is
+                // ACTIVE. Punching it while inactive (focus moved to a
+                // window) left bare RECTANGLE cutouts on the 7 selected
+                // folders until the hold released — the flash Doc caught
+                // ([FLASH] rect-stamp hold=1 sel=0 receipts). Inactive =
+                // silhouette path, exactly as the comment below always said.
+                bool holdPunch = snap.pendingCollapse &&
+                                 g_isDesktopActive.load(std::memory_order_relaxed);
+                if (isSelected || holdPunch) {
                     if (g_whiteBitmap) {
                         // During a collapse hold we keep punching the selection-sized
                         // RECT so Explorer's lingering selection box stays uncovered.
@@ -8538,7 +10916,7 @@ void RenderUnderlayLoopInner() {
                                         masterBmp = altIt->second.sourceBmp;
                                         static std::unordered_map<uint64_t, int> s_altUsedLogged;
                                         if (s_altUsedLogged[targetHash]++ < 5) {
-                                            Wh_Log(L"[MASK] alt-state silhouette for combo %llu (alt %llu, c=%llu e=%llu) '%s'",
+                                            DiagLog(L"[MASK] alt-state silhouette for combo %llu (alt %llu, c=%llu e=%llu) '%s'",
                                                    (unsigned long long)targetHash,
                                                    (unsigned long long)altHash,
                                                    (unsigned long long)snap.comboHash_c,
@@ -8562,7 +10940,7 @@ void RenderUnderlayLoopInner() {
                             // explain why the composite never landed.
                             static std::unordered_map<uint64_t, int> s_rectFallbackLogged;
                             if (s_rectFallbackLogged[targetHash]++ < 3) {
-                                Wh_Log(L"[MASK] white-rect fallback: no silhouette for combo %llu (c=%llu e=%llu) '%s'",
+                                DiagLog(L"[MASK] white-rect fallback: no silhouette for combo %llu (c=%llu e=%llu) '%s'",
                                        (unsigned long long)targetHash,
                                        (unsigned long long)snap.comboHash_c,
                                        (unsigned long long)snap.comboHash_e,
@@ -8597,6 +10975,9 @@ void RenderUnderlayLoopInner() {
                 dc->Flush();
 
                 dc->SetTarget(target.Get());
+                // [PERF-AUDIT v2.2.6] mask rebuild cost on the render thread.
+                DiagLog(L"[MASKBUILD] mask rebuilt in %llu ms (%zu snapshots)",
+                        (unsigned long long)(GetTickCount64() - tMask0), snapshots.size());
 
                 // Flip the ping-pong buffer ONLY when we actually rebuilt it
                 g_activeSharedMaskIdx.store(writeIdx, std::memory_order_release);
@@ -8646,6 +11027,105 @@ void RenderUnderlayLoopInner() {
 // time to distinguish "host torn down" from "our window killed directly".
 static HWND g_overlayParentHwnd = nullptr;
 
+// [MULTIMON v2.9.4] Monitor-tile builder. The Shell renders the wallpaper
+// INDEPENDENTLY per monitor (each screen fits/crops the image against its
+// own dimensions — a 16:9 primary letterboxes differently than a 9:16
+// portrait). One union-wide fit matches neither screen, so the overlay
+// draws one tile per monitor, clipped. The tile vector itself is declared
+// with the wallpaper globals above; same g_renderMutex guard.
+// Runs on paths that already hold g_renderMutex, or lock it themselves
+// (WM_DISPLAYCHANGE).
+
+// Rebuild the tile table from the current display topology. Runs on paths
+// that already hold g_renderMutex, or lock it themselves (WM_DISPLAYCHANGE).
+// [MULTIMON v2.9.7] HARDENED after the display-sleep field case: a topology
+// churn can invalidate the cached parent hwnd (host recreation) or race the
+// origin probe — publishing tiles in SCREEN coords (origin=(0,0) fallback)
+// shifted the whole replica one monitor-width left, leaving the primary's
+// right quarter bare (log-receipt: tiles "origin=(0,0) (0,0)-(3840,2160)
+// (-1080,116)-(0,2036)" at wake). On ANY probe failure we now KEEP the last
+// good table instead of publishing garbage.
+static void BuildMonitorTiles() {
+    std::vector<MonitorTile> tiles;
+    POINT origin = {0, 0};
+    bool originValid = false;
+    HWND hParent = (g_overlayParentHwnd && IsWindow(g_overlayParentHwnd)) ? g_overlayParentHwnd
+                                                                          : GetDesktopParent();
+    if (hParent && IsWindow(hParent)) {
+        RECT rc = {};
+        if (GetClientRect(hParent, &rc) && ClientToScreen(hParent, &origin)) {
+            // origin = screen position of parent-client (0,0); children sit at
+            // parent-client (0,0), so overlay-local = screen - origin.
+            originValid = true;
+        }
+    }
+    if (!originValid) {
+        DiagLog(L"[MULTIMON] tiles probe FAILED (parent=%p alive=%d) - keeping last table",
+                (void*)hParent, (hParent && IsWindow(hParent)) ? 1 : 0);
+        return;
+    }
+    struct Ctx { POINT origin; std::vector<MonitorTile>* tiles; } ctx = { origin, &tiles };
+    auto cb = [](HMONITOR hMonitor, HDC, LPRECT, LPARAM lParam) -> BOOL {
+        Ctx* c = (Ctx*)lParam;
+        MONITORINFO mi = {};
+        mi.cbSize = sizeof(mi);
+        if (GetMonitorInfoW(hMonitor, &mi) && mi.rcMonitor.right > mi.rcMonitor.left && mi.rcMonitor.bottom > mi.rcMonitor.top) {
+            MonitorTile t;
+            t.rect.left   = mi.rcMonitor.left   - c->origin.x;
+            t.rect.top    = mi.rcMonitor.top    - c->origin.y;
+            t.rect.right  = mi.rcMonitor.right  - c->origin.x;
+            t.rect.bottom = mi.rcMonitor.bottom - c->origin.y;
+            c->tiles->push_back(t);
+        }
+        return TRUE;
+    };
+    EnumDisplayMonitors(nullptr, nullptr, cb, (LPARAM)&ctx);
+    g_monitorTiles = std::move(tiles);
+    Wh_Log(L"[MULTIMON] tiles built: %zu (origin %ld,%ld)", g_monitorTiles.size(), origin.x, origin.y);
+    {
+        std::wstring tileStr;
+        for (const auto& t : g_monitorTiles) {
+            wchar_t buf[96];
+            swprintf_s(buf, L"(%ld,%ld)-(%ld,%ld) ", t.rect.left, t.rect.top, t.rect.right, t.rect.bottom);
+            tileStr += buf;
+        }
+        DiagLog(L"[MULTIMON] tiles: %zu origin=(%ld,%ld) %s",
+                 g_monitorTiles.size(), origin.x, origin.y, tileStr.c_str());
+    }
+}
+
+// [MULTIMON v2.9.7] See forward declaration. The SetWindowPos calls fire the
+// windows' own WM_WINDOWPOSCHANGED handlers, which do the heavy lifting
+// (swapchain resize, dpi refresh, wallpaper refresh, tile rebuild, underlay
+// force-render) — this function only decides WHEN and anchors position.
+void RepairDesktopCoverage() {
+    if (g_unloading.load(std::memory_order_relaxed)) return;
+    if (!g_overlayWnd || !IsWindow(g_overlayWnd) || !g_underlayWnd || !IsWindow(g_underlayWnd)) return;
+    HWND hParent = (g_overlayParentHwnd && IsWindow(g_overlayParentHwnd)) ? g_overlayParentHwnd
+                                                                          : GetDesktopParent();
+    if (!hParent || !IsWindow(hParent)) return;
+    RECT rcParent = {};
+    if (!GetClientRect(hParent, &rcParent)) return;
+    int newWidth = rcParent.right - rcParent.left;
+    int newHeight = rcParent.bottom - rcParent.top;
+    if (newWidth <= 0 || newHeight <= 0) return;
+    RECT rcCur = {};
+    if (!GetClientRect(g_overlayWnd, &rcCur)) return;
+    int curW = rcCur.right - rcCur.left;
+    int curH = rcCur.bottom - rcCur.top;
+    if (curW == newWidth && curH == newHeight) return; // healthy: no-op
+    DiagLog(L"[MULTIMON] coverage repair: windows %dx%d -> parent %dx%d",
+            curW, curH, newWidth, newHeight);
+    SetWindowPos(g_overlayWnd, nullptr, 0, 0, newWidth, newHeight, SWP_NOZORDER | SWP_NOACTIVATE);
+    SetWindowPos(g_underlayWnd, nullptr, 0, 0, newWidth, newHeight, SWP_NOZORDER | SWP_NOACTIVATE);
+    HWND hLV = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        hLV = g_cachedHwndLV;
+    }
+    UpdateCachedImageList(hLV);
+}
+
 LRESULT CALLBACK OverlayWndProcInner(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     try {
@@ -8683,6 +11163,15 @@ LRESULT CALLBACK OverlayWndProcInner(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM
         case WM_TIMER:
             if (!g_unloading && wParam == TIMER_ID_STATE_POLL) RevalidateDesktopWindows();
             if (!g_unloading && wParam == TIMER_ID_COLLAPSE_POLL) QuickSnapshotStatePoll();
+            if (!g_unloading && wParam == TIMER_ID_ZOOM_SETTLE) {
+                // [SLITHER v2.5.2] Post-zoom settle re-measure: the poll
+                // re-reads live rects and re-syncs any that moved under it
+                // (the probe proved the pass publishes ~2px-high rects when
+                // it beats Explorer's settle). One shot.
+                KillTimer(hWnd, TIMER_ID_ZOOM_SETTLE);
+                DiagLog(L"[SLITHER] zoom settle re-poll fired");
+                QuickSnapshotStatePoll();
+            }
             if (!g_unloading && wParam >= TIMER_ID_FOCUS_RETRY && wParam <= TIMER_ID_FOCUS_RETRY + 2) {
                 KillTimer(hWnd, wParam);
                 g_selectionUpdatePending.store(true, std::memory_order_relaxed);
@@ -8694,6 +11183,12 @@ LRESULT CALLBACK OverlayWndProcInner(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM
              Wh_Log(L"[TIMER] SNAP_RETRY fired -> triggering snapshot update");
              g_snapshotUpdatePending.store(true, std::memory_order_relaxed);
              PostMessageW(hWnd, WM_APP_SNAPSHOT_UPDATE, 0, 0);
+             // The drag also moved the SELECTION GLOW: g_selectedRects is only
+             // refreshed by WM_APP_SELECTION_UPDATE, and a pure icon move
+             // never changes the selection — so the glow sat at the pre-drag
+             // spot until focus changed. Re-read the rects after the snap.
+             g_selectionUpdatePending.store(true, std::memory_order_relaxed);
+             PostMessageW(hWnd, WM_APP_SELECTION_UPDATE, 0, 0);
          }
             return 0;
 
@@ -8707,7 +11202,8 @@ LRESULT CALLBACK OverlayWndProcInner(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM
                     g_overlayWidth  = (UINT)wp->cx;
                     g_overlayHeight = (UINT)wp->cy;
 
-                    g_dpiScale = GetMonitorDpiScale(GetWorkerWMonitor());
+                    g_dpiScale = GetMonitorDpiScale(GetPrimaryMonitor());
+                    BuildMonitorTiles(); // [MULTIMON v2.9.4]
 
                     ResizeSwapChain(wp->cx, wp->cy);
                     RefreshWallpaperAndStyle();
@@ -8767,6 +11263,30 @@ LRESULT CALLBACK MessageWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPar
 }
 
 LRESULT CALLBACK MessageWndProcInner(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    if (uMsg == WM_APP_FOCUSSTORM) {
+        // [FOCUS-STORM HACK] Fire the focus storm on the UI thread. Intermediate
+        // target = our own overlay window (topmost, click-transparent). If the
+        // overlay can't take focus (WS_EX_NOACTIVATE policies vary), fall back
+        // to the taskbar. Then hand focus back to the desktop ListView.
+        HWND hLV = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            hLV = g_cachedHwndLV;
+        }
+        if (hLV && IsWindow(hLV) && !g_unloading) {
+            HWND prev = GetForegroundWindow();
+            BOOL toOverlay = SetForegroundWindow(g_overlayWnd);
+            if (!toOverlay || GetForegroundWindow() != g_overlayWnd) {
+                HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
+                toOverlay = tray ? SetForegroundWindow(tray) : FALSE;
+            }
+            BOOL back = SetForegroundWindow(hLV);
+            DiagLog(L"[STORM] focus toggle: prev=%p mid=%d back=%d fgNow=%p",
+                    (void*)prev, (int)toOverlay, (int)back,
+                    (void*)GetForegroundWindow());
+        }
+        return 0;
+    }
     if (uMsg == WM_APP_DEFERRED_INIT) {
         if (!g_unloading) {
             ULONGLONG t0 = GetTickCount64();
@@ -8847,6 +11367,24 @@ LRESULT CALLBACK MessageWndProcInner(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM
         return 0;
     }
 
+    // [VD-DIAG] name every broadcast/refresh arriving at the message window
+    if (uMsg == WM_SETTINGCHANGE || uMsg == WM_THEMECHANGED ||
+        uMsg == WM_APP_TRIGGER_REFRESH || uMsg == WM_DISPLAYCHANGE) {
+        DiagLog(L"[MSGWND] uMsg=%u wParam=%llu lParamStr='%s'",
+                uMsg, (unsigned long long)wParam,
+                (uMsg == WM_SETTINGCHANGE && lParam) ? (const wchar_t*)lParam : L"");
+    }
+    // [VD-FIX 2026-11-01] WM_SETTINGCHANGE arriving here directly is rare (the
+    // desktop-chain forwarder is the usual path), but the same stringless VD
+    // broadcast could hit this top-level window too. Same rule as the
+    // forwarder: only real theme strings earn the heavy wipe; everything else
+    // is ignored (its string is already logged by the [MSGWND] station above).
+    if (uMsg == WM_SETTINGCHANGE) {
+        const wchar_t* area = lParam ? (const wchar_t*)lParam : L"";
+        bool isTheme = _wcsicmp(area, L"WindowsThemeElement") == 0 ||
+                       _wcsicmp(area, L"ImmersiveColorSet") == 0;
+        if (!isTheme) return 0;
+    }
  if (uMsg == WM_APP_TRIGGER_REFRESH || uMsg == WM_THEMECHANGED || uMsg == WM_SETTINGCHANGE) {
      if (!g_unloading && g_overlayWnd) {
 
@@ -8865,6 +11403,10 @@ LRESULT CALLBACK MessageWndProcInner(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM
 
             // Re-arm grace window so progressive icon resolution runs for all items
             g_startupGracePeriod.store(true, std::memory_order_release);
+
+            // [VD-DIAG] mark that the heavy wipe actually ran, and why
+            DiagLog(L"[WIPE] heavy cache wipe: uMsg=%u wParam=%llu",
+                    uMsg, (unsigned long long)wParam);
 
             // Wipe icon and shadow caches so in-place theme changes (This PC, Recycle Bin) re-extract
             {
@@ -9006,28 +11548,14 @@ LRESULT CALLBACK MessageWndProcInner(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM
 
         case WM_DISPLAYCHANGE:
             BootLog(L"[BOOT] WM_DISPLAYCHANGE (wparam=%llu)", (unsigned long long)wParam);
+            // [MULTIMON v2.9.7] Same repair as the heartbeat watchdog — one
+            // code path for both broadcast-driven and polled healing.
             if (!g_unloading && g_overlayWnd && g_underlayWnd) {
-                HWND hParent = GetDesktopParent();
-                if (hParent) {
-                    RECT rcParent = {};
-                    GetClientRect(hParent, &rcParent);
-                    int newWidth = rcParent.right - rcParent.left;
-                    int newHeight = rcParent.bottom - rcParent.top;
-
-                    RECT currentRect = {0};
-                    GetClientRect(g_overlayWnd, &currentRect);
-                    int currentWidth = currentRect.right - currentRect.left;
-                    int currentHeight = currentRect.bottom - currentRect.top;
-
-                    if (newWidth != currentWidth || newHeight != currentHeight) {
-                        SetWindowPos(g_overlayWnd, nullptr, 0, 0, newWidth, newHeight, SWP_NOZORDER | SWP_NOACTIVATE);
-                        SetWindowPos(g_underlayWnd, nullptr, 0, 0, newWidth, newHeight, SWP_NOZORDER | SWP_NOACTIVATE);
-                    }
+                {
+                    std::lock_guard<std::mutex> lock(g_renderMutex);
+                    BuildMonitorTiles(); // topology may have changed even at the same union size
                 }
-
-                HWND hLV = nullptr;
-                { std::lock_guard<std::mutex> lock(g_stateMutex); hLV = g_cachedHwndLV; }
-                UpdateCachedImageList(hLV);
+                RepairDesktopCoverage();
             }
             break;
 
@@ -9202,6 +11730,7 @@ void CreateOverlayWindow() {
         g_overlayWidth  = (UINT)width;
         g_overlayHeight = (UINT)height;
         g_overlayParentHwnd = GetParent(g_overlayWnd);
+        BuildMonitorTiles(); // [MULTIMON v2.9.4] initial tile table
     }
 
     {
@@ -9608,67 +12137,347 @@ static void ResolveTintColor(PCWSTR presetName, PCWSTR customHex, D2D1_COLOR_F& 
     out = D2D1::ColorF(0x0D / 255.0f, 0x1B / 255.0f, 0x2A / 255.0f, 1.0f);
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// Ab Tenebris config file (the windhawk2-era settings store)
+//
+// The settings window (tool mod) OWNS this file; the engine only reads it,
+// plus a one-time self-import when it doesn't exist yet (writes the current
+// Windhawk settings values out — the import tool is the fallback loader).
+// Keys mirror the Windhawk settings keys exactly. Missing keys inside the
+// file fall back to the Windhawk BIOS block (bootstrap contract: the engine
+// still boots sane if the tool mod is absent/disabled or the file is broken).
+
+static const wchar_t kAbTenebrisDirName[] = L"AbTenebris";
+static const wchar_t kAbTenebrisCfgName[] = L"settings.cfg";
+
+struct CfgKeyEntry { PCWSTR key; bool isString; };
+// Order here = file layout order. isString keys are stored verbatim (the
+// Windhawk-side fallback reads them through Wh_GetStringSetting).
+static const CfgKeyEntry kCfgKeys[] = {
+    {L"Shadows.enableShadows", false},
+    {L"Shadows.shadowLength", false},
+    {L"Shadows.shadowPasses", false},
+    {L"Shadows.shadowBaseAlpha", false},
+    {L"Shadows.shadowBlur", false},
+    {L"Shadows.shadowTailSoftness", false},
+    {L"Shadows.shadowTailOpacity", false},
+    {L"Shadows.shadowTailScale", false},
+    {L"Shadows.shadowOffset", false},
+    {L"Shadows.shadowGlobalTracking", false},
+    {L"Shadows.shadowFadeInDuration", false},
+    {L"Shadows.shadowFadeOutDuration", false},
+    {L"Spotlight.enableSpotlight", false},
+    {L"Spotlight.idleOpacity", false},
+    {L"Spotlight.overlayClipToIcons", false},
+    {L"Spotlight.spotlightRadius", false},
+    {L"Spotlight.spotlightRoundness", false},
+    {L"Spotlight.spotlightBlur", false},
+    {L"Spotlight.idleDelay", false},
+    {L"Spotlight.spotlightFadeInDuration", false},
+    {L"Spotlight.spotlightFadeOutDuration", false},
+    {L"Spotlight.mouseSmoothing", false},
+    {L"Tint.tintEnabled", false},
+    {L"Tint.tintStrength", false},
+    {L"Tint.tintPreset", true},
+    {L"Tint.tintColorHex", true},
+    {L"Selection.enableSelectionGlow", false},
+    {L"Selection.selectionOpacity", false},
+    {L"Selection.selectionPadding", false},
+    {L"Selection.selectionRoundness", false},
+    {L"Selection.selectionBlur", false},
+    {L"Selection.selectionTimeout", false},
+    {L"Selection.selectionFadeInDuration", false},
+    {L"Selection.selectionFadeOutDuration", false},
+    {L"Toggle.toggleOnDoubleClick", false},
+    {L"Toggle.toggleFadeInDuration", false},
+    {L"Toggle.toggleFadeOutDuration", false},
+    {L"General.targetFps", false},
+    {L"General.cacheMode", false},
+    {L"General.customArrowScale", false},
+    {L"General.customArrowOffsetX", false},
+    {L"General.customArrowOffsetY", false},
+    {L"batSignalEnabled", false},
+    {L"batSignalStyle", true},
+    {L"batLogoBlur", true},   // "auto" or a number — string on purpose
+};
+
+static std::wstring GetAbTenebrisConfigDir() {
+    std::wstring dir;
+    PWSTR local = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &local))) {
+        dir = std::wstring(local) + L"\\" + kAbTenebrisDirName;
+        CoTaskMemFree(local);
+    }
+    return dir;
+}
+
+static std::wstring GetAbTenebrisConfigPath() {
+    std::wstring dir = GetAbTenebrisConfigDir();
+    if (dir.empty()) return dir;
+    return dir + L"\\" + kAbTenebrisCfgName;
+}
+
+static void TrimWstring(std::wstring& s) {
+    size_t b = s.find_first_not_of(L" \t\r\n");
+    if (b == std::wstring::npos) { s.clear(); return; }
+    size_t e = s.find_last_not_of(L" \t\r\n");
+    s = s.substr(b, e - b + 1);
+}
+
+// Reads key=value lines (UTF-16 LE with BOM, or UTF-8). Returns false only
+// when the file couldn't be opened. An empty/unparseable file yields an
+// empty map — every key then falls back to the Windhawk block.
+static bool ReadAbTenebrisConfig(const std::wstring& path,
+                                 std::unordered_map<std::wstring, std::wstring>& out) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    std::wstring content;
+    LARGE_INTEGER size{};
+    if (GetFileSizeEx(h, &size) && size.QuadPart > 0 && size.QuadPart < 1024 * 1024) {
+        std::vector<char> bytes((size_t)size.QuadPart);
+        DWORD got = 0;
+        if (ReadFile(h, bytes.data(), (DWORD)bytes.size(), &got, nullptr) && got >= 2) {
+            const unsigned char* p = (const unsigned char*)bytes.data();
+            if (p[0] == 0xFF && p[1] == 0xFE) {
+                content.assign((const wchar_t*)(p + 2), (got - 2) / 2);
+            } else {
+                int wlen = MultiByteToWideChar(CP_UTF8, 0, (const char*)p, got, nullptr, 0);
+                if (wlen > 0) {
+                    std::wstring w(wlen, L'\0');
+                    MultiByteToWideChar(CP_UTF8, 0, (const char*)p, got, &w[0], wlen);
+                    content = std::move(w);
+                }
+            }
+        }
+    }
+    CloseHandle(h);
+
+    size_t pos = 0;
+    while (pos < content.size()) {
+        size_t eol = content.find(L'\n', pos);
+        size_t end = (eol == std::wstring::npos) ? content.size() : eol;
+        std::wstring line = content.substr(pos, end - pos);
+        pos = (eol == std::wstring::npos) ? content.size() : eol + 1;
+        TrimWstring(line);
+        if (line.empty() || line[0] == L';' || line[0] == L'#') continue;
+        size_t eq = line.find(L'=');
+        if (eq == std::wstring::npos) continue;
+        std::wstring key = line.substr(0, eq);
+        std::wstring val = line.substr(eq + 1);
+        TrimWstring(key);
+        TrimWstring(val);
+        if (!key.empty()) out[std::move(key)] = std::move(val);
+    }
+    return true;
+}
+
+// Atomic write per house style: temp file + MoveFileExW (AV keeps temp files
+// busy; the move retries are cheap and the watcher's LastWriteTime compare
+// ignores intermediate states anyway).
+static bool WriteAbTenebrisConfig(const std::unordered_map<std::wstring, std::wstring>& kv) {
+    std::wstring dir = GetAbTenebrisConfigDir();
+    if (dir.empty()) return false;
+    CreateDirectoryW(dir.c_str(), nullptr);
+    std::wstring tmp = dir + L"\\settings.cfg.tmp";
+    std::wstring final = dir + L"\\" + kAbTenebrisCfgName;
+
+    HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    WORD bom = 0xFEFF;
+    DWORD wrote = 0;
+    WriteFile(h, &bom, sizeof(bom), &wrote, nullptr);
+
+    std::wstring body;
+    for (const auto& e : kCfgKeys) {
+        auto it = kv.find(e.key);
+        if (it == kv.end()) continue;
+        body += e.key;
+        body += L'=';
+        body += it->second;
+        body += L"\r\n";
+    }
+    BOOL ok = WriteFile(h, body.data(), (DWORD)(body.size() * sizeof(wchar_t)), &wrote, nullptr);
+    CloseHandle(h);
+    if (!ok) { DeleteFileW(tmp.c_str()); return false; }
+    return MoveFileExW(tmp.c_str(), final.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+}
+
+// One-time import: snapshot the current Windhawk BIOS values into the file.
+static bool ImportAbTenebrisConfigFromWindhawk() {
+    std::unordered_map<std::wstring, std::wstring> kv;
+    wchar_t buf[32];
+    for (const auto& e : kCfgKeys) {
+        if (e.isString) {
+            PCWSTR s = Wh_GetStringSetting(e.key);
+            kv[e.key] = (s && *s) ? s : L"";
+            Wh_FreeStringSetting(s);
+        } else {
+            swprintf(buf, 32, L"%d", Wh_GetIntSetting(e.key));
+            kv[e.key] = buf;
+        }
+    }
+    bool ok = WriteAbTenebrisConfig(kv);
+    Wh_Log(L"[CFG] self-import %hs", ok ? L"written" : L"FAILED");
+    return ok;
+}
+
+// --- config-file watcher ---------------------------------------------------
+// Watches %LOCALAPPDATA%\AbTenebris for settings.cfg changes (the settings
+// window writes it) and re-runs the settings pipeline. Same lifecycle as the
+// registry watcher: started from StartAuxThreads (desktop-owner gated),
+// stopped via g_hCfgStopEvent + g_unloading.
+
+void ApplySettingsChanges(); // forward: defined after LoadSettings (non-static, matches decl)
+
+void ConfigWatcherThreadProcInner() {
+    auto queryWrite = [&]() -> ULONGLONG {
+        WIN32_FILE_ATTRIBUTE_DATA fa{};
+        std::wstring path = GetAbTenebrisConfigPath();
+        if (path.empty() ||
+            !GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fa)) return 0;
+        return ((ULONGLONG)fa.ftLastWriteTime.dwHighDateTime << 32) |
+                (ULONGLONG)fa.ftLastWriteTime.dwLowDateTime;
+    };
+    ULONGLONG lastSeen = queryWrite();
+
+    HANDLE hChange = INVALID_HANDLE_VALUE;
+    while (!g_unloading) {
+        if (hChange == INVALID_HANDLE_VALUE) {
+            std::wstring dir = GetAbTenebrisConfigDir();
+            if (!dir.empty()) {
+                hChange = FindFirstChangeNotificationW(
+                    dir.c_str(), FALSE,
+                    FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_FILE_NAME |
+                    FILE_NOTIFY_CHANGE_SIZE);
+            }
+            if (hChange == INVALID_HANDLE_VALUE) {
+                // Directory may not exist yet (tool mod not installed); retry.
+                if (WaitForSingleObject(g_hCfgStopEvent, 5000) == WAIT_OBJECT_0) break;
+                continue;
+            }
+        }
+
+        HANDLE waits[2] = { hChange, g_hCfgStopEvent };
+        DWORD w = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+        if (w == WAIT_OBJECT_0 + 1 || g_unloading) break;
+        if (w != WAIT_OBJECT_0) break;
+
+        // Debounce: temp+rename writes fire several notifications. Drain the
+        // burst (each signal needs FindNext to rearm), then apply once.
+        for (int i = 0; i < 20 && !g_unloading; ++i) {
+            if (WaitForSingleObject(hChange, 150) != WAIT_OBJECT_0) break;
+            FindNextChangeNotification(hChange);
+        }
+        FindNextChangeNotification(hChange);
+
+        ULONGLONG now = queryWrite();
+        if (now != lastSeen && !g_unloading) {
+            lastSeen = now;
+            DiagLog(L"[CFG] settings.cfg changed -> reload");
+            ApplySettingsChanges();
+        }
+    }
+    if (hChange != INVALID_HANDLE_VALUE) FindCloseChangeNotification(hChange);
+}
+
+void ConfigWatcherThreadProc() {
+    try {
+        ConfigWatcherThreadProcInner();
+    } catch (const std::exception& e) {
+        Wh_Log(L"[CRASH-GUARD] ConfigWatcher exception: %hs", e.what());
+    } catch (...) {
+        Wh_Log(L"[CRASH-GUARD] ConfigWatcher unknown exception");
+    }
+}
+
 void LoadSettings() {
+    // Ab Tenebris config file first; per-key fallback to the Windhawk block
+    // (bootstrap). Missing file = one-time self-import from Windhawk values.
+    std::wstring cfgPath = GetAbTenebrisConfigPath();
+    std::unordered_map<std::wstring, std::wstring> cfg;
+    if (cfgPath.empty() || !ReadAbTenebrisConfig(cfgPath, cfg) || cfg.empty()) {
+        ImportAbTenebrisConfigFromWindhawk();
+        if (!cfgPath.empty()) ReadAbTenebrisConfig(cfgPath, cfg);
+    }
+    auto cfgInt = [&](PCWSTR key) -> int {
+        auto it = cfg.find(key);
+        return (it != cfg.end()) ? _wtoi(it->second.c_str()) : Wh_GetIntSetting(key);
+    };
+    auto cfgIntDef = [&](PCWSTR key, int def) -> int {
+        auto it = cfg.find(key);
+        return (it != cfg.end()) ? _wtoi(it->second.c_str()) : def;
+    };
+    auto cfgStr = [&](PCWSTR key) -> std::wstring {
+        auto it = cfg.find(key);
+        if (it != cfg.end()) return it->second;
+        PCWSTR s = Wh_GetStringSetting(key);
+        std::wstring r = (s && *s) ? s : L"";
+        Wh_FreeStringSetting(s);
+        return r;
+    };
+
     Settings s;
-    s.enableShadows            = Wh_GetIntSetting(L"Shadows.enableShadows") != 0;
-    s.enableSpotlight          = Wh_GetIntSetting(L"Spotlight.enableSpotlight") != 0;
-    s.enableSelectionGlow      = Wh_GetIntSetting(L"Selection.enableSelectionGlow") != 0;
-    s.idleOpacity              = std::clamp(Wh_GetIntSetting(L"Spotlight.idleOpacity"), 0, 255);
-    s.overlayClipToIcons       = Wh_GetIntSetting(L"Spotlight.overlayClipToIcons") != 0;
-    s.spotlightRadius          = std::max(Wh_GetIntSetting(L"Spotlight.spotlightRadius"), 10);
-    s.spotlightRoundness       = std::clamp(Wh_GetIntSetting(L"Spotlight.spotlightRoundness"), 0, 100);
-    s.spotlightBlur            = std::max(Wh_GetIntSetting(L"Spotlight.spotlightBlur"), 0);
-    s.idleDelay                = std::max(Wh_GetIntSetting(L"Spotlight.idleDelay"), 0);
-    s.spotlightFadeInDuration  = std::max(Wh_GetIntSetting(L"Spotlight.spotlightFadeInDuration"), 0);
-    s.spotlightFadeOutDuration = std::max(Wh_GetIntSetting(L"Spotlight.spotlightFadeOutDuration"), 0);
-    s.mouseSmoothing           = std::clamp(Wh_GetIntSetting(L"Spotlight.mouseSmoothing"), 0, 20);
-    s.selectionOpacity         = std::clamp(Wh_GetIntSetting(L"Selection.selectionOpacity"), 0, 255);
-    s.selectionPadding         = std::max(Wh_GetIntSetting(L"Selection.selectionPadding"), 0);
-    s.selectionRoundness       = std::clamp(Wh_GetIntSetting(L"Selection.selectionRoundness"), 0, 100);
-    s.selectionBlur            = std::clamp(Wh_GetIntSetting(L"Selection.selectionBlur"), 0, 100);
-    s.selectionTimeout         = std::max(Wh_GetIntSetting(L"Selection.selectionTimeout"), 0);
-    s.selectionFadeInDuration  = std::max(Wh_GetIntSetting(L"Selection.selectionFadeInDuration"), 0);
-    s.selectionFadeOutDuration = std::max(Wh_GetIntSetting(L"Selection.selectionFadeOutDuration"), 0);
-    s.toggleOnDoubleClick      = Wh_GetIntSetting(L"Toggle.toggleOnDoubleClick") != 0;
-    s.toggleFadeInDuration     = std::max(Wh_GetIntSetting(L"Toggle.toggleFadeInDuration"), 0);
-    s.toggleFadeOutDuration    = std::max(Wh_GetIntSetting(L"Toggle.toggleFadeOutDuration"), 0);
-    s.shadowLength             = std::max(Wh_GetIntSetting(L"Shadows.shadowLength"), 0);
-    s.shadowPasses             = std::clamp(Wh_GetIntSetting(L"Shadows.shadowPasses"), 1, 64);
-    s.shadowBaseAlpha          = std::clamp(Wh_GetIntSetting(L"Shadows.shadowBaseAlpha"), 0, 255);
-    s.shadowBlur               = std::max(Wh_GetIntSetting(L"Shadows.shadowBlur"), 0);
-    s.shadowTailSoftness       = std::clamp(Wh_GetIntSetting(L"Shadows.shadowTailSoftness"), 0, 100);
-    s.shadowTailOpacity        = std::clamp(Wh_GetIntSetting(L"Shadows.shadowTailOpacity"), 0, 100);
-    s.shadowTailScale         = std::clamp(Wh_GetIntSetting(L"Shadows.shadowTailScale"), -100, 100);
-    s.shadowOffset             = std::clamp(Wh_GetIntSetting(L"Shadows.shadowOffset"), 0, 500);
-    s.shadowGlobalTracking     = Wh_GetIntSetting(L"Shadows.shadowGlobalTracking") != 0;
-    s.shadowFadeInDuration     = std::max(Wh_GetIntSetting(L"Shadows.shadowFadeInDuration"), 0);
-    s.shadowFadeOutDuration    = std::max(Wh_GetIntSetting(L"Shadows.shadowFadeOutDuration"), 0);
-    s.targetFps                = std::clamp(Wh_GetIntSetting(L"General.targetFps"), 15, 360);
-    s.cacheMode                = std::clamp(Wh_GetIntSetting(L"General.cacheMode"), 0, 2);
-    s.customArrowScale         = std::clamp(Wh_GetIntSetting(L"General.customArrowScale"), 10, 200);
-    s.customArrowOffsetX       = std::clamp(Wh_GetIntSetting(L"General.customArrowOffsetX"), -200, 200);
-    s.customArrowOffsetY       = std::clamp(Wh_GetIntSetting(L"General.customArrowOffsetY"), -200, 200);
+    s.enableShadows            = cfgInt(L"Shadows.enableShadows") != 0;
+    s.enableSpotlight          = cfgInt(L"Spotlight.enableSpotlight") != 0;
+    s.enableSelectionGlow      = cfgInt(L"Selection.enableSelectionGlow") != 0;
+    s.idleOpacity              = std::clamp(cfgInt(L"Spotlight.idleOpacity"), 0, 255);
+    s.overlayClipToIcons       = cfgInt(L"Spotlight.overlayClipToIcons") != 0;
+    s.spotlightRadius          = std::max(cfgInt(L"Spotlight.spotlightRadius"), 10);
+    s.spotlightRoundness       = std::clamp(cfgInt(L"Spotlight.spotlightRoundness"), 0, 100);
+    s.spotlightBlur            = std::max(cfgInt(L"Spotlight.spotlightBlur"), 0);
+    s.idleDelay                = std::max(cfgInt(L"Spotlight.idleDelay"), 0);
+    s.spotlightFadeInDuration  = std::max(cfgInt(L"Spotlight.spotlightFadeInDuration"), 0);
+    s.spotlightFadeOutDuration = std::max(cfgInt(L"Spotlight.spotlightFadeOutDuration"), 0);
+    s.mouseSmoothing           = std::clamp(cfgInt(L"Spotlight.mouseSmoothing"), 0, 20);
+    s.selectionOpacity         = std::clamp(cfgInt(L"Selection.selectionOpacity"), 0, 255);
+    s.selectionPadding         = std::max(cfgInt(L"Selection.selectionPadding"), 0);
+    s.selectionRoundness       = std::clamp(cfgInt(L"Selection.selectionRoundness"), 0, 100);
+    s.selectionBlur            = std::clamp(cfgInt(L"Selection.selectionBlur"), 0, 100);
+    s.selectionTimeout         = std::max(cfgInt(L"Selection.selectionTimeout"), 0);
+    s.selectionFadeInDuration  = std::max(cfgInt(L"Selection.selectionFadeInDuration"), 0);
+    s.selectionFadeOutDuration = std::max(cfgInt(L"Selection.selectionFadeOutDuration"), 0);
+    s.toggleOnDoubleClick      = cfgInt(L"Toggle.toggleOnDoubleClick") != 0;
+    s.overlayEnabled           = cfgIntDef(L"Toggle.overlayEnabled", 1) != 0;
+    s.toggleFadeInDuration     = std::max(cfgInt(L"Toggle.toggleFadeInDuration"), 0);
+    s.toggleFadeOutDuration    = std::max(cfgInt(L"Toggle.toggleFadeOutDuration"), 0);
+    s.shadowLength             = std::max(cfgInt(L"Shadows.shadowLength"), 0);
+    s.shadowPasses             = std::clamp(cfgInt(L"Shadows.shadowPasses"), 1, 64);
+    s.shadowBaseAlpha          = std::clamp(cfgInt(L"Shadows.shadowBaseAlpha"), 0, 255);
+    s.shadowBlur               = std::max(cfgInt(L"Shadows.shadowBlur"), 0);
+    s.shadowTailSoftness       = std::clamp(cfgInt(L"Shadows.shadowTailSoftness"), 0, 100);
+    s.shadowTailOpacity        = std::clamp(cfgInt(L"Shadows.shadowTailOpacity"), 0, 100);
+    s.shadowTailScale         = std::clamp(cfgInt(L"Shadows.shadowTailScale"), -100, 100);
+    s.shadowOffset             = std::clamp(cfgInt(L"Shadows.shadowOffset"), 0, 500);
+    s.shadowGlobalTracking     = cfgInt(L"Shadows.shadowGlobalTracking") != 0;
+    s.shadowFadeInDuration     = std::max(cfgInt(L"Shadows.shadowFadeInDuration"), 0);
+    s.shadowFadeOutDuration    = std::max(cfgInt(L"Shadows.shadowFadeOutDuration"), 0);
+    s.targetFps                = std::clamp(cfgInt(L"General.targetFps"), 15, 360);
+    s.cacheMode                = std::clamp(cfgInt(L"General.cacheMode"), 0, 2);
+    s.customArrowEnabled       = cfgIntDef(L"General.customArrowEnabled", 1) != 0;
+    s.customArrowScale         = std::clamp(cfgInt(L"General.customArrowScale"), 10, 200);
+    s.customArrowOffsetX       = std::clamp(cfgInt(L"General.customArrowOffsetX"), -200, 200);
+    s.customArrowOffsetY       = std::clamp(cfgInt(L"General.customArrowOffsetY"), -200, 200);
 
     // Overlay tint
-    s.tintEnabled              = Wh_GetIntSetting(L"Tint.tintEnabled") != 0;
-    s.tintStrength             = std::clamp(Wh_GetIntSetting(L"Tint.tintStrength"), 0, 100);
-    PCWSTR tintPreset          = Wh_GetStringSetting(L"Tint.tintPreset");
-    PCWSTR tintHex             = Wh_GetStringSetting(L"Tint.tintColorHex");
-    ResolveTintColor(tintPreset, tintHex, s.tintColor);
-    Wh_FreeStringSetting(tintPreset);
-    Wh_FreeStringSetting(tintHex);
+    s.tintEnabled              = cfgInt(L"Tint.tintEnabled") != 0;
+    s.tintStrength             = std::clamp(cfgInt(L"Tint.tintStrength"), 0, 100);
+    std::wstring tintPreset    = cfgStr(L"Tint.tintPreset");
+    std::wstring tintHex       = cfgStr(L"Tint.tintColorHex");
+    ResolveTintColor(tintPreset.c_str(), tintHex.c_str(), s.tintColor);
 
     // 🦇 The signal demands a perfectly round projection. Edge blur is NOT
     // forced: the user's blur slider drives both the spotlight edge and the
     // bat silhouette (which uses half of it), keeping them visually linked.
-    s.batSignalEnabled = Wh_GetIntSetting(L"batSignalEnabled") != 0;
-    PCWSTR batStyleStr = Wh_GetStringSetting(L"batSignalStyle");
-    s.batStyle = wcscmp(batStyleStr, L"🦇🦇") == 0 ? 1 :
-                 wcscmp(batStyleStr, L"🦇🦇🦇") == 0 ? 2 : 0;
-    Wh_FreeStringSetting(batStyleStr);
-    PCWSTR batLogoBlurStr = Wh_GetStringSetting(L"batLogoBlur");
-    s.batLogoBlur = wcscmp(batLogoBlurStr, L"auto") == 0 ? -1 : _wtoi(batLogoBlurStr);
-    Wh_FreeStringSetting(batLogoBlurStr);
+    s.batSignalEnabled = cfgInt(L"batSignalEnabled") != 0;
+    std::wstring batStyleStr = cfgStr(L"batSignalStyle");
+    s.batStyle = batStyleStr == L"🦇🦇" ? 1 :
+                 batStyleStr == L"🦇🦇🦇" ? 2 : 0;
+    std::wstring batLogoBlurStr = cfgStr(L"batLogoBlur");
+    s.batLogoBlur = batLogoBlurStr == L"auto" ? -1 : _wtoi(batLogoBlurStr.c_str());
     if (s.batSignalEnabled) {
         s.spotlightRoundness = 100;
         // An explicit logo blur drives the spotlight edge blur too (the logo
@@ -9691,6 +12500,11 @@ void LoadSettings() {
                                  s.customArrowOffsetX != g_settings.customArrowOffsetX ||
                                  s.customArrowOffsetY != g_settings.customArrowOffsetY);
     s_isFirstSettingsLoad = false;
+    // [P1.1] Tell Wh_ModSettingsChanged whether the skip guard must stand
+    // down. First load is suppressed: at mod boot the mirror is empty
+    // anyway, and an install-time settings reload changes nothing.
+    g_bakedInputsChanged.store(shadowBakeChanged || arrowSettingsChanged,
+                               std::memory_order_relaxed);
 
     // 1. Update settings under g_renderMutex and release immediately (prevents deadlocks!)
     {
@@ -9712,7 +12526,7 @@ void LoadSettings() {
     if (cacheModeChanged) {
         if (s.cacheMode == 0) {
             g_diskCache.ClearMemoryCache();
-            DeleteFileW(g_diskCache.GetCacheFilePath().c_str());
+            g_diskCache.DeleteAllZoomCacheFiles(); // [STAGE A v2.4.2] all zoom files
         } else {
             // Entering single/multi mode: reuse whatever is already in memory.
             // Single-profile keeps only the CURRENT state's profile (computed
@@ -9738,7 +12552,7 @@ void LoadSettings() {
     } else if (shadowBakeChanged) {
         if (s.cacheMode == 1) {
             g_diskCache.ClearMemoryCache();
-            DeleteFileW(g_diskCache.GetCacheFilePath().c_str());
+            g_diskCache.DeleteAllZoomCacheFiles(); // [STAGE A v2.4.2] all zoom files
         }
     }
 
@@ -9855,6 +12669,10 @@ void RegistryWatcherThreadInner() {
          WPARAM refreshTag = (res == WAIT_OBJECT_0 + 2 || res == WAIT_OBJECT_0 + 3)
                              ? REFRESH_TAG_WALLPAPER : REFRESH_TAG_FULL;
 
+         // [VD-DIAG] name the registry key that fired
+         DiagLog(L"[REGWATCH] key event %d -> tag %u",
+                 (int)(res - WAIT_OBJECT_0), (unsigned)refreshTag);
+
          if (g_messageWnd) {
              PostMessageW(g_messageWnd, WM_APP_TRIGGER_REFRESH, refreshTag, 0);
          }
@@ -9931,10 +12749,12 @@ void FolderWatcherThreadProcInner() {
             DWORD idx = res - WAIT_OBJECT_0;
             if (g_overlayWnd) {
                 if (g_isLeftButtonDown.load(std::memory_order_relaxed)) {
+                    DiagLog(L"[TRIG-FOLDER] desktop folder change (deferred, button down)");
                     g_snapshotUpdatePending.store(true, std::memory_order_relaxed);
                 } else {
                     bool expectedSnap = false;
                     if (g_snapshotUpdatePending.compare_exchange_strong(expectedSnap, true)) {
+                        DiagLog(L"[TRIG-FOLDER] desktop folder change -> full pass");
                         PostMessageW(g_overlayWnd, WM_APP_SNAPSHOT_UPDATE, 0, 0);
                     }
                 }
@@ -9997,6 +12817,7 @@ BOOL Wh_ModInit() {
     WM_APP_SELECTION_UPDATE = RegisterWindowMessageW(L"TransparentDesktopSpotlight_SelUpdate");
     WM_APP_SNAPSHOT_UPDATE = RegisterWindowMessageW(L"TransparentDesktopSpotlight_SnapUpdate");
     WM_APP_DEFERRED_INIT = RegisterWindowMessageW(L"TransparentDesktopSpotlight_DeferredInit");
+    WM_APP_FOCUSSTORM = RegisterWindowMessageW(L"TransparentDesktopSpotlight_FocusStorm");
 
     g_hUnloadEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
@@ -10010,6 +12831,7 @@ BOOL Wh_ModInit() {
     g_bootstrapThread.reset(new std::thread(BootstrapThread));
 
     g_hRegStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    g_hCfgStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_hFolderWatchUpdateEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_snapshotWorkerEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
@@ -10030,6 +12852,9 @@ static void StartAuxThreads() {
     }
     if (!g_snapshotWorkerThread) {
         g_snapshotWorkerThread.reset(new std::thread(SnapshotWorkerThreadProc));
+    }
+    if (!g_cfgThread) {
+        g_cfgThread.reset(new std::thread(ConfigWatcherThreadProc));
     }
 }
 
@@ -10056,6 +12881,10 @@ void Wh_ModUninit() {
         if (g_regThread->joinable()) g_regThread->join();
         g_regThread.reset();
     }
+
+    // Stop + join the config-file watcher (settings.cfg)
+    if (g_hCfgStopEvent) SetEvent(g_hCfgStopEvent);
+    g_cfgThread.reset();
 
     // Wake up the folder watcher so it breaks out of the wait loop
     if (g_hFolderWatchUpdateEvent) SetEvent(g_hFolderWatchUpdateEvent);
@@ -10167,10 +12996,25 @@ void Wh_ModUninit() {
     if (g_underlayRenderEvent) { CloseHandle(g_underlayRenderEvent); g_underlayRenderEvent = nullptr; }
     if (g_hUnloadEvent) { CloseHandle(g_hUnloadEvent); g_hUnloadEvent = nullptr; }
     if (g_hRegStopEvent) { CloseHandle(g_hRegStopEvent); g_hRegStopEvent = nullptr; }
+    if (g_hCfgStopEvent) { CloseHandle(g_hCfgStopEvent); g_hCfgStopEvent = nullptr; }
     if (g_hFolderWatchUpdateEvent) { CloseHandle(g_hFolderWatchUpdateEvent); g_hFolderWatchUpdateEvent = nullptr; }
     if (g_snapshotWorkerEvent) { CloseHandle(g_snapshotWorkerEvent); g_snapshotWorkerEvent = nullptr; }
 }
 
-void Wh_ModSettingsChanged() {
+// Shared apply path for BOTH settings sources: Windhawk's settings-changed
+// callback and the config-file watcher (the settings window's writes).
+void ApplySettingsChanges() {
     LoadSettings();
+    // [F1/P1.1] Bump the arrow generation ONLY when a baked-pixel input
+    // actually changed (LoadSettings reports via g_bakedInputsChanged). The
+    // old unconditional bump invalidated the composite mirror on every
+    // settings load — including no-op reloads fired by mod installs — and
+    // every zoom revisit leg paid a full combo rebuild for it.
+    if (g_bakedInputsChanged.exchange(false, std::memory_order_relaxed)) {
+        g_arrowGen.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void Wh_ModSettingsChanged() {
+    ApplySettingsChanges();
 }
