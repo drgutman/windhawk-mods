@@ -1,20 +1,27 @@
 // ==WindhawkMod==
 // @id              transparent-desktop-icons-spotlight
 // @name            "Ab Tenebris" - Transparent Desktop Icons with Spotlight and Dynamic Shadows
-// @description     Make desktop icons transparent when idle with an interactive spotlight effect. Hover over the desktop or select icons to reveal them.
-// @version         2.10.0
+// @description     Make desktop icons transparent when idle with an interactive spotlight effect, plus the Ab Tenebris control panel: tray icon and native settings window. Hover over the desktop or select icons to reveal them.
+// @version         2.10.2
 // @author          drgutman
 // @github          https://github.com/drgutman
 // @homepage        https://instagram.com/drgutman
 // @include         explorer.exe
+// @include         windhawk.exe
 // @architecture    x86-64
-// @compilerOptions -lcomctl32 -ldxgi -ld2d1 -ld3d11 -ldcomp -lgdi32 -lshcore -lwindowscodecs -lole32 -luuid -lshell32 -ladvapi32
+// @compilerOptions -lcomctl32 -ldxgi -ld2d1 -ld3d11 -ldcomp -lgdi32 -lshcore -lwindowscodecs -lole32 -luuid -lshell32 -ladvapi32 -lcomdlg32 -luxtheme -ldwmapi
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
 /*
 
 # AB TENEBRIS - Transparent Desktop Icons with Spotlight and Dynamic Shadows
+
+## SETTINGS
+All settings live in the **Ab Tenebris settings window** — open it from the
+tray icon this mod adds to the taskbar (left-click the icon, or right-click
+it and choose Settings). The Windhawk settings page is intentionally empty.
+
 
 Ab tenebris - latin for "out of the darkness"
 
@@ -55,199 +62,6 @@ And don't come back to me crying if you set it on fire.
 */
 // ==/WindhawkModReadme==
 
-// ==WindhawkModSettings==
-/*
-
-- Shadows:
-  - enableShadows: true
-    $name: Enable Shadows
-    $description: Master switch for icon shadows.
-  - shadowLength: 160
-    $name: Shadow Length
-    $description: Maximum reach of shadows from icon centers, in pixels
-  - shadowPasses: 6
-    $name: Shadow Quality
-    $description: Number of overlapping layers per shadow (1-64, higher = smoother gradient but eats VRAM on toast)
-  - shadowBaseAlpha: 140
-    $name: Shadow Opacity
-    $description: Base darkness of the shadows (0-255)
-  - shadowBlur: 2
-    $name: Shadow Blur
-    $description: Softness of shadow edges in pixels (0 = hard geometric edges)
-  - shadowTailSoftness: 50
-    $name: Shadow Tail Softness (%)
-    $description: How much softer the shadow gets as it stretches away from the icon. 0% = uniform sharpness, 100% = extremely soft tail.
-  - shadowTailOpacity: 0
-    $name: Shadow Tail Opacity (%)
-    $description: How opaque the shadow tail remains. 0% = tail fades to transparent (default), 100% = tail stays fully opaque.
-  - shadowTailScale: 0
-    $name: Shadow Tail Scale
-    $description: Progressive size falloff of shadow layers toward the tail (-100 to 100, 0 = unchanged, positive = layers grow toward the tail up to 4x, negative = they shrink down to 0.25x). Independent of blur.
-  - shadowOffset: 10
-    $name: Shadow Offset
-    $description: How much the shadow root is pushed away from the icon (0-500) when the mouse moves away.
-  - shadowGlobalTracking: false
-    $name: Shadow Global Tracking
-    $description: Keep tracking the mouse and drawing shadows even when the cursor leaves the desktop area. (when on, the fade-in and fade-out are disabled)
-  - shadowFadeInDuration: 200
-    $name: Shadow Fade In Duration (ms)
-    $description: How long it takes for shadows to fade in when the mouse enters the desktop.
-  - shadowFadeOutDuration: 500
-    $name: Shadow Fade Out Duration (ms)
-    $description: How long it takes for shadows to fade out when the mouse leaves the desktop.
-  $name: Icons shadows
-
-- Spotlight:
-  - enableSpotlight: true
-    $name: Enable Spotlight
-    $description: Master switch for the mouse spotlight.
-
-  - idleOpacity: 225
-    $name: Overlay Opacity
-    $description: How much the icons are dimmed when idle (0 = icons fully visible, 255 = icons fully hidden)
-  - overlayClipToIcons: false
-    $name: Clip Overlay to Icons
-    $description: When ON, the overlay wallpaper/tint is only drawn on the icons. When OFF, it covers the whole desktop.
-
-  - spotlightRadius: 360
-    $name: Mouse Spotlight Radius
-    $description: Size of the mouse spotlight in pixels
-  - spotlightRoundness: 70
-    $name: Mouse Spotlight Roundness (%)
-    $description: Shape of the spotlight (0 = square, 100 = circular)
-  - spotlightBlur: 40
-    $name: Mouse Spotlight Edge Blur
-    $description: Mouse Spotlight Edge Blur in pixels (0 = hard edge)
-  - idleDelay: 3000
-    $name: Mouse Spotlight Idle Timeout (ms)
-    $description: Time in milliseconds before the spotlight begins to fade out (0 = keep visible indefinitely while over desktop)
-  - spotlightFadeInDuration: 100
-    $name: Mouse Spotlight Fade In Duration (ms)
-    $description: How long it takes for the spotlight to fade in when mouse enters the desktop area
-  - spotlightFadeOutDuration: 2000
-    $name: Mouse Spotlight Fade Out Duration (ms)
-    $description: How long it takes for the spotlight to fade out when mouse leaves the desktop area
-  - mouseSmoothing: 0
-    $name: Mouse Smoothing
-    $description: Smoothing factor for spotlight following (0-20, 0 = no smoothing, 20 = very smooth)
-  $name: Spotlight
-
-- Tint:
-  - tintEnabled: true
-    $name: Enable Overlay Tint
-    $description: Master switch for the tint veil. (The Bat-Signal forces it on while active.)
-  - tintStrength: 25
-    $name: Overlay Tint Strength (%)
-    $description: How strongly the tint veil darkens/colors the desktop behind the spotlight (0 = off). The spotlight punches through it, making the revealed area look lit.
-  - tintPreset: Midnight
-    $name: Tint Color Preset
-    $description: Quick-pick tint colors. Choose "Custom" to use the hex value below.
-    $options:
-    - "Black": Black
-    - "Slate": Slate
-    - "Midnight": Midnight
-    - "Wine": Wine
-    - "Nightshade": Nightshade
-    - "Deep_Red": Deep Red
-    - "Umber": Umber
-    - "Sepia": Sepia
-    - "Forest": Forest
-    - "Abyss": Abyss
-    - "Custom": Custom
-  - tintColorHex: "#0D1B2A"
-    $name: Custom Tint Color (hex)
-    $description: Only used when the preset above is set to "Custom". Format "#RRGGBB" or "RRGGBB".
-  $name: Overlay Tint
-
-- Selection:
-  - enableSelectionGlow: true
-    $name: Enable Selection Glow
-    $description: Master switch for the selection highlight.
-  - selectionOpacity: 255
-    $name: Icon Selection Opacity
-    $description: How visible icons become when selected (0 = transparent, 255 = fully visible)
-  - selectionPadding: 60
-    $name: Icon Selection Padding
-    $description: Extra space around selected icons in pixels
-  - selectionRoundness: 10
-    $name: Icon Selection Roundness (%)
-    $description: How rounded the icon selection area is (0 = square, 100 = circular)
-  - selectionBlur: 50
-    $name: Icon Selection Edge Blur (%)
-    $description: Blur radius for the icon reveal area (0% = sharp edge, 100% = maximum softness)
-  - selectionTimeout: 2000
-    $name: Icon Selection Timeout (ms)
-    $description: Time to keep the icon visible after deselection or when the mouse leaves the desktop area (0 = keep visible indefinitely while selected)
-  - selectionFadeInDuration: 250
-    $name: Icon Selection Fade In Duration (ms)
-    $description: How long the icon selection area takes to fade in when icon is selected
-  - selectionFadeOutDuration: 4000
-    $name: Icon Selection Fade Out Duration (ms)
-    $description: How long the icon selection area takes to fade out after deselection
-  $name: Selection Glow
-
-- Toggle:
-  - toggleOnDoubleClick: true
-    $name: Toggle Overlay on Double-Click
-    $description: Double-click on empty desktop background to hide or show the overlay.
-  - toggleFadeInDuration: 400
-    $name: Overlay Toggle Fade In Duration (ms)
-    $description: How long it takes for the overlay to fade back in when toggled on.
-  - toggleFadeOutDuration: 400
-    $name: Overlay Toggle Fade Out Duration (ms)
-    $description: How long it takes for the overlay to fade out when toggled off.
-  $name: Toggle transparency
-
-
-
-- General:
-  - targetFps: "60"
-    $name: Target Framerate
-    $description: Maximum framerate for the overlay and shadows. 30fps saves battery, 144 might feel smoother sometimes but uses more GPU (it's overkill tbh).
-    $options:
-    - "30": 30 FPS (Battery Saver)
-    - "60": 60 FPS (Standard)
-    - "144": 144 FPS (High Refresh)
-  - cacheMode: "1"
-    $name: Disk Cache Mode
-    $description: How the mod remembers shadow settings. 0 = RAM only, 1 = Saves only the current profile, 2 = Remembers every shadow tweak you make.
-    $options:
-    - "0": No Cache (RAM only)
-    - "1": Single Profile (Default)
-    - "2": Multi-Profile Hoarder
-  - customArrowScale: 75
-    $name: Custom Shortcut Arrow Scale (%)
-    $description: Size percentage for custom shortcut arrows (e.g. Winaero Tweaker). Only applies when a custom arrow is detected (Windows default arrow scales automatically).
-  - customArrowOffsetX: 0
-    $name: Custom Shortcut Arrow Offset X (px)
-    $description: Horizontal offset in pixels for custom shortcut arrows.
-  - customArrowOffsetY: 0
-    $name: Custom Shortcut Arrow Offset Y (px)
-    $description: Vertical offset in pixels for custom shortcut arrows.
-  $name: General
-
-
-- batSignalEnabled: false
-  $name: 🦇
-- batSignalStyle: "🦇"
-  $name: 🦇
-  $options:
-  - "🦇": "🦇"
-  - "🦇🦇": "🦇🦇"
-  - "🦇🦇🦇": "🦇🦇🦇"
-- batLogoBlur: "auto"
-  $name: 🦇
-  $options:
-  - "auto": Auto
-  - "0": None
-  - "10": Subtle
-  - "20": Normal
-  - "30": Soft
-  - "40": Mist
-  - "60": Fog
-
-*/
-// ==/WindhawkModSettings==
 
 #define _WIN32_WINNT 0x0A00
 #define WINVER 0x0A00
@@ -286,6 +100,10 @@ And don't come back to me crying if you set it on fire.
 #include <cstring>
 #include <unordered_map>
 #include <unordered_set>
+// Control-panel section needs (merged from ab_tenebris_control.cpp):
+#include <commdlg.h>
+#include <uxtheme.h>
+#include <dwmapi.h>
 
 // ===== MinGW fallback definitions for missing shell interfaces =====
 #ifndef SWC_DESKTOP
@@ -12144,15 +11962,17 @@ static void ResolveTintColor(PCWSTR presetName, PCWSTR customHex, D2D1_COLOR_F& 
 // plus a one-time self-import when it doesn't exist yet (writes the current
 // Windhawk settings values out — the import tool is the fallback loader).
 // Keys mirror the Windhawk settings keys exactly. Missing keys inside the
-// file fall back to the Windhawk BIOS block (bootstrap contract: the engine
-// still boots sane if the tool mod is absent/disabled or the file is broken).
+// file fall back to the built-in defaults table (kCfgDefaults below — the
+// bootstrap the removed Windhawk settings block used to provide), so the
+// engine still boots sane if the settings window never wrote the file.
 
 static const wchar_t kAbTenebrisDirName[] = L"AbTenebris";
 static const wchar_t kAbTenebrisCfgName[] = L"settings.cfg";
 
 struct CfgKeyEntry { PCWSTR key; bool isString; };
-// Order here = file layout order. isString keys are stored verbatim (the
-// Windhawk-side fallback reads them through Wh_GetStringSetting).
+// Order here = file layout order. isString keys are stored verbatim. The
+// legacy import path below still reads them through Wh_Get*Setting (kept for
+// users upgrading from a build that still had a settings block).
 static const CfgKeyEntry kCfgKeys[] = {
     {L"Shadows.enableShadows", false},
     {L"Shadows.shadowLength", false},
@@ -12200,6 +12020,74 @@ static const CfgKeyEntry kCfgKeys[] = {
     {L"batSignalStyle", true},
     {L"batLogoBlur", true},   // "auto" or a number — string on purpose
 };
+
+// Built-in defaults — the bootstrap the Windhawk settings block used to
+// provide. Used when settings.cfg is missing or a key is absent from it, and
+// to seed a fresh install's first settings.cfg. Values mirror the old YAML.
+struct CfgDefault { PCWSTR key; int i; PCWSTR s; };
+static const CfgDefault kCfgDefaults[] = {
+    {L"Shadows.enableShadows", 1, nullptr},
+    {L"Shadows.shadowLength", 160, nullptr},
+    {L"Shadows.shadowPasses", 6, nullptr},
+    {L"Shadows.shadowBaseAlpha", 140, nullptr},
+    {L"Shadows.shadowBlur", 2, nullptr},
+    {L"Shadows.shadowTailSoftness", 50, nullptr},
+    {L"Shadows.shadowTailOpacity", 0, nullptr},
+    {L"Shadows.shadowTailScale", 0, nullptr},
+    {L"Shadows.shadowOffset", 10, nullptr},
+    {L"Shadows.shadowGlobalTracking", 0, nullptr},
+    {L"Shadows.shadowFadeInDuration", 200, nullptr},
+    {L"Shadows.shadowFadeOutDuration", 500, nullptr},
+    {L"Spotlight.enableSpotlight", 1, nullptr},
+    {L"Spotlight.idleOpacity", 225, nullptr},
+    {L"Spotlight.overlayClipToIcons", 0, nullptr},
+    {L"Spotlight.spotlightRadius", 360, nullptr},
+    {L"Spotlight.spotlightRoundness", 70, nullptr},
+    {L"Spotlight.spotlightBlur", 40, nullptr},
+    {L"Spotlight.idleDelay", 3000, nullptr},
+    {L"Spotlight.spotlightFadeInDuration", 100, nullptr},
+    {L"Spotlight.spotlightFadeOutDuration", 2000, nullptr},
+    {L"Spotlight.mouseSmoothing", 0, nullptr},
+    {L"Tint.tintEnabled", 1, nullptr},
+    {L"Tint.tintStrength", 25, nullptr},
+    {L"Tint.tintPreset", 0, L"Midnight"},
+    {L"Tint.tintColorHex", 0, L"#0D1B2A"},
+    {L"Selection.enableSelectionGlow", 1, nullptr},
+    {L"Selection.selectionOpacity", 255, nullptr},
+    {L"Selection.selectionPadding", 60, nullptr},
+    {L"Selection.selectionRoundness", 10, nullptr},
+    {L"Selection.selectionBlur", 50, nullptr},
+    {L"Selection.selectionTimeout", 2000, nullptr},
+    {L"Selection.selectionFadeInDuration", 250, nullptr},
+    {L"Selection.selectionFadeOutDuration", 4000, nullptr},
+    {L"Toggle.toggleOnDoubleClick", 1, nullptr},
+    {L"Toggle.overlayEnabled", 1, nullptr},
+    {L"Toggle.toggleFadeInDuration", 400, nullptr},
+    {L"Toggle.toggleFadeOutDuration", 400, nullptr},
+    {L"General.targetFps", 60, nullptr},
+    {L"General.cacheMode", 1, nullptr},
+    {L"General.customArrowEnabled", 1, nullptr},
+    {L"General.customArrowScale", 75, nullptr},
+    {L"General.customArrowOffsetX", 0, nullptr},
+    {L"General.customArrowOffsetY", 0, nullptr},
+    {L"batSignalEnabled", 0, nullptr},
+    {L"batSignalStyle", 0, L"🦧"},
+    {L"batLogoBlur", 0, L"auto"},
+};
+static const CfgDefault* FindCfgDefault(PCWSTR key) {
+    for (const auto& d : kCfgDefaults) {
+        if (wcscmp(d.key, key) == 0) return &d;
+    }
+    return nullptr;
+}
+static int CfgIntDefault(PCWSTR key) {
+    const CfgDefault* d = FindCfgDefault(key);
+    return d ? d->i : 0;
+}
+static std::wstring CfgStrDefault(PCWSTR key) {
+    const CfgDefault* d = FindCfgDefault(key);
+    return d ? d->s : std::wstring();
+}
 
 static std::wstring GetAbTenebrisConfigDir() {
     std::wstring dir;
@@ -12310,14 +12198,32 @@ static bool WriteAbTenebrisConfig(const std::unordered_map<std::wstring, std::ws
 static bool ImportAbTenebrisConfigFromWindhawk() {
     std::unordered_map<std::wstring, std::wstring> kv;
     wchar_t buf[32];
+    bool blockHasValues = false;
     for (const auto& e : kCfgKeys) {
         if (e.isString) {
             PCWSTR s = Wh_GetStringSetting(e.key);
             kv[e.key] = (s && *s) ? s : L"";
             Wh_FreeStringSetting(s);
         } else {
-            swprintf(buf, 32, L"%d", Wh_GetIntSetting(e.key));
+            int v = Wh_GetIntSetting(e.key);
+            swprintf(buf, 32, L"%d", v);
             kv[e.key] = buf;
+            if (v != 0) blockHasValues = true;
+        }
+        if (e.isString && !kv[e.key].empty()) blockHasValues = true;
+    }
+    if (!blockHasValues) {
+        // No Windhawk settings block anymore (it was removed when the control
+        // panel merged in). Seed the file with the built-in defaults instead
+        // so a fresh install boots with the classic configuration.
+        kv.clear();
+        for (const auto& d : kCfgDefaults) {
+            if (d.s) {
+                kv[d.key] = d.s;
+            } else {
+                swprintf(buf, 32, L"%d", d.i);
+                kv[d.key] = buf;
+            }
         }
     }
     bool ok = WriteAbTenebrisConfig(kv);
@@ -12405,7 +12311,7 @@ void LoadSettings() {
     }
     auto cfgInt = [&](PCWSTR key) -> int {
         auto it = cfg.find(key);
-        return (it != cfg.end()) ? _wtoi(it->second.c_str()) : Wh_GetIntSetting(key);
+        return (it != cfg.end()) ? _wtoi(it->second.c_str()) : CfgIntDefault(key);
     };
     auto cfgIntDef = [&](PCWSTR key, int def) -> int {
         auto it = cfg.find(key);
@@ -12414,10 +12320,8 @@ void LoadSettings() {
     auto cfgStr = [&](PCWSTR key) -> std::wstring {
         auto it = cfg.find(key);
         if (it != cfg.end()) return it->second;
-        PCWSTR s = Wh_GetStringSetting(key);
-        std::wstring r = (s && *s) ? s : L"";
-        Wh_FreeStringSetting(s);
-        return r;
+        std::wstring d = CfgStrDefault(key);
+        return d;
     };
 
     Settings s;
@@ -12771,7 +12675,7 @@ void FolderWatcherThreadProcInner() {
 
 SafeThread g_bootstrapThread;
 
-BOOL Wh_ModInit() {
+static BOOL Engine_ModInit() {
     ULONGLONG bootT0 = GetTickCount64();
     BootLog(L"[BOOT] ===== new boot =====");
     BootLog(L"[BOOT] Wh_ModInit enter");
@@ -12859,7 +12763,7 @@ static void StartAuxThreads() {
 }
 
 
-void Wh_ModUninit() {
+static void Engine_ModUninit() {
     // 1. Raise the flag. All WndProcs and Loops will immediately drop incoming work.
     g_unloading = true;
 
@@ -13015,6 +12919,2920 @@ void ApplySettingsChanges() {
     }
 }
 
-void Wh_ModSettingsChanged() {
+static void Engine_ModSettingsChanged() {
     ApplySettingsChanges();
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// ============ AB TENEBRIS CONTROL PANEL (merged from ab_tenebris_control.cpp v0.2.44) ============
+// Three-way process branch (see merged Wh_ModInit at end of file):
+//   explorer.exe            -> engine (Engine_ModInit above)
+//   windhawk.exe            -> launcher: spawns + watches the tool host process
+//   windhawk.exe -tool-mod  -> tool host: tray icon + settings window (below)
+// Config contract unchanged: control panel writes %LOCALAPPDATA%\AbTenebris\settings.cfg,
+// engine's ConfigWatcherThreadProc reloads it. Windhawk [Settings] block above stays
+// bootstrap/fallback only (one-time import when the cfg file is missing).
+////////////////////////////////////////////////////////////////////////////////
+
+
+////////////////////////////////////////////////////////////////////////////////
+// Constants
+
+static const wchar_t kWindowClassName[] = L"AbTenebrisControl_SettingsWnd";
+static const wchar_t kMessageClassName[] = L"AbTenebrisControl_MsgWnd";
+static const wchar_t kWindowTitle[] = L"Ab Tenebris — Settings";
+static const UINT WMAPP_TRAYICON = WM_APP + 1;
+static HICON g_trayIcon = nullptr;  // loaded via LoadTrayIcon (system icon)
+static const UINT WMAPP_SCREENSHOT = WM_APP + 11;  // lParam = 0; saves snap.png
+static const UINT WMAPP_SWITCHSECTION = WM_APP + 12;  // lParam = section index
+
+static const wchar_t kCfgDirName[] = L"AbTenebris";
+static const wchar_t kCfgFileName[] = L"settings.cfg";
+static const wchar_t kProfilesDirName[] = L"profiles";
+
+// Layout (dialog units avoided; raw px, scaled by system DPI at create time)
+static const int kSidebarW = 200;
+static const int kBottomBarH = 48;
+
+////////////////////////////////////////////////////////////////////////////////
+// Tool-mod process plumbing (desktop-window-cards-v2 recipe)
+
+static bool g_isToolModProcessLauncher;
+static bool g_isCtrlToolProcess;
+static HANDLE g_toolModProcessMutex;
+
+static HWND g_settingsWnd = nullptr;
+static HWND g_msgWnd = nullptr;
+static NOTIFYICONDATAW g_nid = {};
+static std::atomic<bool> g_trayAdded{false};
+static std::atomic<bool> g_ctrlUnloading{false};
+static DWORD g_uiThreadId = 0;
+
+////////////////////////////////////////////////////////////////////////////////
+// Colors / fonts
+
+static const COLORREF kColBg = RGB(32, 32, 32);       // #202020 window base
+static const COLORREF kColSidebar = RGB(32, 32, 32);  // unified: no two-tone slab
+static const COLORREF kColInputBg = RGB(40, 40, 40);  // #282828 tertiary
+static const COLORREF kColAccent = RGB(68, 138, 255); // the ONE accent
+static const COLORREF kColText = RGB(255, 255, 255);  // primary
+static const COLORREF kColTextSec = RGB(196, 196, 196);  // white @ 77%
+static const COLORREF kColDim = RGB(94, 94, 94);      // white @ 37%
+
+static HFONT g_font = nullptr;
+static HFONT g_fontBold = nullptr;
+static HFONT g_fontEmoji = nullptr;
+static HBRUSH g_brushBg = nullptr;
+static HBRUSH g_brushSidebar = nullptr;
+static HBRUSH g_brushSidebarHover = nullptr;
+static HBRUSH g_brushInput = nullptr;
+static HBRUSH g_brushAccent = nullptr;
+static HBRUSH g_brushStroke = nullptr;
+static HBRUSH g_brushHover = nullptr;
+static HBRUSH g_brushThumb = nullptr;
+
+// Dark-mode theming: kills light scrollbar/combo/trackbar artifacts on the
+// dark background (stable since Win10 1809).
+static void Darkize(HWND h) {
+    if (h) SetWindowTheme(h, L"DarkMode_Explorer", nullptr);
+}
+
+static HFONT g_fontMdl2 = nullptr;  // Segoe MDL2 Assets glyphs (system font)
+
+static HFONT MakePtFont(int pt, bool bold, const wchar_t* face = L"Segoe UI") {
+    HDC hdc = GetDC(nullptr);
+    int px = -MulDiv(pt, GetDeviceCaps(hdc, LOGPIXELSY), 72);
+    ReleaseDC(nullptr, hdc);
+    return CreateFontW(px, 0, 0, 0, bold ? FW_SEMIBOLD : FW_NORMAL, FALSE,
+                       FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                       CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                       DEFAULT_PITCH | FF_DONTCARE, face);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Config file (same format the engine reads: key=value, UTF-16 LE, BOM)
+
+struct CtrlCfgKeyEntry {
+    const wchar_t* key;
+    bool isString;
+};
+
+// Mirrors the engine's kCtrlCfgKeys (order = file layout).
+static const CtrlCfgKeyEntry kCtrlCfgKeys[] = {
+    {L"Shadows.enableShadows", false},
+    {L"Shadows.shadowLength", false},
+    {L"Shadows.shadowPasses", false},
+    {L"Shadows.shadowBaseAlpha", false},
+    {L"Shadows.shadowBlur", false},
+    {L"Shadows.shadowTailSoftness", false},
+    {L"Shadows.shadowTailOpacity", false},
+    {L"Shadows.shadowTailScale", false},
+    {L"Shadows.shadowOffset", false},
+    {L"Shadows.shadowGlobalTracking", false},
+    {L"Shadows.shadowFadeInDuration", false},
+    {L"Shadows.shadowFadeOutDuration", false},
+    {L"Spotlight.enableSpotlight", false},
+    {L"Spotlight.idleOpacity", false},
+    {L"Spotlight.overlayClipToIcons", false},
+    {L"Spotlight.spotlightRadius", false},
+    {L"Spotlight.spotlightRoundness", false},
+    {L"Spotlight.spotlightBlur", false},
+    {L"Spotlight.idleDelay", false},
+    {L"Spotlight.spotlightFadeInDuration", false},
+    {L"Spotlight.spotlightFadeOutDuration", false},
+    {L"Spotlight.mouseSmoothing", false},
+    {L"Tint.tintEnabled", false},
+    {L"Tint.tintStrength", false},
+    {L"Tint.tintPreset", true},
+    {L"Tint.tintColorHex", true},
+    {L"Selection.enableSelectionGlow", false},
+    {L"Selection.selectionOpacity", false},
+    {L"Selection.selectionPadding", false},
+    {L"Selection.selectionRoundness", false},
+    {L"Selection.selectionBlur", false},
+    {L"Selection.selectionTimeout", false},
+    {L"Selection.selectionFadeInDuration", false},
+    {L"Selection.selectionFadeOutDuration", false},
+    {L"Toggle.overlayEnabled", false},
+    {L"Toggle.toggleOnDoubleClick", false},
+    {L"Toggle.toggleFadeInDuration", false},
+    {L"Toggle.toggleFadeOutDuration", false},
+    {L"General.targetFps", false},
+    {L"General.cacheMode", false},
+    {L"General.customArrowEnabled", false},
+    {L"General.customArrowScale", false},
+    {L"General.customArrowOffsetX", false},
+    {L"General.customArrowOffsetY", false},
+    {L"batSignalEnabled", false},
+    {L"batSignalStyle", true},
+    {L"batLogoBlur", true},
+};
+
+static std::wstring GetCfgDir() {
+    std::wstring dir;
+    PWSTR local = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr,
+                                       &local))) {
+        dir = std::wstring(local) + L"\\" + kCfgDirName;
+        CoTaskMemFree(local);
+    }
+    return dir;
+}
+
+static std::wstring GetCfgPath() {
+    std::wstring dir = GetCfgDir();
+    return dir.empty() ? dir : dir + L"\\" + kCfgFileName;
+}
+
+static void TrimW(std::wstring& s) {
+    size_t b = s.find_first_not_of(L" \t\r\n");
+    if (b == std::wstring::npos) {
+        s.clear();
+        return;
+    }
+    size_t e = s.find_last_not_of(L" \t\r\n");
+    s = s.substr(b, e - b + 1);
+}
+
+static bool ReadConfigFile(const std::wstring& path,
+                           std::unordered_map<std::wstring, std::wstring>& out) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    std::wstring content;
+    LARGE_INTEGER size{};
+    if (GetFileSizeEx(h, &size) && size.QuadPart > 0 &&
+        size.QuadPart < 1024 * 1024) {
+        std::vector<char> bytes((size_t)size.QuadPart);
+        DWORD got = 0;
+        if (ReadFile(h, bytes.data(), (DWORD)bytes.size(), &got, nullptr) &&
+            got >= 2) {
+            const unsigned char* p = (const unsigned char*)bytes.data();
+            if (p[0] == 0xFF && p[1] == 0xFE) {
+                content.assign((const wchar_t*)(p + 2), (got - 2) / 2);
+            } else {
+                int wlen = MultiByteToWideChar(CP_UTF8, 0, (const char*)p, got,
+                                               nullptr, 0);
+                if (wlen > 0) {
+                    std::wstring w(wlen, L'\0');
+                    MultiByteToWideChar(CP_UTF8, 0, (const char*)p, got, &w[0],
+                                        wlen);
+                    content = std::move(w);
+                }
+            }
+        }
+    }
+    CloseHandle(h);
+
+    size_t pos = 0;
+    while (pos < content.size()) {
+        size_t eol = content.find(L'\n', pos);
+        size_t end = (eol == std::wstring::npos) ? content.size() : eol;
+        std::wstring line = content.substr(pos, end - pos);
+        pos = (eol == std::wstring::npos) ? content.size() : eol + 1;
+        TrimW(line);
+        if (line.empty() || line[0] == L';' || line[0] == L'#') continue;
+        size_t eq = line.find(L'=');
+        if (eq == std::wstring::npos) continue;
+        std::wstring key = line.substr(0, eq);
+        std::wstring val = line.substr(eq + 1);
+        TrimW(key);
+        TrimW(val);
+        if (!key.empty()) out[std::move(key)] = std::move(val);
+    }
+    return true;
+}
+
+static bool WriteConfigMap(
+    const std::unordered_map<std::wstring, std::wstring>& kv) {
+    std::wstring dir = GetCfgDir();
+    if (dir.empty()) return false;
+    CreateDirectoryW(dir.c_str(), nullptr);
+    std::wstring tmp = dir + L"\\settings.cfg.tmp";
+    std::wstring finalPath = dir + L"\\" + kCfgFileName;
+
+    HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    WORD bom = 0xFEFF;
+    DWORD wrote = 0;
+    WriteFile(h, &bom, sizeof(bom), &wrote, nullptr);
+
+    std::wstring body;
+    for (const auto& e : kCtrlCfgKeys) {
+        auto it = kv.find(e.key);
+        if (it == kv.end()) continue;
+        body += e.key;
+        body += L'=';
+        body += it->second;
+        body += L"\r\n";
+    }
+    BOOL ok =
+        WriteFile(h, body.data(), (DWORD)(body.size() * sizeof(wchar_t)),
+                  &wrote, nullptr);
+    CloseHandle(h);
+    if (!ok) {
+        DeleteFileW(tmp.c_str());
+        return false;
+    }
+    return MoveFileExW(tmp.c_str(), finalPath.c_str(),
+                       MOVEFILE_REPLACE_EXISTING) != 0;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Control spec table (drives pane construction + read/write)
+
+enum class Kind { Chk, Slider, Combo, Color };
+
+struct CtlSpec {
+    int section;
+    Kind kind;
+    const wchar_t* key;
+    const wchar_t* label;
+    int minV;
+    int maxV;
+    const wchar_t* const* options;       // for Combo (stored values)
+    int optionCount;
+    const wchar_t* const* displayNames;  // optional user-facing combo names
+};
+
+// Sections mirror the ENGINE MOD's own settings groups — no invented names.
+// Sections: General first (Doc's order). The Toggle-transparency rows live
+// inside General now. Labels carry NO section-name prefixes (the tab IS the
+// context — "Shadow Length" inside a Shadows tab is redundant).
+static const int SEC_GENERAL = 0;
+static const int SEC_OVERLAY = 1;
+static const int SEC_SPOTLIGHT = 2;
+static const int SEC_SHADOWS = 3;
+static const int SEC_SELECTION = 4;
+static const int SEC_DIAGNOSTICS = 5;
+static const int SEC_COUNT = 6;
+// Pane slot only (not a sidebar section): the profiles UI lives at the
+// bottom of the General tab.
+static const int SEC_PROFILES = 6;
+
+// Sidebar rows that carry a live enable-checkbox (click = toggle + write).
+struct SidebarToggle {
+    int section;
+    const wchar_t* key;
+};
+static const SidebarToggle kSidebarToggles[] = {
+    {SEC_SHADOWS, L"Shadows.enableShadows"},
+    {SEC_SPOTLIGHT, L"Spotlight.enableSpotlight"},
+    {SEC_OVERLAY, L"Tint.tintEnabled"},
+    {SEC_SELECTION, L"Selection.enableSelectionGlow"},
+};
+
+// Mirror of the ENGINE's kCtrlTintPresets table (mod_014) - swatch preview
+// only; the engine remains the single source of truth.
+struct TintPresetColor {
+    const wchar_t* name;
+    COLORREF rgb;
+};
+static const TintPresetColor kTintPresetColors[] = {
+    {L"Black", RGB(0x00, 0x00, 0x00)},
+    {L"Slate", RGB(0x16, 0x19, 0x1E)},
+    {L"Midnight", RGB(0x05, 0x15, 0x29)},
+    {L"Wine", RGB(0x1A, 0x0F, 0x2B)},
+    {L"Nightshade", RGB(0x22, 0x0C, 0x29)},
+    {L"Deep_Red", RGB(0x29, 0x06, 0x06)},
+    {L"Umber", RGB(0x26, 0x16, 0x0F)},
+    {L"Sepia", RGB(0x2B, 0x20, 0x09)},
+    {L"Forest", RGB(0x15, 0x20, 0x0C)},
+    {L"Abyss", RGB(0x04, 0x20, 0x24)},
+};
+
+// The picked custom color (written to Tint.tintColorHex by the picker; no
+// dedicated UI row anymore).
+static std::wstring g_customHex;
+
+static const wchar_t* const kCtrlTintPresets[] = {
+    L"Black", L"Slate", L"Midnight", L"Wine", L"Nightshade",
+    L"Deep_Red", L"Umber", L"Sepia", L"Forest", L"Abyss", L"Custom"};
+static const wchar_t* const kBatStyles[] = {L"🦇", L"🦇🦇", L"🦇🦇🦇"};
+static const wchar_t* const kBatBlurs[] = {L"auto", L"0", L"10", L"20", L"30",
+                                           L"40", L"60"};
+static const wchar_t* const kFps[] = {L"30", L"60", L"144"};
+static const wchar_t* const kCacheModes[] = {L"0", L"1", L"2"};
+static const wchar_t* const kCacheModeDisplay[] = {
+    L"No Cache (RAM only)", L"Single Profile", L"Multi-Profile Hoarder"};
+
+#define CHKS(s, k, lbl) {s, Kind::Chk, k, lbl, 0, 0, nullptr, 0}
+#define SLD(s, k, lbl, mn, mx) {s, Kind::Slider, k, lbl, mn, mx, nullptr, 0}
+#define CBOS(s, k, lbl, opts) {s, Kind::Combo, k, lbl, 0, 0, opts, ARRAYSIZE(opts), nullptr}
+#define CBOSD(s, k, lbl, opts, disp) {s, Kind::Combo, k, lbl, 0, 0, opts, ARRAYSIZE(opts), disp}
+#define COLR(s, k, lbl) {s, Kind::Color, k, lbl, 0, 0, nullptr, 0}
+
+static const CtlSpec kSpecs[] = {
+    // General (engine "General" + 🦇)
+    CBOS(SEC_GENERAL, L"General.targetFps", L"Target Framerate", kFps),
+    CBOSD(SEC_GENERAL, L"General.cacheMode", L"Disk Cache Mode", kCacheModes,
+          kCacheModeDisplay),
+    // Overlay (Doc 2026-11-08: dim veil + toggle/tint/arrow groups; the
+    // sidebar checkbox toggles veil AND tint. Group titles are the enable
+    // checkboxes and live in kGroups, not here.)
+    SLD(SEC_OVERLAY, L"Spotlight.idleOpacity", L"Overlay Opacity", 0, 255),
+    CHKS(SEC_OVERLAY, L"Spotlight.overlayClipToIcons",
+         L"Clip Overlay to Icons"),
+    SLD(SEC_OVERLAY, L"Toggle.toggleFadeInDuration",
+        L"Fade In Duration (ms)", 0, 3000),
+    SLD(SEC_OVERLAY, L"Toggle.toggleFadeOutDuration",
+        L"Fade Out Duration (ms)", 0, 3000),
+    SLD(SEC_OVERLAY, L"Tint.tintStrength", L"Strength (%)", 0, 100),
+    // One Color row drives everything (Doc 2026-11-12): the preset combo
+    // selects, the swatch previews the EFFECTIVE color, the picker button
+    // writes Tint.tintColorHex and flips the combo to Custom (engine
+    // contract: unknown preset name = use the hex key).
+    CBOS(SEC_OVERLAY, L"Tint.tintPreset", L"Color", kCtrlTintPresets),
+    SLD(SEC_OVERLAY, L"General.customArrowScale", L"Scale (%)", 10, 200),
+    SLD(SEC_OVERLAY, L"General.customArrowOffsetX", L"Offset X (px)", -200,
+        200),
+    SLD(SEC_OVERLAY, L"General.customArrowOffsetY", L"Offset Y (px)", -200,
+        200),
+    // Shadows (labels de-prefixed: the tab is the context; Enable lives in
+    // the sidebar)
+    SLD(SEC_SHADOWS, L"Shadows.shadowLength", L"Length (px)", 0, 1000),
+    SLD(SEC_SHADOWS, L"Shadows.shadowPasses", L"Quality", 1, 32),
+    SLD(SEC_SHADOWS, L"Shadows.shadowBaseAlpha", L"Opacity", 0, 255),
+    SLD(SEC_SHADOWS, L"Shadows.shadowBlur", L"Blur (px)", 0, 50),
+    SLD(SEC_SHADOWS, L"Shadows.shadowTailSoftness", L"Tail Softness (%)", 0,
+        100),
+    SLD(SEC_SHADOWS, L"Shadows.shadowTailOpacity", L"Tail Opacity (%)", 0, 100),
+    SLD(SEC_SHADOWS, L"Shadows.shadowTailScale", L"Tail Scale", -100, 100),
+    SLD(SEC_SHADOWS, L"Shadows.shadowOffset", L"Offset (px)", 0, 500),
+    SLD(SEC_SHADOWS, L"Shadows.shadowFadeInDuration",
+        L"Fade In Duration (ms)", 0, 5000),
+    SLD(SEC_SHADOWS, L"Shadows.shadowFadeOutDuration",
+        L"Fade Out Duration (ms)", 0, 5000),
+    // Spotlight (Enable lives in the sidebar; veil rows moved to Overlay)
+    SLD(SEC_SPOTLIGHT, L"Spotlight.spotlightRadius", L"Radius (px)", 50, 1500),
+    SLD(SEC_SPOTLIGHT, L"Spotlight.spotlightRoundness", L"Roundness (%)", 0,
+        100),
+    SLD(SEC_SPOTLIGHT, L"Spotlight.spotlightBlur", L"Edge Blur (px)", 0, 500),
+    SLD(SEC_SPOTLIGHT, L"Spotlight.idleDelay", L"Idle Timeout (ms)", 0, 10000),
+    SLD(SEC_SPOTLIGHT, L"Spotlight.spotlightFadeInDuration",
+        L"Fade In Duration (ms)", 0, 3000),
+    SLD(SEC_SPOTLIGHT, L"Spotlight.spotlightFadeOutDuration",
+        L"Fade Out Duration (ms)", 0, 5000),
+    SLD(SEC_SPOTLIGHT, L"Spotlight.mouseSmoothing", L"Mouse Smoothing", 0, 20),
+    CBOS(SEC_SPOTLIGHT, L"batSignalStyle", L"🦇 style", kBatStyles),
+    CBOS(SEC_SPOTLIGHT, L"batLogoBlur", L"🦇 blur", kBatBlurs),
+    // Selection (Enable lives in the sidebar)
+    SLD(SEC_SELECTION, L"Selection.selectionOpacity", L"Opacity", 0, 255),
+    SLD(SEC_SELECTION, L"Selection.selectionPadding", L"Padding (px)", 0, 500),
+    SLD(SEC_SELECTION, L"Selection.selectionRoundness", L"Roundness (%)", 0,
+        100),
+    SLD(SEC_SELECTION, L"Selection.selectionBlur", L"Edge Blur (%)", 0, 100),
+    SLD(SEC_SELECTION, L"Selection.selectionTimeout",
+        L"Timeout (ms)", 0, 10000),
+    SLD(SEC_SELECTION, L"Selection.selectionFadeInDuration",
+        L"Fade In Duration (ms)", 0, 3000),
+    SLD(SEC_SELECTION, L"Selection.selectionFadeOutDuration",
+        L"Fade Out Duration (ms)", 0, 5000),
+};
+
+static const wchar_t* kSectionNames[SEC_COUNT] = {
+    L"General", L"Overlay", L"Spotlight", L"Shadows", L"Selection",
+    L"Diagnostics"};
+
+////////////////////////////////////////////////////////////////////////////////
+// Window state
+
+struct Row {
+    const CtlSpec* spec;
+    HWND label = nullptr;   // row label static
+    HWND ctl = nullptr;     // checkbox / trackbar / combobox / edit
+    HWND value = nullptr;   // value edit (sliders)
+    HWND spin = nullptr;    // up-down spinner buddied to value (sliders)
+    HWND swatch = nullptr;  // color swatch button (color rows)
+    HWND pick = nullptr;    // "..." button (color rows)
+    int lastY = 0;          // pane-relative y from the last layout pass
+};
+
+static std::vector<Row> g_rows;
+static HWND g_panes[SEC_COUNT + 1] = {};  // +1: profiles pane slot
+static HWND g_sidebar = nullptr;
+// Sidebar enable-checkbox state for keys that have NO row anymore (Enable
+// switches left the tabs; the sidebar checkbox is the only control).
+static std::unordered_map<std::wstring, bool> g_toggleState;
+// Forward decls (group layout + rowless-key plumbing run earlier in file).
+static Row* FindRowByKey(const wchar_t* key);
+static bool RowlessOn(const wchar_t* key);
+static void ApplyGroupEnableStates();
+static HWND g_btnApply = nullptr;
+static HWND g_btnSave = nullptr;
+static HWND g_btnCancel = nullptr;
+static HWND g_chkPreview = nullptr;
+static HWND g_profilesEmpty = nullptr;
+static int g_curSection = 0;
+static bool g_dirty = false;
+static bool g_loading = false;
+static bool g_resizing = false;  // inside a WM_ENTERSIZEMOVE drag loop
+static bool g_syncing = false;  // suppress EN_CHANGE loops during programmatic
+                                // slider<->edit sync
+static UINT_PTR g_previewTimer = 0;
+static std::unordered_map<std::wstring, std::wstring> g_initialSnapshot;
+
+static const int ID_BTN_APPLY = 1001;
+static const int ID_BTN_SAVE = 1002;
+static const int ID_BTN_CANCEL = 1003;
+static const int ID_CHK_PREVIEW = 1004;
+static const int ID_COLOR_PICK = 1005;
+static const int ID_COLOR_SWATCH = 1006;
+static const int ID_TINT_PICK = 1007;
+static const int ID_PROFILE_LIST = 1101;
+static const int ID_PROFILE_NAME = 1102;
+static const int ID_PROFILE_SAVE = 1103;
+static const int ID_PROFILE_APPLY = 1104;
+static const int ID_PROFILE_DELETE = 1105;
+static const int ID_DIAG_OPENFOLDER = 1201;
+static const int ID_SIDEBAR = 1300;
+static const UINT WM_APP_RELAYOUT = WM_APP + 10;
+static const int TIMER_PREVIEW = 1;
+
+// Sidebar hover state (item index, -1 = none), fed by the sidebar subclass.
+static int g_sidebarHover = -1;
+
+// Visual grouping: 1px frame windows drawn BEHIND a row range, with an
+// optional CHECKBOX title sitting on the top border (the Win32 answer to
+// PySide6's QGroupBox — the native themed groupbox doesn't fit the dark
+// square language). Unchecking the title disables the member rows.
+struct GroupSpec {
+    int section;
+    const wchar_t* titleKey;    // enable key (row-less, lives in the map)
+    const wchar_t* titleText;   // checkbox label
+    const wchar_t* const* memberKeys;
+    int memberCount;
+};
+static const wchar_t* const kFadeMembers[] = {
+    L"Toggle.toggleFadeInDuration", L"Toggle.toggleFadeOutDuration"};
+static const wchar_t* const kTintMembers[] = {
+    L"Tint.tintStrength", L"Tint.tintPreset"};
+static const wchar_t* const kBatMembers[] = {
+    L"batSignalStyle", L"batLogoBlur"};
+static const wchar_t* const kShadowFadeMembers[] = {
+    L"Shadows.shadowFadeInDuration", L"Shadows.shadowFadeOutDuration"};
+static const wchar_t* const kArrowMembers[] = {
+    L"General.customArrowScale", L"General.customArrowOffsetX",
+    L"General.customArrowOffsetY"};
+static const GroupSpec kGroups[] = {
+    {SEC_OVERLAY, L"Toggle.toggleOnDoubleClick", L"Toggle on Double-Click",
+     kFadeMembers, 2},
+    {SEC_OVERLAY, L"Tint.tintEnabled", L"Tint", kTintMembers, 2},
+    {SEC_OVERLAY, L"General.customArrowEnabled", L"Custom Shortcut Arrow:",
+     kArrowMembers, 3},
+    {SEC_SPOTLIGHT, L"batSignalEnabled", L"🦇 Bat Signal",
+     kBatMembers, 2},
+    {SEC_SHADOWS, L"Shadows.shadowGlobalTracking", L"Global Tracking",
+     kShadowFadeMembers, 2},
+};
+static HWND g_groupWnds[ARRAYSIZE(kGroups)] = {};
+static HWND g_groupTitle[ARRAYSIZE(kGroups)] = {};
+
+// Group frame window: paints pane bg + a 1px stroke frame. Created before
+// the rows so it sits BEHIND them; positioned by LayoutRows to wrap the
+// row range (it scrolls with the rows).
+static LRESULT CALLBACK GroupProc(HWND hwnd, UINT msg, WPARAM wParam,
+                                  LPARAM lParam) {
+    switch (msg) {
+        case WM_NCHITTEST:
+            // Click-through: the frame must never eat clicks meant for the
+            // title checkbox or the rows (it overlapped the checkbox's
+            // lower half).
+            return HTTRANSPARENT;
+        case WM_ERASEBKGND: {
+            // Opaque fill: without it, vacated pixels from other sections
+            // ghost through the group interiors (field-proven). The title
+            // checkbox is kept clean by geometry + forced repaint below.
+            HDC hdc = (HDC)wParam;
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            FillRect(hdc, &rc, g_brushBg);
+            return 1;
+        }
+        case WM_PAINT: {
+            // 1px frame; the top line leaves a GAP under the title checkbox
+            // (GWLP_USERDATA = gap width; gap starts at 10px raw).
+            PAINTSTRUCT ps;
+            HDC hdc = BeginPaint(hwnd, &ps);
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            int dpi = GetDpiForWindow(hwnd);
+            int gapL = MulDiv(10, dpi, 96);
+            int gapR = gapL + (int)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+            HPEN pen = CreatePen(PS_SOLID, 1, RGB(58, 58, 58));
+            HPEN old = (HPEN)SelectObject(hdc, pen);
+            MoveToEx(hdc, gapR, 0, nullptr);
+            LineTo(hdc, rc.right - 1, 0);
+            LineTo(hdc, rc.right - 1, rc.bottom - 1);
+            LineTo(hdc, 0, rc.bottom - 1);
+            LineTo(hdc, 0, 0);
+            LineTo(hdc, gapL, 0);
+            SelectObject(hdc, old);
+            DeleteObject(pen);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+
+
+static void RegisterGroupClass() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = GroupProc;
+    wc.hInstance = GetModuleHandle(nullptr);
+    wc.hbrBackground = nullptr;
+    wc.lpszClassName = L"AbTenebrisControl_Group";
+    RegisterClassW(&wc);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Wheel-reversal subclass for NATIVE scrollable controls (sidebar listbox,
+// profiles list): Doc wants the reversed wheel direction on ALL scrollbars,
+// and native controls' built-in mapping can't be set — so flip the delta
+// sign and let the control do the rest. dwRefData=1 marks the SIDEBAR,
+// which additionally tracks a hover item (subtle bg change on hover).
+static LRESULT CALLBACK WheelReverseProc(HWND hwnd, UINT msg, WPARAM wParam,
+                                         LPARAM lParam, UINT_PTR,
+                                         DWORD_PTR dwRefData) {
+    if (msg == WM_MOUSEWHEEL) {
+        short delta = (short)HIWORD(wParam);
+        if (delta != SHRT_MIN) delta = (short)-delta;  // flip (guard SHRT_MIN)
+        wParam = (wParam & 0xFFFF0000) | (WORD)delta;
+    } else if (dwRefData == 1 && msg == WM_MOUSEMOVE) {
+        int itemH = (int)SendMessageW(hwnd, LB_GETITEMHEIGHT, 0, 0);
+        if (itemH > 0) {
+            int count = (int)SendMessageW(hwnd, LB_GETCOUNT, 0, 0);
+            int idx = (short)HIWORD(lParam) / itemH;  // GET_Y_LPARAM needs windowsx.h
+            if (idx < 0 || idx >= count) idx = -1;
+            if (idx != g_sidebarHover) {
+                RECT rc;
+                if (g_sidebarHover >= 0 &&
+                    SendMessageW(hwnd, LB_GETITEMRECT, g_sidebarHover,
+                                 (LPARAM)&rc))
+                    InvalidateRect(hwnd, &rc, FALSE);
+                g_sidebarHover = idx;
+                if (idx >= 0 &&
+                    SendMessageW(hwnd, LB_GETITEMRECT, idx, (LPARAM)&rc))
+                    InvalidateRect(hwnd, &rc, FALSE);
+            }
+        }
+        TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, hwnd, 0};
+        TrackMouseEvent(&tme);
+    } else if (dwRefData == 1 && msg == WM_MOUSELEAVE) {
+        RECT rc;
+        if (g_sidebarHover >= 0 &&
+            SendMessageW(hwnd, LB_GETITEMRECT, g_sidebarHover, (LPARAM)&rc))
+            InvalidateRect(hwnd, &rc, FALSE);
+        g_sidebarHover = -1;
+    }
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
+static void ReverseWheel(HWND hwnd, bool sidebar = false) {
+    SetWindowSubclass(hwnd, WheelReverseProc, 1, sidebar ? 1 : 0);
+}
+
+// Trackbars: WM_MOUSEWHEEL goes to the FOCUS window — after a drag the
+// trackbar itself has focus, so the NATIVE control handled the wheel and
+// it never reached PaneProc (this is why every pane-side "fix" so far
+// changed nothing Doc could feel). Route the wheel to the parent pane and
+// eat the native handling completely.
+static LRESULT CALLBACK TrackbarWheelProc(HWND hwnd, UINT msg,
+                                          WPARAM wParam, LPARAM lParam,
+                                          UINT_PTR, DWORD_PTR) {
+    if (msg == WM_MOUSEWHEEL) {
+        // Route via the TOP window: WM_MOUSEWHEEL goes to the focus
+        // window, so a trackbar focused in pane A ate wheels meant for
+        // pane B (field-proven). The root routes purely by cursor.
+        SendMessageW(GetAncestor(hwnd, GA_ROOT), WM_MOUSEWHEEL, wParam,
+                     lParam);
+        return 0;
+    }
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
+static void RouteTrackbarWheel(HWND hwnd) {
+    SetWindowSubclass(hwnd, TrackbarWheelProc, 2, 0);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Responsive layout: reposition every row's controls. All coordinates are
+// PANE-RELATIVE (children live inside the pane window, which itself sits at
+// content.left — never add content.left to child positions).
+static void LayoutRows(HWND hwnd) {
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    int dpi = GetDpiForWindow(hwnd);
+    int barTop = rc.bottom - MulDiv(kBottomBarH, dpi, 96);
+    int margin = MulDiv(12, dpi, 96);
+    int labelW = MulDiv(210, dpi, 96);
+    int valueW = MulDiv(64, dpi, 96);
+    int rowH = MulDiv(36, dpi, 96);
+    RECT content = {MulDiv(kSidebarW + 6, dpi, 96),
+                    MulDiv(6, dpi, 96),
+                    rc.right - MulDiv(12, dpi, 96), barTop};
+    int paneW = content.right - content.left;
+    int ctlW = paneW - 2 * margin - labelW - valueW - MulDiv(8, dpi, 96);
+    int comboW = MulDiv(220, dpi, 96);
+    int editW = MulDiv(110, dpi, 96);
+    int pickW = MulDiv(70, dpi, 96);
+
+    int idx[SEC_COUNT] = {};
+    int extras[SEC_COUNT] = {};  // group spacing accumulated, per section
+    bool afterGroup[SEC_COUNT] = {};
+    // Group vertical rhythm (raw px): gap above a group's title, the title
+    // checkbox band, gap between title and first member row, gap below a
+    // group's frame before the next row.
+    const int grpBefore = MulDiv(10, dpi, 96);
+    const int grpTitle = MulDiv(20, dpi, 96);
+    const int grpTitleGap = MulDiv(6, dpi, 96);
+    const int grpAfter = MulDiv(8, dpi, 96);
+    for (auto& row : g_rows) {
+        int s = row.spec->section;
+        int i = idx[s]++;
+        HWND pane = g_panes[s];
+        if (!pane) continue;
+        int scroll = (int)GetWindowLongPtrW(pane, GWLP_USERDATA);
+        if (afterGroup[s]) {
+            extras[s] += grpAfter;
+            afterGroup[s] = false;
+        }
+        for (const GroupSpec& g : kGroups) {
+            if (g.section != s) continue;
+            if (wcscmp(g.memberKeys[0], row.spec->key) == 0)
+                extras[s] += grpBefore + grpTitle + grpTitleGap;
+            if (wcscmp(g.memberKeys[g.memberCount - 1], row.spec->key) == 0)
+                afterGroup[s] = true;
+        }
+        int y = margin + i * rowH + extras[s] - scroll;
+        row.lastY = y;
+
+        int ctlH = MulDiv(row.spec->kind == Kind::Slider ? 28 : 24, dpi, 96);
+        int ctlY = y + (rowH - ctlH) / 2;
+        if (row.label) {
+            // Rows living inside a titled group get 12px of label padding
+            // (Doc: the frame already indents them visually).
+            bool inGroup = false;
+            for (const GroupSpec& g : kGroups)
+                for (int mk = 0; mk < g.memberCount && !inGroup; mk++)
+                    if (wcscmp(g.memberKeys[mk], row.spec->key) == 0)
+                        inGroup = true;
+            MoveWindow(row.label, margin + (inGroup ? MulDiv(12, dpi, 96) : 0),
+                       y, labelW, rowH, !g_resizing);
+        }
+        // Slider column caps at 560px — precision dies on an endless track.
+        int sliderW = ctlW;
+        if (sliderW > MulDiv(560, dpi, 96)) sliderW = MulDiv(560, dpi, 96);
+        // One right-edge grid: value boxes, combos and hex fields all END on
+        // the same line (the value column's right edge).
+        int valueRight = margin + labelW + sliderW + MulDiv(8, dpi, 96) +
+                         valueW;
+        // Checkboxes span the whole row (own text); others sit in the ctl column.
+        int ctlX = margin + (row.spec->kind == Kind::Chk ? 0 : labelW);
+        int ctlWid =
+            row.spec->kind == Kind::Slider
+                ? sliderW
+                : (row.spec->kind == Kind::Combo
+                       ? comboW
+                       : (row.spec->kind == Kind::Color
+                              ? editW
+                              : (row.spec->kind == Kind::Chk
+                                     ? labelW + ctlW - MulDiv(20, dpi, 96)
+                                     : ctlW)));
+        if (row.spec->kind == Kind::Combo)
+            ctlX = valueRight - ctlWid;
+        else if (row.spec->kind == Kind::Color)
+            ctlX = valueRight - pickW - MulDiv(8, dpi, 96) - editW;
+        MoveWindow(row.ctl, ctlX, ctlY, ctlWid, ctlH, !g_resizing);
+        if (row.value) {
+            // Slider rows: the spinner occupies the editbox's last 16px —
+            // the pair stays flush to the value column's right edge.
+            // (UDS_ALIGNRIGHT auto-docking didn't track our MoveWindow
+            // layout, so the spin is placed by hand.)
+            int spinW = row.spin ? MulDiv(16, dpi, 96) : 0;
+            MoveWindow(row.value, valueRight - valueW, ctlY,
+                       valueW - spinW, MulDiv(24, dpi, 96), !g_resizing);
+            if (row.spin)
+                MoveWindow(row.spin, valueRight - spinW, ctlY, spinW,
+                           MulDiv(24, dpi, 96), !g_resizing);
+        }
+        if (wcscmp(row.spec->key, L"Tint.tintPreset") == 0) {
+            // The Color row: combo LEFT (slider column), then swatch (42),
+            // then the picker-icon button.
+            // +8raw = 10phys nudge (trackbar channel inset): Doc-px are
+            // PHYSICAL at 125%, so MulDiv(x,dpi,96) renders x*1.25.
+            int comboW2 = MulDiv(200, dpi, 96);  // 200raw = 250phys
+            int cbx = margin + labelW + MulDiv(8, dpi, 96);
+            MoveWindow(row.ctl, cbx, ctlY, comboW2, ctlH, !g_resizing);
+            MoveWindow(row.swatch, cbx + comboW2 + MulDiv(8, dpi, 96), ctlY,
+                       MulDiv(50, dpi, 96), ctlH, !g_resizing);
+            MoveWindow(row.pick, cbx + comboW2 + MulDiv(8, dpi, 96) +
+                                     MulDiv(50, dpi, 96) +
+                                     MulDiv(6, dpi, 96),
+                       ctlY, ctlH, ctlH, !g_resizing);
+        } else {
+            if (row.swatch)
+                MoveWindow(row.swatch, valueRight - pickW - MulDiv(28, dpi, 96),
+                           ctlY, MulDiv(24, dpi, 96), ctlH, !g_resizing);
+            if (row.pick)
+                MoveWindow(row.pick, valueRight - pickW, ctlY, pickW, ctlH,
+                           !g_resizing);
+        }
+    }
+
+    // Per-pane scrollbars: enable when the section's rows overflow the pane.
+    for (int s = 0; s < SEC_COUNT; s++) {
+        HWND pane = g_panes[s];
+        if (!pane) continue;
+        int n = 0;
+        for (const Row& r : g_rows)
+            if (r.spec->section == s) n++;
+        RECT prc;
+        GetClientRect(pane, &prc);
+        int contentH = margin * 2 + n * rowH + extras[s];
+        // The trailing bottom margin is padding, not content — it must never
+        // count as scrollable range (used to grant 1-8px phantom wheel
+        // scroll on sections whose rows all fit).
+        int usableH = contentH - margin;
+        SCROLLINFO si = {sizeof(si), SIF_RANGE | SIF_PAGE | SIF_POS};
+        si.nMax = usableH;
+        si.nPage = (UINT)(prc.bottom > 0 ? prc.bottom : 1);
+        si.nPos = (int)GetWindowLongPtrW(pane, GWLP_USERDATA);
+        if (usableH > prc.bottom) {
+            SetScrollInfo(pane, SB_VERT, &si, !g_resizing);
+            ShowScrollBar(pane, SB_VERT, !g_resizing);
+        } else {
+            SetWindowLongPtrW(pane, GWLP_USERDATA, 0);
+            // Also WIPE the scroll range: ShowScrollBar(FALSE) alone leaves
+            // stale si behind (measured: nMax 525 vs nPage 518 on hidden
+            // panes), and any later si read then trusts a phantom range.
+            SCROLLINFO wipe = {sizeof(wipe), SIF_RANGE | SIF_PAGE};
+            wipe.nPage = (UINT)(prc.bottom > 0 ? prc.bottom : 1);
+            SetScrollInfo(pane, SB_VERT, &wipe, FALSE);
+            ShowScrollBar(pane, SB_VERT, FALSE);
+        }
+        // Erase stale pixels from every reposition — INCLUDING children.
+        // WS_CLIPCHILDREN excludes child rects from the parent's erase, so
+        // rows vacated by a scroll keep ghost pixels unless RDW_ALLCHILDREN
+        // forces them in. During live resize we skip the sync repaint (it
+        // made resizing feel like it was "running math"); the full repaint
+        // happens once on WM_EXITSIZEMOVE.
+        if (!g_resizing) {
+            RedrawWindow(pane, nullptr, nullptr,
+                         RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN |
+                             RDW_UPDATENOW);
+        }
+        // Group frames wrap their member rows (pane-relative; they ride
+        // the same scroll offset); the title checkbox sits ON the top
+        // border and the frame leaves a gap beneath it.
+        for (int gi = 0; gi < (int)ARRAYSIZE(kGroups); gi++) {
+            if (kGroups[gi].section != s || !g_groupWnds[gi]) continue;
+            Row* rFirst =
+                FindRowByKey(kGroups[gi].memberKeys[0]);
+            Row* rLast = FindRowByKey(
+                kGroups[gi].memberKeys[kGroups[gi].memberCount - 1]);
+            if (!rFirst || !rLast) continue;
+            int pad = MulDiv(4, dpi, 96);
+            int titleH = MulDiv(20, dpi, 96);
+            // Top border runs through the middle of the title band, which
+            // sits grpTitleGap above the first member row.
+            int yTop = rFirst->lastY - MulDiv(6, dpi, 96) - titleH / 2;
+            int yBot = rLast->lastY + rowH + pad;
+            int fx = margin - MulDiv(8, dpi, 96);
+            MoveWindow(g_groupWnds[gi], fx, yTop,
+                       paneW - 2 * margin + MulDiv(16, dpi, 96), yBot - yTop,
+                       TRUE);
+            HDC tdc = GetDC(g_groupTitle[gi]);
+            HFONT of = (HFONT)SelectObject(tdc, g_font);
+            SIZE tsz = {};
+            GetTextExtentPoint32W(tdc, kGroups[gi].titleText,
+                                  (int)wcslen(kGroups[gi].titleText), &tsz);
+            SelectObject(tdc, of);
+            ReleaseDC(g_groupTitle[gi], tdc);
+            int cbW = tsz.cx + MulDiv(30, dpi, 96);
+            int cbH = titleH;
+            MoveWindow(g_groupTitle[gi], fx + MulDiv(10, dpi, 96),
+                       yTop - cbH / 2, cbW, cbH, TRUE);
+            SetWindowLongPtrW(g_groupWnds[gi], GWLP_USERDATA,
+                              tsz.cx + MulDiv(18, dpi, 96));
+        }
+    }
+}
+
+static std::wstring GetProfileDir() {
+    std::wstring dir = GetCfgDir();
+    return dir.empty() ? dir : dir + L"\\" + kProfilesDirName;
+}
+
+// Full window relayout: sidebar, bottom bar, panes, rows. Runs on WM_SIZE
+// (outside a drag) and once on WM_EXITSIZEMOVE.
+static void RelayoutAll(HWND hwnd) {
+    int dpi = GetDpiForWindow(hwnd);
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    int barTop = rc.bottom - MulDiv(kBottomBarH, dpi, 96);
+    SetWindowPos(g_sidebar, nullptr, 0, 0, MulDiv(kSidebarW, dpi, 96), barTop,
+                 SWP_NOZORDER | SWP_NOMOVE);
+    // Bottom bar, right-aligned: [Preview] [Apply] [Save] [Close],
+    // 12px between everything (Doc's layout).
+    int gap = MulDiv(12, dpi, 96);
+    int btnH = MulDiv(32, dpi, 96);
+    int by = barTop + (MulDiv(kBottomBarH, dpi, 96) - btnH) / 2;
+    int bx = rc.right - MulDiv(12, dpi, 96);
+    HWND order[3] = {g_btnCancel, g_btnSave, g_btnApply};
+    for (HWND btn : order) {
+        RECT br;
+        GetWindowRect(btn, &br);
+        int w = br.right - br.left;
+        bx -= w;
+        SetWindowPos(btn, nullptr, bx, by, 0, 0, SWP_NOZORDER | SWP_NOSIZE);
+        bx -= gap;
+    }
+    RECT pr;
+    GetWindowRect(g_chkPreview, &pr);
+    int pw = pr.right - pr.left;
+    SetWindowPos(g_chkPreview, nullptr, bx - pw + gap,
+                 by + (btnH - MulDiv(22, dpi, 96)) / 2, 0, 0,
+                 SWP_NOZORDER | SWP_NOSIZE);
+    RECT content = {MulDiv(kSidebarW + 6, dpi, 96),
+                    MulDiv(6, dpi, 96),
+                    rc.right - MulDiv(10, dpi, 96), barTop};
+    for (int s = 0; s < SEC_COUNT; s++) {
+        if (g_panes[s])
+            MoveWindow(g_panes[s], content.left, content.top,
+                       content.right - content.left,
+                       content.bottom - content.top, TRUE);
+    }
+    LayoutRows(hwnd);
+}
+
+// File logger (Wh_Log from tool mods doesn't reach OutputDebugString; this
+// gives the same diagnose-before-fix loop the engine mod has).
+static void CtlLog(const wchar_t* fmt, ...) {
+    wchar_t buf[512];
+    va_list a;
+    va_start(a, fmt);
+    vswprintf(buf, 512, fmt, a);
+    va_end(a);
+    std::wstring dir = GetCfgDir();
+    if (dir.empty()) return;
+    CreateDirectoryW(dir.c_str(), nullptr);
+    HANDLE h = CreateFileW((dir + L"\\control_log.txt").c_str(),
+                           FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
+                           OPEN_ALWAYS, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    wchar_t line[600];
+    swprintf_s(line, L"%u %s\r\n", GetTickCount(), buf);
+    DWORD wrote;
+    WriteFile(h, line, (DWORD)(wcslen(line) * sizeof(wchar_t)), &wrote, nullptr);
+    CloseHandle(h);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Value <-> control plumbing
+
+static std::wstring GetCtlValueText(const Row& row) {
+    wchar_t buf[64] = {};
+    switch (row.spec->kind) {
+        case Kind::Chk:
+            return SendMessageW(row.ctl, BM_GETCHECK, 0, 0) == BST_CHECKED
+                       ? L"1"
+                       : L"0";
+        case Kind::Slider: {
+            int v = (int)SendMessageW(row.ctl, TBM_GETPOS, 0, 0);
+            swprintf_s(buf, L"%d", v);
+            return buf;
+        }
+        case Kind::Combo: {
+            int sel = (int)SendMessageW(row.ctl, CB_GETCURSEL, 0, 0);
+            if (sel < 0) return L"";
+            return row.spec->options[sel];
+        }
+        case Kind::Color: {
+            wchar_t hex[32] = {};
+            GetWindowTextW(row.ctl, hex, 32);
+            return hex;
+        }
+    }
+    return L"";
+}
+
+static void SetCtlFromValue(Row& row, const std::wstring& val) {
+    switch (row.spec->kind) {
+        case Kind::Chk:
+            SendMessageW(row.ctl, BM_SETCHECK,
+                         (val == L"1" || _wtoi(val.c_str()) != 0) ? BST_CHECKED
+                                                                  : BST_UNCHECKED,
+                         0);
+            break;
+        case Kind::Slider: {
+            int v = _wtoi(val.c_str());
+            if (v < row.spec->minV) v = row.spec->minV;
+            if (v > row.spec->maxV) v = row.spec->maxV;
+            CtlLog(L"[SET] %s v=%d editHwnd=0x%p", row.spec->key, v,
+                   (void*)row.value);
+            g_syncing = true;
+            SendMessageW(row.ctl, TBM_SETPOS, TRUE, (LPARAM)v);
+            if (row.value) {
+                wchar_t buf[32];
+                swprintf_s(buf, L"%d", v);
+                BOOL ok = SetWindowTextW(row.value, buf);
+                CtlLog(L"[SET] edit text '%s' ok=%d", buf, (int)ok);
+            }
+            g_syncing = false;
+            break;
+        }
+        case Kind::Combo: {
+            int sel = -1;
+            for (int i = 0; i < row.spec->optionCount; i++) {
+                if (val == row.spec->options[i]) {
+                    sel = i;
+                    break;
+                }
+            }
+            if (sel < 0) sel = 0;
+            SendMessageW(row.ctl, CB_SETCURSEL, sel, 0);
+            break;
+        }
+        case Kind::Color:
+            SetWindowTextW(row.ctl, val.c_str());
+            break;
+    }
+}
+
+static void CollectAllValues(std::unordered_map<std::wstring, std::wstring>& out,
+                             const std::unordered_map<std::wstring, std::wstring>* fillMissing) {
+    for (auto& row : g_rows) {
+        out[row.spec->key] = GetCtlValueText(row);
+    }
+    // Row-less enable keys (sidebar toggles + group titles) come from the
+    // state map.
+    for (const SidebarToggle& t : kSidebarToggles) {
+        if (out.find(t.key) == out.end())
+            out[t.key] = RowlessOn(t.key) ? L"1" : L"0";
+    }
+    for (const GroupSpec& g : kGroups) {
+        if (out.find(g.titleKey) == out.end())
+            out[g.titleKey] = RowlessOn(g.titleKey) ? L"1" : L"0";
+    }
+    if (!g_customHex.empty())
+        out[L"Tint.tintColorHex"] = g_customHex;  // picker's write path
+    // Keys not shown in the UI survive from the given snapshot.
+    if (fillMissing) {
+        for (const auto& e : *fillMissing) {
+            if (out.find(e.first) == out.end()) out[e.first] = e.second;
+        }
+    }
+}
+
+static void WriteConfigFromUI();  // defined below
+static Row* FindRowByKey(const wchar_t* key) {
+    for (auto& row : g_rows)
+        if (wcscmp(row.spec->key, key) == 0) return &row;
+    return nullptr;
+}
+
+// Row-less enable keys (sidebar toggles + group-title checkboxes) live in
+// g_toggleState; one setter keeps every UI surface bound to the key in sync.
+static bool RowlessOn(const wchar_t* key) {
+    auto it = g_toggleState.find(key);
+    return it != g_toggleState.end() && it->second;
+}
+
+static void ApplyGroupEnableStates() {
+    for (int gi = 0; gi < (int)ARRAYSIZE(kGroups); gi++) {
+        bool on = RowlessOn(kGroups[gi].titleKey);
+        for (int m = 0; m < kGroups[gi].memberCount; m++) {
+            Row* r = FindRowByKey(kGroups[gi].memberKeys[m]);
+            if (!r) continue;
+            EnableWindow(r->ctl, on);
+            if (r->value) EnableWindow(r->value, on);
+            if (r->spin) EnableWindow(r->spin, on);
+            if (r->label) EnableWindow(r->label, on);
+        }
+    }
+}
+
+static void SetRowlessKey(const wchar_t* key, bool on) {
+    g_toggleState[key] = on;
+    for (int gi = 0; gi < (int)ARRAYSIZE(kGroups); gi++) {
+        if (wcscmp(kGroups[gi].titleKey, key) == 0 && g_groupTitle[gi])
+            SendMessageW(g_groupTitle[gi], BM_SETCHECK,
+                         on ? BST_CHECKED : BST_UNCHECKED, 0);
+    }
+    ApplyGroupEnableStates();
+    if (g_sidebar) InvalidateRect(g_sidebar, nullptr, TRUE);
+}
+
+// Sidebar checkbox toggle: flip one enable-key, write the file, refresh the
+// row control + sidebar. Not routed through the dirty state — it IS a save.
+// Keys with a row use the row control; row-less keys live in g_toggleState.
+static void ToggleSidebarEnable(const wchar_t* key) {
+    Row* row = FindRowByKey(key);
+    if (row) {
+        bool on = SendMessageW(row->ctl, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        SetCtlFromValue(*row, on ? L"0" : L"1");
+    } else {
+        SetRowlessKey(key, !RowlessOn(key));
+    }
+    WriteConfigFromUI();
+    InvalidateRect(g_sidebar, nullptr, TRUE);
+}
+
+// Checked state of a sidebar toggle: row control if the key has one,
+// g_toggleState otherwise.
+static bool SidebarToggleOn(const SidebarToggle& t) {
+    Row* row = FindRowByKey(t.key);
+    if (row) return SendMessageW(row->ctl, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    auto it = g_toggleState.find(t.key);
+    return it != g_toggleState.end() && it->second;
+}
+
+static void CtrlMarkDirty() {
+    if (g_loading) return;
+    if (!g_dirty) {
+        g_dirty = true;
+        Wh_Log(L"[CTRL] dirty -> enabling Apply/Save");
+        EnableWindow(g_btnApply, TRUE);
+        EnableWindow(g_btnSave, TRUE);
+        SetWindowTextW(g_btnCancel, L"Cancel");
+    }
+}
+
+static void WriteConfigFromUI() {
+    std::unordered_map<std::wstring, std::wstring> kv;
+    CollectAllValues(kv, &g_initialSnapshot);
+    if (WriteConfigMap(kv)) {
+        Wh_Log(L"[CTRL] config written (%zu keys)", kv.size());
+    } else {
+        Wh_Log(L"[CTRL] config WRITE FAILED");
+    }
+}
+
+static void ApplyClearedDirty() {
+    g_dirty = false;
+    EnableWindow(g_btnApply, FALSE);
+    EnableWindow(g_btnSave, FALSE);
+    SetWindowTextW(g_btnCancel, L"Close");
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Pane building
+
+static void OnControlChanged();  // defined after the window state section
+
+// Panes are real windows (not STATICs) whose job is forwarding child
+// notifications (WM_COMMAND / WM_HSCROLL / ...) up to the settings window —
+// notifications go to the immediate parent, and rows are pane children —
+// plus vertical scrolling when a section's rows overflow the pane.
+static LRESULT CALLBACK PaneProc(HWND hwnd, UINT msg, WPARAM wParam,
+                                 LPARAM lParam) {
+    switch (msg) {
+        case WM_COMMAND:
+        case WM_HSCROLL:
+        case WM_DRAWITEM:
+        case WM_MEASUREITEM:
+        case WM_NOTIFY:
+            return SendMessageW(GetParent(hwnd), msg, wParam, lParam);
+        case WM_VSCROLL: {
+            SCROLLINFO si = {sizeof(si), SIF_ALL};
+            GetScrollInfo(hwnd, SB_VERT, &si);
+            int old = si.nPos;
+            switch (LOWORD(wParam)) {
+                case SB_LINEUP: si.nPos -= 40; break;
+                case SB_LINEDOWN: si.nPos += 40; break;
+                case SB_PAGEUP: si.nPos -= (int)si.nPage; break;
+                case SB_PAGEDOWN: si.nPos += (int)si.nPage; break;
+                case SB_THUMBTRACK:
+                case SB_THUMBPOSITION: si.nPos = si.nTrackPos; break;
+            }
+            si.fMask = SIF_POS;
+            SetScrollInfo(hwnd, SB_VERT, &si, TRUE);
+            GetScrollInfo(hwnd, SB_VERT, &si);  // read back the clamped pos
+            if (si.nPos != old) {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, si.nPos);
+                SendMessageW(GetParent(hwnd), WM_APP_RELAYOUT, 0, 0);
+            }
+            return 0;
+        }
+        case WM_MOUSEWHEEL: {
+            // Wheel over a value spinbox adjusts THAT value; otherwise the
+            // pane scrolls (only if it actually overflows). Direction:
+            // REVERSED per Doc — wheel down = content up.
+            int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+            // Geometry hit-test, NOT ChildWindowFromPoint: a group frame's
+            // rect CONTAINS its member rows, so ChildWindowFromPoint could
+            // hand back the frame and silently kill the wheel (field-proven:
+            // only the ungrouped "Overlay Opacity" row ever matched).
+            POINT pt;
+            GetCursorPos(&pt);
+            for (auto& row : g_rows) {
+                if (!row.ctl || GetParent(row.ctl) != hwnd) continue;
+                if (!IsWindowEnabled(row.ctl)) continue;
+                bool hit = false;
+                for (HWND t : {row.value, row.spin, row.ctl}) {
+                    if (!t) continue;
+                    RECT rc;
+                    GetWindowRect(t, &rc);
+                    if (PtInRect(&rc, pt)) {
+                        hit = true;
+                        break;
+                    }
+                }
+                if (!hit) continue;
+                if (row.spec->kind == Kind::Slider) {
+                    int v = (int)SendMessageW(row.ctl, TBM_GETPOS, 0, 0);
+                    // Doc's mapping: wheel DOWN = value DOWN. Step =
+                    // ~1% of the slider's range (min 1).
+                    int range = row.spec->maxV - row.spec->minV;
+                    int step = range > 100 ? (range + 50) / 100 : 1;
+                    v += (delta > 0 ? step : -step);
+                    if (v < row.spec->minV) v = row.spec->minV;
+                    if (v > row.spec->maxV) v = row.spec->maxV;
+                    SetCtlFromValue(row, std::to_wstring(v));
+                    OnControlChanged();
+                    CtlLog(L"[WHEEL] slider '%s' delta=%d -> v=%d",
+                           row.spec->key, delta, v);
+                    return 0;
+                }
+                break;  // over a non-slider control: fall through to scroll
+            }
+            // No phantom scrolling: only act when the scrollbar genuinely
+            // has a range (stale/off-by-rounding si used to let panes whose
+            // content fits wheel-scroll a few pixels with no bar visible).
+            SCROLLINFO wsi = {sizeof(wsi), SIF_ALL};
+            if (GetScrollInfo(hwnd, SB_VERT, &wsi) &&
+                wsi.nMax - wsi.nMin + 1 > (int)wsi.nPage) {
+                // Doc's mapping: wheel DOWN = content moves UP.
+                SendMessageW(hwnd, WM_VSCROLL,
+                             delta > 0 ? SB_LINEUP : SB_LINEDOWN, 0);
+                CtlLog(L"[WHEEL] pane scroll delta=%d", delta);
+            }
+            return 0;
+        }
+        case WM_ERASEBKGND: {
+            // Panes MUST erase: without this every scroll/relayout leaves
+            // ghost rows painted over stale pixels.
+            HDC hdc = (HDC)wParam;
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            FillRect(hdc, &rc, g_brushBg);
+            // Section frame (Doc: see where each tab zone starts/ends).
+            // The profiles pane docks under General's rows, so it draws
+            // only sides + bottom and continues General's frame.
+            if (hwnd == g_panes[SEC_PROFILES]) {
+                RECT l = {rc.left, rc.top, rc.left + 1, rc.bottom};
+                RECT r = {rc.right - 1, rc.top, rc.right, rc.bottom};
+                RECT b = {rc.left, rc.bottom - 1, rc.right, rc.bottom};
+                FillRect(hdc, &l, g_brushStroke);
+                FillRect(hdc, &r, g_brushStroke);
+                FillRect(hdc, &b, g_brushStroke);
+            } else {
+                FrameRect(hdc, &rc, g_brushStroke);
+            }
+            return 1;
+        }
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void RegisterPaneClass() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = PaneProc;
+    wc.hInstance = GetModuleHandle(nullptr);
+    wc.hbrBackground = nullptr;
+    wc.lpszClassName = L"AbTenebrisControl_Pane";
+    RegisterClassW(&wc);
+}
+
+static void BuildSectionPanes(HWND parent, const RECT& content) {
+    RegisterPaneClass();
+    int dpi = GetDpiForWindow(parent);
+    int rowH = MulDiv(36, dpi, 96);
+    int labelW = MulDiv(210, dpi, 96);
+    int margin = MulDiv(12, dpi, 96);
+    HINSTANCE hInst = GetModuleHandle(nullptr);
+
+    g_rows.clear();
+    for (int s = 0; s < SEC_COUNT; s++) g_panes[s] = nullptr;
+
+    for (const CtlSpec& spec : kSpecs) {
+        if (!g_panes[spec.section]) {
+            g_panes[spec.section] = CreateWindowExW(
+                0, L"AbTenebrisControl_Pane", nullptr,
+                WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+                content.left, content.top, content.right - content.left,
+                content.bottom - content.top, parent, nullptr, hInst, nullptr);
+            // Group frames + their title checkboxes: created BEFORE the
+            // rows so the frames sit behind them (checkboxes must be after
+            // their frame, which they are — same loop).
+            RegisterGroupClass();
+            for (int gi = 0; gi < (int)ARRAYSIZE(kGroups); gi++) {
+                if (kGroups[gi].section != spec.section) continue;
+                g_groupWnds[gi] = CreateWindowExW(
+                    0, L"AbTenebrisControl_Group", nullptr,
+                    WS_CHILD | WS_VISIBLE, 0, 0, 0, 0,
+                    g_panes[spec.section], nullptr, hInst, nullptr);
+                g_groupTitle[gi] = CreateWindowExW(
+                    0, L"BUTTON", kGroups[gi].titleText,
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                    0, 0, 0, 0, g_panes[spec.section],
+                    (HMENU)(INT_PTR)(5000 + gi), hInst, nullptr);
+                SendMessageW(g_groupTitle[gi], WM_SETFONT, (WPARAM)g_font,
+                             TRUE);
+                Darkize(g_groupTitle[gi]);
+            }
+        }
+        HWND pane = g_panes[spec.section];
+
+        Row row;
+        row.spec = &spec;
+        int rowIndex = 0;
+        for (const Row& r : g_rows)
+            if (r.spec->section == spec.section) rowIndex++;
+
+        int y = margin + rowIndex * rowH;
+        int x = margin;
+
+        // Checkboxes carry their OWN text — no separate label STATIC. Only
+        // non-checkbox rows get the label column. Labels span the full row
+        // height (SS_CENTERIMAGE) so descenders never clip.
+        bool isBat = wcsstr(spec.key, L"batSignal") != nullptr;
+        HWND label = nullptr;
+        if (spec.kind != Kind::Chk) {
+            label = CreateWindowExW(
+                0, L"STATIC", spec.label,
+                WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, x, y, labelW, rowH,
+                pane, nullptr, hInst, nullptr);
+            SendMessageW(label, WM_SETFONT,
+                         (WPARAM)(isBat ? g_fontEmoji : g_font), TRUE);
+        }
+        row.label = label;
+
+        int cx = x + labelW;
+        int ctlW = content.right - content.left - labelW -
+                   MulDiv(64 + 8, dpi, 96) - 2 * margin;
+        int ctlH = MulDiv(spec.kind == Kind::Slider ? 28 : 24, dpi, 96);
+        DWORD style = WS_CHILD | WS_VISIBLE;
+        HWND ctl = nullptr;
+        switch (spec.kind) {
+            case Kind::Chk:
+                ctl = CreateWindowExW(
+                    0, L"BUTTON", spec.label,
+                    style | WS_TABSTOP | BS_AUTOCHECKBOX, x,
+                    y + (rowH - ctlH) / 2, labelW + ctlW, ctlH, pane,
+                    (HMENU)(INT_PTR)(2000 + (int)g_rows.size()), hInst, nullptr);
+                break;
+            case Kind::Slider:
+                ctl = CreateWindowExW(0, TRACKBAR_CLASSW, nullptr,
+                                      style | WS_TABSTOP | TBS_HORZ |
+                                          TBS_NOTICKS | TBS_FIXEDLENGTH |
+                                          TBS_BOTH,
+                                      cx, y, ctlW - MulDiv(70, dpi, 96), ctlH,
+                                      pane,
+                                      (HMENU)(INT_PTR)(2000 + (int)g_rows.size()),
+                                      hInst, nullptr);
+                SendMessageW(ctl, TBM_SETRANGE, TRUE,
+                             MAKELPARAM(spec.minV, spec.maxV));
+                RouteTrackbarWheel(ctl);
+                break;
+            case Kind::Combo:
+                ctl = CreateWindowExW(0, L"COMBOBOX", nullptr,
+                                      style | WS_TABSTOP | CBS_DROPDOWNLIST,
+                                      cx, y, MulDiv(220, dpi, 96),
+                                      MulDiv(300, dpi, 96), pane,
+                                      (HMENU)(INT_PTR)(2000 + (int)g_rows.size()),
+                                      hInst, nullptr);
+                for (int i = 0; i < spec.optionCount; i++)
+                    SendMessageW(ctl, CB_ADDSTRING, 0,
+                                 (LPARAM)(spec.displayNames
+                                              ? spec.displayNames[i]
+                                              : spec.options[i]));
+                break;
+            case Kind::Color:
+                ctl = CreateWindowExW(
+                    WS_EX_CLIENTEDGE, L"EDIT", nullptr,
+                    style | WS_TABSTOP | ES_AUTOHSCROLL, cx, y,
+                    MulDiv(110, dpi, 96), ctlH, pane,
+                    (HMENU)(INT_PTR)(2000 + (int)g_rows.size()), hInst, nullptr);
+                row.swatch = CreateWindowExW(
+                    0, L"BUTTON", nullptr,
+                    style | BS_OWNERDRAW, cx + MulDiv(116, dpi, 96),
+                    y, MulDiv(24, dpi, 96), ctlH, pane,
+                    (HMENU)(INT_PTR)ID_COLOR_SWATCH, hInst, nullptr);
+                Darkize(row.swatch);
+                row.pick = CreateWindowExW(
+                    0, L"BUTTON", L"Pick…",
+                    style | WS_TABSTOP | BS_OWNERDRAW, cx + MulDiv(146, dpi, 96),
+                    y, MulDiv(70, dpi, 96), ctlH, pane,
+                    (HMENU)(INT_PTR)ID_COLOR_PICK, hInst, nullptr);
+                SendMessageW(row.pick, WM_SETFONT, (WPARAM)g_font, TRUE);
+                Darkize(row.pick);
+                break;
+        }
+        if (wcscmp(spec.key, L"Tint.tintPreset") == 0) {
+            // The Color row: swatch preview + picker-icon button.
+            row.swatch = CreateWindowExW(
+                0, L"BUTTON", nullptr, style | BS_OWNERDRAW, cx, y,
+                MulDiv(42, dpi, 96), ctlH, pane,
+                (HMENU)(INT_PTR)ID_COLOR_SWATCH, hInst, nullptr);
+            row.pick = CreateWindowExW(
+                0, L"BUTTON", nullptr, style | WS_TABSTOP | BS_OWNERDRAW, cx,
+                y, MulDiv(30, dpi, 96), ctlH, pane,
+                (HMENU)(INT_PTR)ID_TINT_PICK, hInst, nullptr);
+            Darkize(row.pick);
+        }
+        row.ctl = ctl;
+        SendMessageW(ctl, WM_SETFONT, (WPARAM)g_font, TRUE);
+        Darkize(ctl);
+        if (isBat) SendMessageW(ctl, WM_SETFONT, (WPARAM)g_fontEmoji, TRUE);
+
+        if (spec.kind == Kind::Slider) {
+            // Numeric edit next to the slider, two-way synced (id 3000+idx).
+            row.value = CreateWindowExW(
+                WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE |
+                                                  WS_TABSTOP | ES_NUMBER,
+                cx + ctlW - MulDiv(70, dpi, 96), y + MulDiv(4, dpi, 96),
+                MulDiv(66, dpi, 96), MulDiv(24, dpi, 96), pane,
+                (HMENU)(INT_PTR)(3000 + (int)g_rows.size()), hInst, nullptr);
+            SendMessageW(row.value, WM_SETFONT, (WPARAM)g_font, TRUE);
+            Darkize(row.value);
+            // Native up-down spinner — placed BY HAND in LayoutRows at the
+            // value edit's right edge (UDS_ALIGNRIGHT auto-dock didn't track
+            // our MoveWindow layout). NO UDS_SETBUDDYINT: it writes
+            // thousands separators ("1,440") that would poison the
+            // ES_NUMBER parse — UDN_DELTAPOS drives our setter instead.
+            row.spin = CreateWindowExW(
+                0, UPDOWN_CLASSW, nullptr,
+                WS_CHILD | WS_VISIBLE | UDS_ARROWKEYS | UDS_HOTTRACK,
+                0, 0, 0, 0, pane,
+                (HMENU)(INT_PTR)(4000 + (int)g_rows.size()), hInst, nullptr);
+            SendMessageW(row.spin, UDM_SETRANGE32, spec.minV, spec.maxV);
+        }
+
+        g_rows.push_back(row);
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Profiles + diagnostics panes
+
+// Profiles UI is a disabled PLACEHOLDER for now (Doc 2026-11-12: the
+// infrastructure isn't there yet - list/empty-state/name edit removed,
+// one editable combo reading "NOT AVAILABLE", buttons disabled). This
+// keeps old call sites harmless; the real implementation comes later.
+static void RefreshProfileList(HWND parent) {}
+
+static void BuildProfilesPane(HWND parent, const RECT& content) {
+    HINSTANCE hInst = GetModuleHandle(nullptr);
+    // Docked INSIDE the General tab, below its rows (Doc: no Profiles
+    // section; the widgets live under General's own rows).
+    int dpi = GetDpiForWindow(parent);
+    int m = MulDiv(12, dpi, 96);
+    int genRows = 0;
+    for (const CtlSpec& sp : kSpecs)
+        if (sp.section == SEC_GENERAL) genRows++;
+    int rowH36 = MulDiv(36, dpi, 96);
+    int profTop = m + genRows * rowH36 + m;
+    HWND pane = CreateWindowExW(0, L"AbTenebrisControl_Pane", nullptr,
+                                WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+                                content.left, content.top + profTop,
+                                content.right - content.left,
+                                content.bottom - content.top - profTop, parent,
+                                nullptr, hInst, nullptr);
+    g_panes[SEC_PROFILES] = pane;
+
+    HWND hint = CreateWindowExW(
+        0, L"STATIC",
+        L"A profile is a named snapshot of all settings.\n"
+        L"Loading one applies it live — the engine picks it up instantly.",
+        WS_CHILD | WS_VISIBLE | WS_DISABLED, m, m,
+        content.right - content.left - 2 * m,
+        MulDiv(36, dpi, 96), pane, nullptr, hInst, nullptr);
+    SendMessageW(hint, WM_SETFONT, (WPARAM)g_font, TRUE);
+    // Placeholder banner (white — it's the active status; the hint above
+    // is the grayed one).
+    HWND avail = CreateWindowExW(
+        0, L"STATIC", L"*** NOT AVAILABLE YET ***",
+        WS_CHILD | WS_VISIBLE, m, m + MulDiv(40, dpi, 96),
+        content.right - content.left - 2 * m, MulDiv(18, dpi, 96), pane,
+        nullptr, hInst, nullptr);
+    SendMessageW(avail, WM_SETFONT, (WPARAM)g_font, TRUE);
+
+    // Profile selector: editable combo (CBS_DROPDOWN = built-in edit box,
+    // no custom widget needed) - DISABLED placeholder until the profiles
+    // infrastructure lands.
+    int rowY = MulDiv(96, dpi, 96);  // well below hint + NOT-AVAILABLE banner
+    HWND name = CreateWindowExW(
+        WS_EX_CLIENTEDGE, L"COMBOBOX", L"NOT AVAILABLE",
+        WS_CHILD | WS_VISIBLE | CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_DISABLED,
+        m, rowY, MulDiv(220, dpi, 96), MulDiv(120, dpi, 96), pane,
+        (HMENU)(INT_PTR)ID_PROFILE_NAME, hInst, nullptr);
+    SendMessageW(name, WM_SETFONT, (WPARAM)g_font, TRUE);
+    Darkize(name);
+    EnableWindow(name, FALSE);
+
+    struct Btn {
+        int id;
+        const wchar_t* text;
+        int x;
+        int w;
+    };
+    int bY = rowY;
+    const Btn btns[] = {
+        {ID_PROFILE_SAVE, L"Save Profile", m + MulDiv(232, dpi, 96),
+         MulDiv(104, dpi, 96)},
+        {ID_PROFILE_APPLY, L"Load", m + MulDiv(344, dpi, 96),
+         MulDiv(80, dpi, 96)},
+        {ID_PROFILE_DELETE, L"Delete", m + MulDiv(432, dpi, 96),
+         MulDiv(80, dpi, 96)}};
+    for (const Btn& b : btns) {
+        HWND btn = CreateWindowExW(0, L"BUTTON", b.text,
+                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+                                       BS_OWNERDRAW,
+                                   b.x, bY, b.w, MulDiv(26, dpi, 96), pane,
+                                   (HMENU)(INT_PTR)b.id, hInst, nullptr);
+        SendMessageW(btn, WM_SETFONT, (WPARAM)g_font, TRUE);
+        Darkize(btn);
+        // Placeholder era: profiles don't work yet, buttons are inert.
+        EnableWindow(btn, FALSE);
+    }
+    RefreshProfileList(pane);
+}
+
+static void BuildDiagnosticsPane(HWND parent, const RECT& content) {
+    HINSTANCE hInst = GetModuleHandle(nullptr);
+    HWND pane = CreateWindowExW(0, L"AbTenebrisControl_Pane", nullptr,
+                                WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+                                content.left, content.top,
+                                content.right - content.left,
+                                content.bottom - content.top, parent, nullptr,
+                                hInst, nullptr);
+    g_panes[SEC_DIAGNOSTICS] = pane;
+    int dpi = GetDpiForWindow(parent);
+    int m = MulDiv(12, dpi, 96);
+
+    HWND st = CreateWindowExW(
+        0, L"STATIC",
+        L"Config file (read live by the engine — select and copy):",
+        WS_CHILD | WS_VISIBLE, m, m, content.right - content.left - 2 * m,
+        MulDiv(20, dpi, 96), pane, nullptr, hInst, nullptr);
+    SendMessageW(st, WM_SETFONT, (WPARAM)g_font, TRUE);
+
+    // Readonly edit = selectable/copyable path field.
+    std::wstring cfg = GetCfgPath();
+    HWND path = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", cfg.c_str(),
+                                WS_CHILD | WS_VISIBLE | ES_READONLY |
+                                    ES_AUTOHSCROLL,
+                                m, m + MulDiv(28, dpi, 96),
+                                content.right - content.left - 2 * m,
+                                MulDiv(24, dpi, 96), pane, nullptr, hInst,
+                                nullptr);
+    SendMessageW(path, WM_SETFONT, (WPARAM)g_font, TRUE);
+    Darkize(path);
+
+    HWND info = CreateWindowExW(
+        0, L"STATIC",
+        L"Engine: transparent-desktop-icons-spotlight\n"
+        L"Control panel: ab-tenebris-control\n"
+        L"Verbose probe logging can be enabled on request when reporting a bug.",
+        WS_CHILD | WS_VISIBLE, m, m + MulDiv(68, dpi, 96),
+        content.right - content.left - 2 * m, MulDiv(72, dpi, 96), pane,
+        nullptr, hInst, nullptr);
+    SendMessageW(info, WM_SETFONT, (WPARAM)g_font, TRUE);
+
+    HWND btn = CreateWindowExW(0, L"BUTTON", L"Open Config Folder",
+                               WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+                                   BS_OWNERDRAW,
+                               m, m + MulDiv(148, dpi, 96),
+                               MulDiv(170, dpi, 96), MulDiv(28, dpi, 96), pane,
+                               (HMENU)(INT_PTR)ID_DIAG_OPENFOLDER, hInst,
+                               nullptr);
+    SendMessageW(btn, WM_SETFONT, (WPARAM)g_font, TRUE);
+    Darkize(btn);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Config write/read on window open/close
+
+static void LoadValuesIntoControls() {
+    g_loading = true;
+    std::unordered_map<std::wstring, std::wstring> kv;
+    std::wstring path = GetCfgPath();
+    if (!ReadConfigFile(path, kv) || kv.empty()) {
+        // Engine hasn't imported yet: fall back to defaults matching the
+        // Windhawk block defaults (the engine will self-import on its side).
+        for (const auto& e : kCtrlCfgKeys) kv[e.key] = e.isString ? L"" : L"0";
+        kv[L"Toggle.overlayEnabled"] = L"1";      // engine default is TRUE
+        kv[L"General.customArrowEnabled"] = L"1";  // engine default is TRUE
+    }
+    g_initialSnapshot = kv;
+    for (auto& row : g_rows) {
+        auto it = kv.find(row.spec->key);
+        if (it != kv.end()) SetCtlFromValue(row, it->second);
+    }
+    for (const SidebarToggle& t : kSidebarToggles) {
+        auto it = kv.find(t.key);
+        g_toggleState[t.key] =
+            (it != kv.end() ? _wtoi(it->second.c_str()) : 0) != 0;
+    }
+    for (const GroupSpec& g : kGroups) {
+        auto it = kv.find(g.titleKey);
+        g_toggleState[g.titleKey] =
+            (it != kv.end() ? _wtoi(it->second.c_str()) : 0) != 0;
+        SendMessageW(g_groupTitle[&g - kGroups], BM_SETCHECK,
+                     g_toggleState[g.titleKey] ? BST_CHECKED : BST_UNCHECKED,
+                     0);
+    }
+    {
+        auto it = kv.find(L"Tint.tintColorHex");
+        g_customHex = (it != kv.end()) ? it->second : L"";
+    }
+    ApplyGroupEnableStates();
+    g_loading = false;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Settings window proc
+
+static void SwitchSection(int section) {
+    g_curSection = section;
+    for (int s = 0; s < SEC_COUNT; s++) {
+        if (g_panes[s]) ShowWindow(g_panes[s], s == section ? SW_SHOW : SW_HIDE);
+    }
+    // The profiles UI rides along with the General tab.
+    if (g_panes[SEC_PROFILES])
+        ShowWindow(g_panes[SEC_PROFILES],
+                   section == SEC_GENERAL ? SW_SHOW : SW_HIDE);
+    InvalidateRect(g_sidebar, nullptr, TRUE);
+}
+
+static void OnControlChanged() {
+    CtrlMarkDirty();
+    if (SendMessageW(g_chkPreview, BM_GETCHECK, 0, 0) == BST_CHECKED) {
+        // Debounced live write: the engine's watcher applies it ~instantly.
+        SetTimer(g_settingsWnd, TIMER_PREVIEW, 150, nullptr);
+    }
+}
+
+static void ShowColorPicker(HWND hwnd, Row& row) {
+    static COLORREF custom[16] = {};
+    CHOOSECOLORW cc = {};
+    cc.lStructSize = sizeof(cc);
+    cc.hwndOwner = hwnd;
+    cc.lpCustColors = custom;
+    cc.Flags = CC_FULLOPEN | CC_RGBINIT;
+
+    // Start from the current hex if parseable.
+    wchar_t hex[32] = {};
+    GetWindowTextW(row.ctl, hex, 32);
+    PCWSTR p = hex;
+    while (*p == L' ' || *p == L'#') p++;
+    if (wcslen(p) == 6) {
+        wchar_t b[3] = {0, 0, 0};
+        auto byteAt = [&](int i) {
+            b[0] = p[i * 2];
+            b[1] = p[i * 2 + 1];
+            return (int)wcstoul(b, nullptr, 16);
+        };
+        cc.rgbResult = RGB(byteAt(0), byteAt(1), byteAt(2));
+    }
+
+    if (ChooseColorW(&cc)) {
+        wchar_t out[16];
+        swprintf_s(out, L"#%02X%02X%02X", GetRValue(cc.rgbResult),
+                   GetGValue(cc.rgbResult), GetBValue(cc.rgbResult));
+        SetWindowTextW(row.ctl, out);
+        OnControlChanged();
+    }
+}
+
+static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam,
+                                        LPARAM lParam) {
+    switch (msg) {
+        case WM_CREATE: {
+            HINSTANCE hInst = GetModuleHandle(nullptr);
+            int dpi = GetDpiForWindow(hwnd);
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            int barTop = rc.bottom - MulDiv(kBottomBarH, dpi, 96);
+
+            // Sidebar (flat — no sunken edge)
+            g_sidebar = CreateWindowExW(
+                0, L"LISTBOX", nullptr,
+                WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY |
+                    LBS_OWNERDRAWFIXED | LBS_HASSTRINGS |
+                    LBS_NOINTEGRALHEIGHT | WS_TABSTOP,
+                0, MulDiv(8, dpi, 96), MulDiv(kSidebarW, dpi, 96),
+                barTop - MulDiv(8, dpi, 96), hwnd,
+                (HMENU)(INT_PTR)ID_SIDEBAR, hInst, nullptr);
+            Darkize(g_sidebar);
+            ReverseWheel(g_sidebar, /*sidebar=*/true);
+            SendMessageW(g_sidebar, WM_SETFONT, (WPARAM)g_font, TRUE);
+            SendMessageW(g_sidebar, LB_SETITEMHEIGHT, 0,
+                         MAKELPARAM(MulDiv(36, dpi, 96), 0));
+            for (int s = 0; s < SEC_COUNT; s++)
+                SendMessageW(g_sidebar, LB_ADDSTRING, 0,
+                             (LPARAM)kSectionNames[s]);
+            SendMessageW(g_sidebar, LB_SETCURSEL, SEC_GENERAL, 0);
+
+            // Bottom bar
+            HWND preview = CreateWindowExW(
+                0, L"BUTTON", L"Preview (live)",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 0,
+                barTop + MulDiv(14, dpi, 96), MulDiv(140, dpi, 96),
+                MulDiv(22, dpi, 96), hwnd, (HMENU)(INT_PTR)ID_CHK_PREVIEW,
+                hInst, nullptr);
+            g_chkPreview = preview;
+            SendMessageW(preview, WM_SETFONT, (WPARAM)g_font, TRUE);
+            Darkize(preview);
+
+            struct Btn {
+                int id;
+                const wchar_t* text;
+                BOOL enabled;
+            };
+            const Btn btns[] = {
+                {ID_BTN_APPLY, L"Apply", FALSE},
+                {ID_BTN_SAVE, L"Save", FALSE},
+                {ID_BTN_CANCEL, L"Close", TRUE},
+            };
+            int bx = rc.right - MulDiv(12, dpi, 96);
+            for (int i = 3; i-- > 0;) {
+                int w = MulDiv(92, dpi, 96);
+                bx -= w;
+                if (i < 2) bx -= MulDiv(8, dpi, 96);  // gap between buttons
+                HWND btn = CreateWindowExW(
+                    0, L"BUTTON", btns[i].text,
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, bx,
+                    barTop + MulDiv(10, dpi, 96), w, MulDiv(28, dpi, 96), hwnd,
+                    (HMENU)(INT_PTR)btns[i].id, hInst, nullptr);
+                SendMessageW(btn, WM_SETFONT, (WPARAM)g_font, TRUE);
+                Darkize(btn);
+                EnableWindow(btn, btns[i].enabled);
+                if (btns[i].id == ID_BTN_APPLY) g_btnApply = btn;
+                if (btns[i].id == ID_BTN_SAVE) g_btnSave = btn;
+                if (btns[i].id == ID_BTN_CANCEL) g_btnCancel = btn;
+            }
+
+            // Content panes
+            RECT content = {MulDiv(kSidebarW + 6, dpi, 96),
+                    MulDiv(6, dpi, 96),
+                            rc.right - MulDiv(10, dpi, 96), barTop};
+            BuildSectionPanes(hwnd, content);
+            BuildProfilesPane(hwnd, content);
+            BuildDiagnosticsPane(hwnd, content);
+            LoadValuesIntoControls();
+            SwitchSection(SEC_GENERAL);
+            return 0;
+        }
+        case WM_MOUSEWHEEL: {
+            // Route by CURSOR, not focus: WM_MOUSEWHEEL is delivered to the
+            // focus window (MSDN), so with no pane child focused this top
+            // window got it and the pane never saw it. Forward to whichever
+            // section pane is under the cursor; PaneProc always eats it, so
+            // no bounce-back loop.
+            POINT pt;
+            GetCursorPos(&pt);
+            for (int s = 0; s < SEC_COUNT; s++) {
+                HWND pane = g_panes[s];
+                if (!pane || !IsWindowVisible(pane)) continue;
+                RECT prc;
+                GetWindowRect(pane, &prc);
+                if (PtInRect(&prc, pt)) {
+                    SendMessageW(pane, WM_MOUSEWHEEL, wParam, lParam);
+                    return 0;
+                }
+            }
+            return 0;  // cursor not over any pane: eat (no bounce loop)
+        }
+        case WM_ENTERSIZEMOVE:
+            // Freeze the whole window during the drag: zero repaint work per
+            // frame (no layout math, no child repaints — nothing to lag).
+            g_resizing = true;
+            SendMessageW(hwnd, WM_SETREDRAW, FALSE, 0);
+            return 0;
+        case WM_EXITSIZEMOVE: {
+            // Drag done: thaw, relayout once, paint once.
+            g_resizing = false;
+            SendMessageW(hwnd, WM_SETREDRAW, TRUE, 0);
+            RelayoutAll(hwnd);
+            RedrawWindow(hwnd, nullptr, nullptr,
+                         RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN |
+                             RDW_UPDATENOW);
+            return 0;
+        }
+        case WM_SIZE: {
+            if (g_resizing) return 0;  // frozen; handled on WM_EXITSIZEMOVE
+            RelayoutAll(hwnd);
+            return 0;
+        }
+        case WM_NOTIFY: {
+            // Spinner arrows on slider value edits (UDN_DELTAPOS): step the
+            // REAL value (trackbar is the source of truth), reuse the same
+            // setter as the wheel — dirty-state + preview stay consistent.
+            if (((LPNMHDR)lParam)->code == UDN_DELTAPOS) {
+                int idx = (int)((LPNMHDR)lParam)->idFrom - 4000;
+                if (idx >= 0 && idx < (int)g_rows.size() &&
+                    g_rows[idx].spec->kind == Kind::Slider) {
+                    Row& row = g_rows[idx];
+                    LPNMUPDOWN ud = (LPNMUPDOWN)lParam;
+                    int v = (int)SendMessageW(row.ctl, TBM_GETPOS, 0, 0);
+                    v += ud->iDelta;  // up arrow = value up (standard)
+                    if (v < row.spec->minV) v = row.spec->minV;
+                    if (v > row.spec->maxV) v = row.spec->maxV;
+                    SetCtlFromValue(row, std::to_wstring(v));
+                    OnControlChanged();
+                }
+                return 0;
+            }
+            // Trackbar custom draw: visible channel + clean square thumb
+            // (the native look is a hairline track with an alien thumb).
+            LPNMCUSTOMDRAW nmc = (LPNMCUSTOMDRAW)lParam;
+            if (nmc->hdr.code == NM_CUSTOMDRAW &&
+                nmc->hdr.idFrom >= 2000 &&
+                nmc->hdr.idFrom < 2000 + (int)g_rows.size() &&
+                nmc->hdr.hwndFrom && g_rows[nmc->hdr.idFrom - 2000].spec
+                                         ->kind == Kind::Slider) {
+                if (nmc->dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+                if (nmc->dwDrawStage == CDDS_ITEMPREPAINT) {
+                    switch (nmc->dwItemSpec) {
+                        case TBCD_CHANNEL: {
+                            // The channel is a thin strip; if the theme hands
+                            // us a full-control rect, drawing it would paint
+                            // row-height banding across the pane.
+                            int h = nmc->rc.bottom - nmc->rc.top;
+                            if (h > MulDiv(10, GetDpiForWindow(hwnd), 96))
+                                return CDRF_DODEFAULT;
+                            FillRect(nmc->hdc, &nmc->rc, g_brushStroke);
+                            return CDRF_SKIPDEFAULT;
+                        }
+                        case TBCD_THUMB: {
+                            // Center the thumb vertically in the channel rect.
+                            RECT rc = nmc->rc;
+                            FillRect(nmc->hdc, &rc, g_brushThumb);
+                            FrameRect(nmc->hdc, &rc, g_brushStroke);
+                            return CDRF_SKIPDEFAULT;
+                        }
+                    }
+                }
+                return CDRF_DODEFAULT;
+            }
+            break;
+        }
+        case WM_DRAWITEM: {
+            DRAWITEMSTRUCT* di = (DRAWITEMSTRUCT*)lParam;
+            if (di->CtlType == ODT_BUTTON && di->CtlID == ID_COLOR_SWATCH) {
+                // Swatch = the EFFECTIVE tint color: preset table color, or
+                // the picked hex when the combo is on Custom.
+                for (const Row& r : g_rows) {
+                    if (r.swatch != di->hwndItem) continue;
+                    wchar_t sel[32] = {};
+                    GetWindowTextW(r.ctl, sel, 32);  // combo text = display
+                    COLORREF col = RGB(40, 40, 40);
+                    bool found = false;
+                    for (const TintPresetColor& p : kTintPresetColors) {
+                        if (wcscmp(sel, p.name) == 0) {
+                            col = p.rgb;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        PCWSTR q = g_customHex.c_str();
+                        while (*q == L' ' || *q == L'#') q++;
+                        if (wcslen(q) == 6) {
+                            wchar_t b[3] = {0, 0, 0};
+                            auto byteAt = [&](int i) {
+                                b[0] = q[i * 2];
+                                b[1] = q[i * 2 + 1];
+                                return (int)wcstoul(b, nullptr, 16);
+                            };
+                            col = RGB(byteAt(0), byteAt(1), byteAt(2));
+                        }
+                    }
+                    HBRUSH fill = CreateSolidBrush(col);
+                    FillRect(di->hDC, &di->rcItem, fill);
+                    DeleteObject(fill);
+                    FrameRect(di->hDC, &di->rcItem, g_brushStroke);
+                    return TRUE;
+                }
+                return TRUE;
+            }
+            if (di->CtlType == ODT_BUTTON && di->CtlID == ID_TINT_PICK) {
+                // Color-picker icon: Segoe MDL2 Assets "Color" glyph E790
+                // (system font - nothing shipped with the mod).
+                HFONT old = (HFONT)SelectObject(di->hDC, g_fontMdl2);
+                SetBkMode(di->hDC, TRANSPARENT);
+                SetTextColor(di->hDC, RGB(220, 220, 220));
+                DrawTextW(di->hDC, L"", 1, &di->rcItem,
+                          DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                SelectObject(di->hDC, old);
+                FrameRect(di->hDC, &di->rcItem, g_brushStroke);
+                return TRUE;
+            }
+            if (di->CtlType == ODT_BUTTON) {
+                // One button language everywhere: #282828 fill, 1px stroke,
+                // white text / white@37% when disabled. Square corners.
+                HDC hdc = di->hDC;
+                RECT rcB = di->rcItem;
+                bool disabled = (di->itemState & ODS_DISABLED) != 0;
+                bool pressed = (di->itemState & ODS_SELECTED) != 0;
+                FillRect(hdc, &rcB, pressed ? g_brushHover : g_brushInput);
+                FrameRect(hdc, &rcB, g_brushStroke);
+                wchar_t btext[64] = {};
+                GetWindowTextW(di->hwndItem, btext, 64);
+                SetBkMode(hdc, TRANSPARENT);
+                SetTextColor(hdc, disabled ? RGB(150, 150, 150) : kColText);
+                HFONT oldF = (HFONT)SelectObject(hdc, g_font);
+                DrawTextW(hdc, btext, -1, &rcB,
+                          DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                SelectObject(hdc, oldF);
+                if (di->itemState & ODS_FOCUS) DrawFocusRect(hdc, &rcB);
+                return TRUE;
+            }
+            if (di->CtlType != ODT_LISTBOX || di->hwndItem != g_sidebar) {
+                break;
+            }
+            FillRect(di->hDC, &di->rcItem, g_brushSidebar);
+            bool selected = (di->itemState & ODS_SELECTED) != 0;
+            // Subtle hover: one step lighter than the sidebar slab; the
+            // selected row keeps its accent fill.
+            if (!selected && di->itemID == (UINT)g_sidebarHover)
+                FillRect(di->hDC, &di->rcItem, g_brushSidebarHover);
+            RECT full = di->rcItem;
+            int dpi2 = GetDpiForWindow(hwnd);
+            if (selected) {
+                // Square accent fill, inset 4px — NEVER rounded.
+                RECT pill = {full.left + MulDiv(4, dpi2, 96),
+                             full.top + MulDiv(4, dpi2, 96),
+                             full.right - MulDiv(4, dpi2, 96),
+                             full.bottom - MulDiv(4, dpi2, 96)};
+                FillRect(di->hDC, &pill, g_brushAccent);
+            }
+            SetBkMode(di->hDC, TRANSPARENT);
+            SetTextColor(di->hDC, selected ? kColText : kColTextSec);
+            wchar_t text[64];
+            SendMessageW(di->hwndItem, LB_GETTEXT, di->itemID, (LPARAM)text);
+            RECT tr = full;
+            tr.left += MulDiv(16, dpi2, 96);
+            HFONT old = (HFONT)SelectObject(di->hDC, g_font);
+            DrawTextW(di->hDC, text, -1, &tr,
+                      DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+            SelectObject(di->hDC, old);
+            // Live enable-checkbox on the right for toggleable sections.
+            // (No focus rectangle — Doc's law: no dotted borders.)
+            for (const SidebarToggle& t : kSidebarToggles) {
+                if (t.section == (int)di->itemID) {
+                    RECT box = {full.right - MulDiv(30, dpi2, 96),
+                                full.top + (full.bottom - full.top -
+                                            MulDiv(16, dpi2, 96)) / 2,
+                                full.right - MulDiv(14, dpi2, 96),
+                                0};
+                    box.bottom = box.top + MulDiv(16, dpi2, 96);
+                    HBRUSH boxFill = CreateSolidBrush(RGB(24, 24, 24));
+                    FillRect(di->hDC, &box, boxFill);
+                    FrameRect(di->hDC, &box, g_brushStroke);
+                    DeleteObject(boxFill);
+                    if (SidebarToggleOn(t)) {
+                        // Check mark: two accent lines.
+                        HPEN pen = CreatePen(PS_SOLID, MulDiv(2, dpi2, 96),
+                                             RGB(120, 220, 120));
+                        HPEN oldPen = (HPEN)SelectObject(di->hDC, pen);
+                        int cx1 = box.left + MulDiv(3, dpi2, 96);
+                        int cy = box.top + MulDiv(8, dpi2, 96);
+                        int cx2 = box.left + MulDiv(6, dpi2, 96);
+                        int cy2 = box.top + MulDiv(12, dpi2, 96);
+                        int cx3 = box.right - MulDiv(3, dpi2, 96);
+                        int cy3 = box.top + MulDiv(4, dpi2, 96);
+                        MoveToEx(di->hDC, cx1, cy, nullptr);
+                        LineTo(di->hDC, cx2, cy2);
+                        LineTo(di->hDC, cx3, cy3);
+                        SelectObject(di->hDC, oldPen);
+                        DeleteObject(pen);
+                    }
+                    break;
+                }
+            }
+            return TRUE;
+        }
+        case WM_CTLCOLORBTN: {
+            // Checkboxes paint their themed (lighter) background across their
+            // full control width — which IS the whole row. Return the window
+            // brush so no banding strips appear behind checkbox rows.
+            return (LRESULT)g_brushBg;
+        }
+        case WM_CTLCOLORSTATIC: {
+            HDC hdc = (HDC)wParam;
+            HWND ctl = (HWND)lParam;
+            if (ctl == g_sidebar) {
+                SetBkColor(hdc, kColSidebar);
+                SetTextColor(hdc, kColText);
+                return (LRESULT)g_brushSidebar;
+            }
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, kColText);
+            SetBkColor(hdc, kColBg);
+            return (LRESULT)g_brushBg;
+        }
+        case WM_CTLCOLORLISTBOX: {
+            HDC hdc = (HDC)wParam;
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, kColText);
+            // The sidebar listbox owns its whole column: paint it with the
+            // window bg, or its lighter control fill shows as a two-tone slab
+            // below the nav items. Real input lists keep the input fill.
+            if ((HWND)lParam == g_sidebar) {
+                SetBkColor(hdc, kColBg);
+                return (LRESULT)g_brushBg;
+            }
+            SetBkColor(hdc, kColInputBg);
+            return (LRESULT)g_brushInput;
+        }
+        case WM_ERASEBKGND: {
+            HDC hdc = (HDC)wParam;
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            FillRect(hdc, &rc, g_brushBg);
+            return 1;
+        }
+        case WM_APP_RELAYOUT:
+            LayoutRows(hwnd);
+            return 0;
+        case WM_GETMINMAXINFO: {
+            // Resize floor: below this the rows would collide.
+            MINMAXINFO* mmi = (MINMAXINFO*)lParam;
+            int dpi = GetDpiForWindow(hwnd);
+            mmi->ptMinTrackSize.x = 800;
+            mmi->ptMinTrackSize.y = 560;
+            return 0;
+        }
+        case WM_HSCROLL: {
+            // Trackbar movement: sync the value edit + mark dirty.
+            if (!g_syncing) {
+                for (auto& row : g_rows) {
+                    if (row.spec->kind == Kind::Slider &&
+                        row.ctl == (HWND)lParam) {
+                        int v = (int)SendMessageW(row.ctl, TBM_GETPOS, 0, 0);
+                        wchar_t buf[32];
+                        swprintf_s(buf, L"%d", v);
+                        g_syncing = true;
+                        SetWindowTextW(row.value, buf);
+                        g_syncing = false;
+                        break;
+                    }
+                }
+                OnControlChanged();
+            }
+            return 0;
+        }
+        case WM_COMMAND: {
+            int id = LOWORD(wParam);
+            int code = HIWORD(wParam);
+            CtlLog(L"[CMD] id=%d code=%d", id, code);
+            // Group-title checkboxes (5000+groupIndex): flip the row-less
+            // enable key; members enable/disable in SetRowlessKey.
+            if (id >= 5000 &&
+                id < 5000 + (int)ARRAYSIZE(kGroups) &&
+                code == BN_CLICKED) {
+                const GroupSpec& grp = kGroups[id - 5000];
+                SetRowlessKey(grp.titleKey, !RowlessOn(grp.titleKey));
+                OnControlChanged();
+                return 0;
+            }
+            if (id == ID_SIDEBAR && code == LBN_SELCHANGE) {
+                int sel = (int)SendMessageW(g_sidebar, LB_GETCURSEL, 0, 0);
+                if (sel >= 0) {
+                    // Click on the item's checkbox zone = toggle the enable
+                    // key (and stay on the section); click on text = navigate.
+                    POINT pt;
+                    GetCursorPos(&pt);
+                    ScreenToClient(g_sidebar, &pt);
+                    RECT item = {};
+                    SendMessageW(g_sidebar, LB_GETITEMRECT, sel, (LPARAM)&item);
+                    bool hitBox = pt.x >= item.right - MulDiv(32, GetDpiForWindow(hwnd), 96);
+                    for (const SidebarToggle& t : kSidebarToggles) {
+                        if (t.section == sel && hitBox) {
+                            ToggleSidebarEnable(t.key);
+                            return 0;
+                        }
+                    }
+                    SwitchSection(sel);
+                }
+                return 0;
+            }
+            // Slider value-edit typed a number (id 3000+rowIndex).
+            if (id >= 3000 && id < 3000 + (int)g_rows.size() &&
+                code == EN_CHANGE && !g_syncing && !g_loading) {
+                CtlLog(L"[ENCHANGE] id=%d", id);
+                Row& row = g_rows[id - 3000];
+                if (row.spec->kind == Kind::Slider && row.value) {
+                    wchar_t buf[16] = {};
+                    GetWindowTextW(row.value, buf, 16);
+                    if (buf[0]) {
+                        int v = _wtoi(buf);
+                        if (v < row.spec->minV) v = row.spec->minV;
+                        if (v > row.spec->maxV) v = row.spec->maxV;
+                        g_syncing = true;
+                        SendMessageW(row.ctl, TBM_SETPOS, TRUE, (LPARAM)v);
+                    }
+                }
+                return 0;
+            }
+            if (id == ID_BTN_APPLY) {
+                WriteConfigFromUI();
+                ApplyClearedDirty();
+                return 0;
+            }
+            if (id == ID_BTN_SAVE) {
+                WriteConfigFromUI();
+                ApplyClearedDirty();
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                return 0;
+            }
+            if (id == ID_BTN_CANCEL) {
+                if (g_dirty) {
+                    // Revert: restore the file the window opened with; the
+                    // engine's watcher un-applies the preview writes.
+                    WriteConfigMap(g_initialSnapshot);
+                }
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                return 0;
+            }
+            if (id == ID_CHK_PREVIEW && code == BN_CLICKED) {
+                if (SendMessageW(g_chkPreview, BM_GETCHECK, 0, 0) ==
+                        BST_CHECKED &&
+                    g_dirty) {
+                    WriteConfigFromUI();
+                    ApplyClearedDirty();
+                }
+                return 0;
+            }
+            if (id == ID_COLOR_PICK && code == BN_CLICKED) {
+                for (auto& row : g_rows) {
+                    if (row.spec->kind == Kind::Color && row.pick == (HWND)lParam) {
+                        ShowColorPicker(hwnd, row);
+                        return 0;
+                    }
+                }
+                return 0;
+            }
+            if ((id == ID_TINT_PICK || id == ID_COLOR_SWATCH) &&
+                code == BN_CLICKED) {
+                for (auto& row : g_rows) {
+                    if (wcscmp(row.spec->key, L"Tint.tintPreset") != 0)
+                        continue;
+                    if (row.pick != (HWND)lParam &&
+                        row.swatch != (HWND)lParam)
+                        continue;
+                    // Start the dialog from the EFFECTIVE color.
+                    wchar_t sel[32] = {};
+                    GetWindowTextW(row.ctl, sel, 32);
+                    COLORREF start = RGB(0x05, 0x15, 0x29);
+                    bool found = false;
+                    for (const TintPresetColor& pr : kTintPresetColors) {
+                        if (wcscmp(sel, pr.name) == 0) {
+                            start = pr.rgb;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        PCWSTR q = g_customHex.c_str();
+                        while (*q == L' ' || *q == L'#') q++;
+                        if (wcslen(q) == 6) {
+                            wchar_t b[3] = {0, 0, 0};
+                            auto byteAt = [&](int i) {
+                                b[0] = q[i * 2];
+                                b[1] = q[i * 2 + 1];
+                                return (int)wcstoul(b, nullptr, 16);
+                            };
+                            start = RGB(byteAt(0), byteAt(1), byteAt(2));
+                        }
+                    }
+                    CHOOSECOLORW cc = {sizeof(cc)};
+                    cc.hwndOwner = hwnd;
+                    cc.Flags = CC_RGBINIT | CC_FULLOPEN;  // seed + expanded
+                    cc.rgbResult = start;
+                    static COLORREF s_cust[16] = {};
+                    cc.lpCustColors = s_cust;
+                    if (ChooseColorW(&cc)) {
+                        wchar_t out[16];
+                        swprintf_s(out, L"#%02X%02X%02X",
+                                   GetRValue(cc.rgbResult),
+                                   GetGValue(cc.rgbResult),
+                                   GetBValue(cc.rgbResult));
+                        g_customHex = out;
+                        // Engine contract: unknown preset name = use hex.
+                        int idx = (int)SendMessageW(
+                            row.ctl, CB_FINDSTRINGEXACT, -1,
+                            (LPARAM)L"Custom");
+                        if (idx >= 0)
+                            SendMessageW(row.ctl, CB_SETCURSEL, idx, 0);
+                        OnControlChanged();
+                        InvalidateRect(row.swatch, nullptr, TRUE);
+                    }
+                    return 0;
+                }
+                return 0;
+            }
+            if (id == ID_DIAG_OPENFOLDER && code == BN_CLICKED) {
+                std::wstring dir = GetCfgDir();
+                CreateDirectoryW(dir.c_str(), nullptr);
+                ShellExecuteW(hwnd, L"open", dir.c_str(), nullptr, nullptr,
+                              SW_SHOWNORMAL);
+                return 0;
+            }
+            if (id >= 2000 && id < 2000 + (int)g_rows.size()) {
+                if (code == BN_CLICKED || code == CBN_SELCHANGE ||
+                    code == EN_CHANGE) {
+                    if (code == CBN_SELCHANGE && g_rows[id - 2000].swatch)
+                        InvalidateRect(g_rows[id - 2000].swatch, nullptr,
+                                       TRUE);
+                    Wh_Log(L"[CTRL] row changed id=%d code=%d", id, code);
+                    OnControlChanged();
+                }
+                return 0;
+            }
+            // Profiles
+            if (id == ID_PROFILE_LIST && code == LBN_SELCHANGE) {
+                HWND list = (HWND)lParam;
+                int sel = (int)SendMessageW(list, LB_GETCURSEL, 0, 0);
+                if (sel >= 0) {
+                    wchar_t name[128];
+                    SendMessageW(list, LB_GETTEXT, sel, (LPARAM)name);
+                    SetWindowTextW(GetDlgItem(g_panes[SEC_PROFILES],
+                                              ID_PROFILE_NAME),
+                                   name);
+                }
+                return 0;
+            }
+            if (id == ID_PROFILE_SAVE && code == BN_CLICKED) {
+                wchar_t name[128] = {};
+                GetWindowTextW(
+                    GetDlgItem(g_panes[SEC_PROFILES], ID_PROFILE_NAME), name,
+                    128);
+                // Trim inline (name is a plain array).
+                {
+                    wchar_t* s = name;
+                    while (*s == L' ' || *s == L'\t') s++;
+                    wchar_t* e = s + wcslen(s);
+                    while (e > s && (e[-1] == L' ' || e[-1] == L'\t')) *--e = 0;
+                    if (s != name) memmove(name, s, (wcslen(s) + 1) * sizeof(wchar_t));
+                }
+                if (!name[0]) {
+                    MessageBoxW(hwnd, L"Enter a profile name first.",
+                                L"Ab Tenebris", MB_OK | MB_ICONINFORMATION);
+                    return 0;
+                }
+                std::unordered_map<std::wstring, std::wstring> kv;
+                CollectAllValues(kv, &g_initialSnapshot);
+                std::wstring dir = GetProfileDir();
+                CreateDirectoryW(dir.c_str(), nullptr);
+                std::wstring finalPath = dir + L"\\" + name + L".profile";
+                // Reuse the config writer by staging the file as settings.cfg
+                // format: write via temp map, then copy to profile path.
+                std::wstring body;
+                WORD bom = 0xFEFF;
+                for (const auto& e : kCtrlCfgKeys) {
+                    auto it = kv.find(e.key);
+                    if (it == kv.end()) continue;
+                    body += e.key;
+                    body += L'=';
+                    body += it->second;
+                    body += L"\r\n";
+                }
+                HANDLE h = CreateFileW(finalPath.c_str(), GENERIC_WRITE, 0,
+                                       nullptr, CREATE_ALWAYS, 0, nullptr);
+                if (h != INVALID_HANDLE_VALUE) {
+                    DWORD wrote;
+                    WriteFile(h, &bom, sizeof(bom), &wrote, nullptr);
+                    WriteFile(h, body.data(),
+                              (DWORD)(body.size() * sizeof(wchar_t)), &wrote,
+                              nullptr);
+                    CloseHandle(h);
+                }
+                RefreshProfileList(g_panes[SEC_PROFILES]);
+                return 0;
+            }
+            if (id == ID_PROFILE_APPLY && code == BN_CLICKED) {
+                HWND list = GetDlgItem(g_panes[SEC_PROFILES], ID_PROFILE_LIST);
+                int sel = (int)SendMessageW(list, LB_GETCURSEL, 0, 0);
+                if (sel < 0) {
+                    MessageBoxW(hwnd, L"Select a profile to apply.",
+                                L"Ab Tenebris", MB_OK | MB_ICONINFORMATION);
+                    return 0;
+                }
+                wchar_t name[128];
+                SendMessageW(list, LB_GETTEXT, sel, (LPARAM)name);
+                std::unordered_map<std::wstring, std::wstring> kv;
+                ReadConfigFile(GetProfileDir() + L"\\" + name + L".profile",
+                               kv);
+                if (kv.empty()) {
+                    MessageBoxW(hwnd, L"Profile file is empty or missing.",
+                                L"Ab Tenebris", MB_OK | MB_ICONWARNING);
+                    return 0;
+                }
+                // Merge: profile values override; keep any keys the profile
+                // lacks from the current file (forward compatibility).
+                std::unordered_map<std::wstring, std::wstring> cur;
+                ReadConfigFile(GetCfgPath(), cur);
+                for (auto& e : cur)
+                    if (kv.find(e.first) == kv.end()) kv[e.first] = e.second;
+                WriteConfigMap(kv);
+                g_initialSnapshot = kv;  // cancel baseline = what we applied
+                LoadValuesIntoControls();
+                ApplyClearedDirty();
+                return 0;
+            }
+            if (id == ID_PROFILE_DELETE && code == BN_CLICKED) {
+                HWND list = GetDlgItem(g_panes[SEC_PROFILES], ID_PROFILE_LIST);
+                int sel = (int)SendMessageW(list, LB_GETCURSEL, 0, 0);
+                if (sel >= 0) {
+                    wchar_t name[128];
+                    SendMessageW(list, LB_GETTEXT, sel, (LPARAM)name);
+                    std::wstring p = GetProfileDir() + L"\\" + name +
+                                     L".profile";
+                    if (MessageBoxW(hwnd,
+                                    (std::wstring(L"Delete profile \"") +
+                                     name + L"\"?")
+                                        .c_str(),
+                                    L"Ab Tenebris",
+                                    MB_OKCANCEL | MB_ICONQUESTION) == IDOK) {
+                        DeleteFileW(p.c_str());
+                        RefreshProfileList(g_panes[SEC_PROFILES]);
+                    }
+                }
+                return 0;
+            }
+            return 0;
+        }
+        case WM_TIMER:
+            if (wParam == TIMER_PREVIEW) {
+                KillTimer(hwnd, TIMER_PREVIEW);
+                WriteConfigFromUI();
+            }
+            return 0;
+        case WM_CLOSE: {
+            // Unapplied non-preview changes die with the window (classic
+            // contract); preview writes were already applied to the file.
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        case WM_DESTROY:
+            g_settingsWnd = nullptr;
+            return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+// The native Win32 settings window (the PySide6 experiment is rolled back;
+// the next era rebuilds this UI in WebView2 — see WEBVIEW2_PLAN.md).
+static void OpenSettingsWindow() {
+    if (g_settingsWnd) {
+        ShowWindow(g_settingsWnd, SW_RESTORE);
+        SetForegroundWindow(g_settingsWnd);
+        return;
+    }
+
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = SettingsWndProc;
+    wc.hInstance = GetModuleHandle(nullptr);
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hIcon = g_trayIcon ? g_trayIcon
+                          : LoadIcon(nullptr, IDI_APPLICATION);
+    wc.hbrBackground = nullptr;
+    wc.lpszClassName = kWindowClassName;
+    RegisterClassW(&wc);
+
+    int wndW = 960;  // raw px — fixed per Doc; we adjust slowly from here
+    int wndH = 700;
+    RECT work = {};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    int x = work.left + ((work.right - work.left) - wndW) / 2;
+    int y = work.top + ((work.bottom - work.top) - wndH) / 2;
+
+    // FIXED size per Doc: caption + sysmenu + minimize only — no thick
+    // frame, no maximize box. Size adjustments are code changes from here.
+    g_settingsWnd = CreateWindowExW(
+        0, kWindowClassName, kWindowTitle,
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX |
+            WS_CLIPCHILDREN,
+        x, y, wndW, wndH,
+                                    nullptr, nullptr, wc.hInstance, nullptr);
+    if (!g_settingsWnd) return;
+
+    ShowWindow(g_settingsWnd, SW_SHOW);
+    SetForegroundWindow(g_settingsWnd);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Tray icon
+
+static void ShowTrayContextMenu(HWND hwnd) {
+    POINT pt;
+    GetCursorPos(&pt);
+
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    AppendMenuW(menu, MF_STRING, 1, L"Open Settings");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, 2, L"About");
+    SetForegroundWindow(hwnd);
+    int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0,
+                             hwnd, nullptr);
+    DestroyMenu(menu);
+    // Eat the stray message so the menu doesn't reopen (classic tray quirk).
+    MSG flush;
+    PeekMessageW(&flush, hwnd, 0, 0, PM_NOREMOVE);
+
+    switch (cmd) {
+        case 1:
+            OpenSettingsWindow();
+            break;
+        case 2:
+            MessageBoxW(hwnd,
+                        L"Ab Tenebris Control Panel\n"
+                        L"Companion of the transparent-desktop-icons-spotlight "
+                        L"engine mod.\n\n"
+                        L"Out of the darkness.",
+                        L"Ab Tenebris", MB_OK);
+            break;
+    }
+}
+
+// Tray icon: imageres.dll #96 - the Windows "night light" monitor-with-moon
+// icon (Doc's pick, 2026-11-20). Ships with Windows on every machine: no
+// local file, no embedding. Index verified visually at 16-48px on this
+// build; if a future Windows shuffles indices or the DLL is missing, the
+// loader fails cleanly and the generic application icon takes over.
+static const int kTrayIconIndex = 96;
+
+static HICON LoadTrayIcon(int size) {
+    wchar_t path[MAX_PATH];
+    UINT n = GetSystemDirectoryW(path, MAX_PATH);
+    if (!n || n >= MAX_PATH - 20) return nullptr;
+    wcscat_s(path, L"\\imageres.dll");
+    HICON h = nullptr;
+    // Try the small-icon slot, then the large slot (SHDefExtractIcon fills
+    // whichever pointer it gets; LOWORD of nIconSize is the large size).
+    if (SUCCEEDED(SHDefExtractIconW(path, kTrayIconIndex, 0, nullptr, &h,
+                                    (UINT)MAKEWORD(size, 0)))) {
+        return h;
+    }
+    if (SUCCEEDED(SHDefExtractIconW(path, kTrayIconIndex, 0, &h, nullptr,
+                                    (UINT)MAKEWORD(size, 0)))) {
+        return h;
+    }
+    return nullptr;
+}
+
+static const UINT_PTR kTrayRetryTimer = 7;
+
+static bool AddTrayIcon(HWND hwnd, const wchar_t* reason) {
+    ZeroMemory(&g_nid, sizeof(g_nid));
+    g_nid.cbSize = sizeof(g_nid);
+    g_nid.hWnd = hwnd;
+    g_nid.uID = 1;
+    g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    g_nid.uCallbackMessage = WMAPP_TRAYICON;
+    // Load ONCE: re-adds (TaskbarCreated) reuse the handle — the settings
+    // window class holds it too, so it must never be replaced or freed.
+    if (!g_trayIcon) {
+        g_trayIcon = LoadTrayIcon(GetSystemMetrics(SM_CXSMICON));
+    }
+    if (!g_trayIcon) {
+        // Larger size for the settings-window title bar too.
+        g_trayIcon = LoadTrayIcon(48);
+    }
+    g_nid.hIcon = g_trayIcon ? g_trayIcon
+                             : (HICON)LoadImage(nullptr, IDI_APPLICATION,
+                                                IMAGE_ICON, 0, 0, LR_SHARED);
+    wcscpy_s(g_nid.szTip, L"Ab Tenebris");
+    g_trayAdded = Shell_NotifyIconW(NIM_ADD, &g_nid) != FALSE;
+    // Log every attempt: the boot-race failure (2026-11-09) was silent.
+    CtlLog(L"[TRAY] add (%s) ok=%d pid=%lu", reason, (int)g_trayAdded.load(),
+           GetCurrentProcessId());
+    return g_trayAdded;
+}
+
+static void RemoveTrayIcon() {
+    if (g_trayAdded.exchange(false)) {
+        Shell_NotifyIconW(NIM_DELETE, &g_nid);
+    }
+}
+
+// In-process screenshot: BitBlt the settings window's real pixels (children
+// included — external PrintWindow renders these unreliably) and save a PNG
+// next to the config file.
+static void TakeScreenshot() {
+    if (!g_settingsWnd) return;
+    RECT rc;
+    GetWindowRect(g_settingsWnd, &rc);
+    // True visible bounds (GetWindowRect includes invisible DWM resize borders
+    // that bleed neighboring windows into the capture).
+    RECT fb = rc;
+    DwmGetWindowAttribute(g_settingsWnd, DWMWA_EXTENDED_FRAME_BOUNDS, &fb,
+                          sizeof(fb));
+    int offX = fb.left - rc.left, offY = fb.top - rc.top;
+    int w = fb.right - fb.left, h = fb.bottom - fb.top;
+    if (w <= 0 || h <= 0) return;
+
+    HDC wndDc = GetWindowDC(g_settingsWnd);
+    HDC mem = CreateCompatibleDC(wndDc);
+    HBITMAP bmp = CreateCompatibleBitmap(wndDc, w, h);
+    HGDIOBJ oldBmp = SelectObject(mem, bmp);
+    BitBlt(mem, 0, 0, w, h, wndDc, offX, offY, SRCCOPY);
+
+    std::vector<BYTE> pixels((size_t)w * h * 4);
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;  // top-down
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    GetDIBits(mem, bmp, 0, h, pixels.data(), &bi, DIB_RGB_COLORS);
+
+    SelectObject(mem, oldBmp);
+    DeleteObject(bmp);
+    DeleteDC(mem);
+    ReleaseDC(g_settingsWnd, wndDc);
+
+    IWICImagingFactory* factory = nullptr;
+    IWICStream* stream = nullptr;
+    IWICBitmapEncoder* encoder = nullptr;
+    IWICBitmapFrameEncode* frame = nullptr;
+    do {
+        if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                                    CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory))))
+            break;
+        if (FAILED(factory->CreateStream(&stream))) break;
+        std::wstring dir = GetCfgDir();
+        CreateDirectoryW(dir.c_str(), nullptr);
+        if (FAILED(stream->InitializeFromFilename(
+                (dir + L"\\snap.png").c_str(), GENERIC_WRITE))) break;
+        if (FAILED(factory->CreateEncoder(GUID_ContainerFormatPng, nullptr,
+                                          &encoder))) break;
+        if (FAILED(encoder->Initialize(stream, WICBitmapEncoderNoCache))) break;
+        if (FAILED(encoder->CreateNewFrame(&frame, nullptr))) break;
+        if (FAILED(frame->Initialize(nullptr))) break;
+        if (FAILED(frame->SetSize((UINT)w, (UINT)h))) break;
+        WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
+        if (FAILED(frame->SetPixelFormat(&fmt))) break;
+        if (FAILED(frame->WritePixels(h, (UINT)(w * 4), (UINT)pixels.size(),
+                                      pixels.data())))
+            break;
+        frame->Commit();
+        encoder->Commit();
+        CtlLog(L"[SNAP] saved %dx%d", w, h);
+    } while (false);
+    if (frame) frame->Release();
+    if (encoder) encoder->Release();
+    if (stream) stream->Release();
+    if (factory) factory->Release();
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Hidden message window (tray callbacks; later: hotkey, engine pings)
+
+static LRESULT CALLBACK MsgWndProc(HWND hwnd, UINT msg, WPARAM wParam,
+                                   LPARAM lParam) {
+    // Explorer broadcasts "TaskbarCreated" whenever its taskbar comes up
+    // (logon AND every explorer restart); icons added before that are lost.
+    // Boot race 2026-11-09: this host started 2s before explorer existed and
+    // the one-shot add failed silently. Pattern ported from cursor-tail.
+    static const UINT s_taskbarCreated =
+        RegisterWindowMessageW(L"TaskbarCreated");
+    if (s_taskbarCreated && msg == s_taskbarCreated) {
+        AddTrayIcon(hwnd, L"TaskbarCreated");
+        return 0;
+    }
+    // Retry timer (desktop-icon-guardian pattern): every 5s while the icon
+    // isn't in the tray (taskbar not up yet at boot).
+    if (msg == WM_TIMER && wParam == kTrayRetryTimer) {
+        if (!g_trayAdded) AddTrayIcon(hwnd, L"retry");
+        return 0;
+    }
+    if (msg == WMAPP_SWITCHSECTION) {
+        if (g_settingsWnd) {
+            SendMessageW(g_sidebar, LB_SETCURSEL, (WPARAM)lParam, 0);
+            SwitchSection((int)lParam);
+        }
+        return 0;
+    }
+    if (msg == WMAPP_SCREENSHOT) {
+        TakeScreenshot();
+        return 0;
+    }
+    if (msg == WMAPP_TRAYICON) {
+        if (LOWORD(lParam) == WM_CONTEXTMENU ||
+            LOWORD(lParam) == WM_RBUTTONUP) {
+            ShowTrayContextMenu(hwnd);
+        } else if (LOWORD(lParam) == WM_LBUTTONUP ||
+                   LOWORD(lParam) == WM_LBUTTONDBLCLK) {
+            OpenSettingsWindow();
+        }
+        return 0;
+    }
+    switch (msg) {
+        case WM_DESTROY:
+            RemoveTrayIcon();
+            PostQuitMessage(0);
+            return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+// The UI thread of the tool process: tray + windows + message loop.
+static DWORD WINAPI UIThreadProc(void*) {
+    HRESULT hrCom = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+    INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_STANDARD_CLASSES |
+                                                 ICC_BAR_CLASSES |
+                                                 ICC_UPDOWN_CLASS};
+    InitCommonControlsEx(&icc);
+
+    g_font = MakePtFont(10, false);
+    g_fontBold = MakePtFont(10, true);
+    // 🦇 rows need emoji fallback — Segoe UI alone renders tofu boxes.
+    g_fontEmoji = MakePtFont(10, false, L"Segoe UI Emoji");
+    g_fontMdl2 = MakePtFont(12, false, L"Segoe MDL2 Assets");
+    g_brushBg = CreateSolidBrush(kColBg);
+    g_brushSidebar = CreateSolidBrush(kColSidebar);
+    g_brushSidebarHover = CreateSolidBrush(RGB(44, 44, 44));
+    g_brushInput = CreateSolidBrush(kColInputBg);
+    g_brushAccent = CreateSolidBrush(kColAccent);
+    g_brushStroke = CreateSolidBrush(RGB(58, 58, 58));
+    g_brushHover = CreateSolidBrush(RGB(58, 58, 58));
+    g_brushThumb = CreateSolidBrush(RGB(150, 150, 150));
+
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = MsgWndProc;
+    wc.hInstance = GetModuleHandle(nullptr);
+    wc.lpszClassName = kMessageClassName;
+    RegisterClassW(&wc);
+
+    g_msgWnd = CreateWindowExW(0, kMessageClassName, L"AbTenebrisControl",
+                               WS_OVERLAPPED, 0, 0, 0, 0, nullptr, nullptr,
+                               wc.hInstance, nullptr);
+    if (g_msgWnd) {
+        AddTrayIcon(g_msgWnd, L"init");
+        SetTimer(g_msgWnd, kTrayRetryTimer, 5000, nullptr);
+    }
+
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        // IsDialogMessage gives Tab/Esc navigation in the settings window.
+        if (g_settingsWnd && IsDialogMessageW(g_settingsWnd, &msg)) continue;
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    if (g_settingsWnd) {
+        DestroyWindow(g_settingsWnd);
+        g_settingsWnd = nullptr;
+    }
+    if (g_msgWnd) {
+        DestroyWindow(g_msgWnd);
+        g_msgWnd = nullptr;
+    }
+    if (g_brushBg) DeleteObject(g_brushBg);
+    if (g_brushSidebar) DeleteObject(g_brushSidebar);
+    if (g_brushInput) DeleteObject(g_brushInput);
+    if (g_brushAccent) DeleteObject(g_brushAccent);
+    if (g_brushStroke) DeleteObject(g_brushStroke);
+    if (g_brushHover) DeleteObject(g_brushHover);
+    if (g_brushThumb) DeleteObject(g_brushThumb);
+    if (g_trayIcon) DestroyIcon(g_trayIcon);
+    if (SUCCEEDED(hrCom)) CoUninitialize();
+    Wh_Log(L"[CTRL] UI thread exit");
+    return 0;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Tool mod callbacks (run only in the dedicated tool process)
+
+static bool WhTool_ModInit() {
+    g_ctrlUnloading = false;
+    HANDLE thread =
+        CreateThread(nullptr, 0, UIThreadProc, nullptr, 0, &g_uiThreadId);
+    if (!thread) {
+        Wh_Log(L"[CTRL] failed to start UI thread");
+        return false;
+    }
+    CloseHandle(thread);
+    Wh_Log(L"[CTRL] tool mod init, uiThreadId=%u", g_uiThreadId);
+    return true;
+}
+
+static void WhTool_ModUninit() {
+    g_ctrlUnloading = true;
+    if (g_uiThreadId) {
+        PostThreadMessageW(g_uiThreadId, WM_QUIT, 0, 0);
+        for (int i = 0; i < 40; ++i) {
+            if (!g_settingsWnd && !g_trayAdded) break;
+            Sleep(50);
+        }
+        RemoveTrayIcon();
+    }
+    Wh_Log(L"[CTRL] tool mod uninit");
+}
+
+static void WhTool_ModSettingsChanged() {
+    Wh_Log(L"[CTRL] settings changed (no-op)");
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Tool-host plumbing: process classification, spawn, watchdog
+
+static void WINAPI EntryPoint_Hook() {
+    Wh_Log(L">");
+    ExitThread(0);
+}
+
+static void SpawnToolModProcess() {
+    WCHAR currentProcessPath[MAX_PATH];
+    switch (GetModuleFileName(nullptr, currentProcessPath,
+                              ARRAYSIZE(currentProcessPath))) {
+        case 0:
+        case ARRAYSIZE(currentProcessPath):
+            Wh_Log(L"GetModuleFileName failed");
+            return;
+    }
+
+    WCHAR commandLine[MAX_PATH + 2 +
+                      (sizeof(L" -tool-mod \"" WH_MOD_ID "\"") / sizeof(WCHAR)) -
+                      1];
+    swprintf_s(commandLine, L"\"%s\" -tool-mod \"%s\"", currentProcessPath,
+               WH_MOD_ID);
+    HMODULE kernelModule = GetModuleHandle(L"kernelbase.dll");
+    if (!kernelModule) {
+        kernelModule = GetModuleHandle(L"kernel32.dll");
+        if (!kernelModule) {
+            Wh_Log(L"No kernelbase.dll/kernel32.dll");
+            return;
+        }
+    }
+
+    using CreateProcessInternalW_t = BOOL(WINAPI*)(
+        HANDLE, LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES,
+        WINBOOL, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION,
+        PHANDLE);
+    CreateProcessInternalW_t pCreateProcessInternalW =
+        (CreateProcessInternalW_t)GetProcAddress(kernelModule,
+                                                 "CreateProcessInternalW");
+    if (!pCreateProcessInternalW) {
+        Wh_Log(L"No CreateProcessInternalW");
+        return;
+    }
+
+    STARTUPINFO si{
+        .cb = sizeof(STARTUPINFO),
+        .dwFlags = STARTF_FORCEOFFFEEDBACK,
+    };
+    PROCESS_INFORMATION pi;
+    if (!pCreateProcessInternalW(nullptr, currentProcessPath, commandLine,
+                                 nullptr, nullptr, FALSE, NORMAL_PRIORITY_CLASS,
+                                 nullptr, nullptr, &si, &pi, nullptr)) {
+        Wh_Log(L"CreateProcess failed (%lu)", GetLastError());
+        return;
+    }
+
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    Wh_Log(L"[CTRL] tool mod process spawned");
+}
+
+static DWORD WINAPI ToolHostWatchdog(void*) {
+    for (int attempt = 0; attempt < 3; attempt++) {
+        // First wait is long (20s): the Windhawk 2.x service spawns its own
+        // tool host and injection can take a while; respawning earlier
+        // produces a duplicate that briefly fights for the mutex. Later
+        // attempts stay at 10s (a host that vanished for real should be
+        // back fast).
+        int waits = attempt == 0 ? 100 : 50;
+        for (int waited = 0; waited < waits; waited++) {
+            Sleep(200);
+            HANDLE mutex = OpenMutexW(SYNCHRONIZE, FALSE,
+                                      L"windhawk-tool-mod_" WH_MOD_ID);
+            if (!mutex) continue;
+            DWORD r = WaitForSingleObject(mutex, 0);
+            CloseHandle(mutex);
+            if (r == WAIT_TIMEOUT || r == WAIT_FAILED) return 0;
+        }
+        Wh_Log(L"[CTRL] tool host missing after %d s, respawning", attempt + 1);
+        SpawnToolModProcess();
+    }
+    return 0;
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+// Merged lifecycle entry points (the ONLY Wh_* callbacks Windhawk sees)
+////////////////////////////////////////////////////////////////////////////////
+
+
+static bool IsWindhawkLauncherProcess() {
+    wchar_t exePath[MAX_PATH];
+    if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH)) return false;
+    wchar_t* base = wcsrchr(exePath, L'\\');
+    base = base ? base + 1 : exePath;
+    return _wcsicmp(base, L"windhawk.exe") == 0;
+}
+
+BOOL Wh_ModInit() {
+    DWORD sessionId;
+    if (ProcessIdToSessionId(GetCurrentProcessId(), &sessionId) &&
+        sessionId == 0) {
+        return FALSE;
+    }
+
+    bool isExcluded = false;
+    bool isToolModProcess = false;
+    bool isCurrentToolModProcess = false;
+    int argc;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLine(), &argc);
+    if (argv) {
+        for (int i = 1; i < argc; i++) {
+            if (wcscmp(argv[i], L"-service") == 0 ||
+                wcscmp(argv[i], L"-service-start") == 0 ||
+                wcscmp(argv[i], L"-service-stop") == 0) {
+                isExcluded = true;
+                break;
+            }
+        }
+        for (int i = 1; i < argc - 1; i++) {
+            if (wcscmp(argv[i], L"-tool-mod") == 0) {
+                isToolModProcess = true;
+                if (wcscmp(argv[i + 1], WH_MOD_ID) == 0) {
+                    isCurrentToolModProcess = true;
+                }
+                break;
+            }
+        }
+        LocalFree(argv);
+    }
+    if (isExcluded) {
+        return FALSE;
+    }
+
+    if (isCurrentToolModProcess) {
+        // Tool host: tray + settings window. Same single-instance mutex wait
+        // as the standalone control mod (old instance hand-over).
+        g_isCtrlToolProcess = true;
+        g_toolModProcessMutex =
+            CreateMutex(nullptr, TRUE, L"windhawk-tool-mod_" WH_MOD_ID);
+        if (!g_toolModProcessMutex) {
+            Wh_Log(L"CreateMutex failed");
+            ExitProcess(1);
+        }
+        if (GetLastError() == ERROR_ALREADY_EXISTS) {
+            Wh_Log(L"Tool mod already running (%s), waiting for the old instance",
+                   WH_MOD_ID);
+            bool owned = false;
+            // Fail fast: 2s, not 10s. A second host that can't win the
+            // mutex within 2s is a duplicate spawn (Windhawk 2.x spawns its
+            // own tool host) — exiting keeps Windhawk's "initializing" state
+            // from lingering ~20s while the loser waits out the old hand-over.
+            for (int i = 0; i < 8 && !owned; i++) {
+                if (g_toolModProcessMutex) CloseHandle(g_toolModProcessMutex);
+                g_toolModProcessMutex =
+                    CreateMutex(nullptr, TRUE, L"windhawk-tool-mod_" WH_MOD_ID);
+                if (!g_toolModProcessMutex) {
+                    Sleep(250);
+                    continue;
+                }
+                if (GetLastError() != ERROR_ALREADY_EXISTS) {
+                    owned = true;
+                    break;
+                }
+                WaitForSingleObject(g_toolModProcessMutex, 250);
+            }
+            if (!owned) {
+                Wh_Log(L"Old tool instance never released the mutex");
+                ExitProcess(1);
+            }
+        }
+        if (!WhTool_ModInit()) {
+            ExitProcess(1);
+        }
+        // Hook the host's entry point so windhawk.exe never actually runs in
+        // this process — it exists purely to host our message loop.
+        IMAGE_DOS_HEADER* dosHeader = (IMAGE_DOS_HEADER*)GetModuleHandle(nullptr);
+        IMAGE_NT_HEADERS* ntHeaders =
+            (IMAGE_NT_HEADERS*)((BYTE*)dosHeader + dosHeader->e_lfanew);
+        DWORD entryPointRVA = ntHeaders->OptionalHeader.AddressOfEntryPoint;
+        void* entryPoint = (BYTE*)dosHeader + entryPointRVA;
+        Wh_SetFunctionHook(entryPoint, (void*)EntryPoint_Hook, nullptr);
+        return TRUE;
+    }
+
+    if (isToolModProcess) {
+        // Another mod's tool host: not ours, not the engine's business.
+        return FALSE;
+    }
+
+    if (IsWindhawkLauncherProcess()) {
+        // Plain windhawk.exe (the normal UI app): we only act as the launcher
+        // that spawns and watchdogs our dedicated tool host process.
+        g_isToolModProcessLauncher = true;
+        return TRUE;
+    }
+
+    // Everything else that matched @include = explorer.exe family: the engine.
+    return Engine_ModInit();
+}
+
+void Wh_ModAfterInit() {
+    if (g_isToolModProcessLauncher) {
+        // Windhawk 2.x spawns the tool host itself for tool mods; spawning
+        // unconditionally created a duplicate that blocked on the mutex for
+        // ~10s (the "initializing" hang). Spawn only when no host holds the
+        // mutex (the 1.x case, where nothing else spawns it).
+        HANDLE existing = OpenMutexW(SYNCHRONIZE, FALSE,
+                                     L"windhawk-tool-mod_" WH_MOD_ID);
+        if (!existing) {
+            SpawnToolModProcess();
+        } else {
+            Wh_Log(L"[CTRL] tool host already running, spawn skipped");
+        }
+        if (existing) CloseHandle(existing);
+        CloseHandle(
+            CreateThread(nullptr, 0, ToolHostWatchdog, nullptr, 0, nullptr));
+    }
+    // Engine and tool host need no AfterInit work.
+}
+
+void Wh_ModSettingsChanged() {
+    if (g_isCtrlToolProcess) {
+        WhTool_ModSettingsChanged();
+        return;
+    }
+    if (g_isToolModProcessLauncher) {
+        return;
+    }
+    Engine_ModSettingsChanged();
+}
+
+void Wh_ModUninit() {
+    if (g_isCtrlToolProcess) {
+        WhTool_ModUninit();
+        return;
+    }
+    if (g_isToolModProcessLauncher) {
+        return;
+    }
+    Engine_ModUninit();
 }
