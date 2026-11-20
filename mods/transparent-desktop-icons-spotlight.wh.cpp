@@ -2,7 +2,7 @@
 // @id              transparent-desktop-icons-spotlight
 // @name            "Ab Tenebris" - Transparent Desktop Icons with Spotlight and Dynamic Shadows
 // @description     Make desktop icons transparent when idle with an interactive spotlight effect, plus the Ab Tenebris control panel: tray icon and native settings window. Hover over the desktop or select icons to reveal them.
-// @version         2.10.2
+// @version         2.10.3
 // @author          drgutman
 // @github          https://github.com/drgutman
 // @homepage        https://instagram.com/drgutman
@@ -12960,6 +12960,10 @@ static const int kBottomBarH = 48;
 static bool g_isToolModProcessLauncher;
 static bool g_isCtrlToolProcess;
 static HANDLE g_toolModProcessMutex;
+// Set by Wh_ModUninit (launcher instance) so the long-lived watchdog thread
+// exits before the mod DLL unmaps — the old 3-attempt watchdog self-expired
+// after ~40s, which left the tray with no lifeguard for the rest of the day.
+static HANDLE g_watchdogStop = nullptr;
 
 static HWND g_settingsWnd = nullptr;
 static HWND g_msgWnd = nullptr;
@@ -15371,6 +15375,7 @@ static bool AddTrayIcon(HWND hwnd, const wchar_t* reason) {
 static void RemoveTrayIcon() {
     if (g_trayAdded.exchange(false)) {
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
+        CtlLog(L"[TRAY] remove pid=%lu", GetCurrentProcessId());
     }
 }
 
@@ -15656,25 +15661,30 @@ static void SpawnToolModProcess() {
 }
 
 static DWORD WINAPI ToolHostWatchdog(void*) {
-    for (int attempt = 0; attempt < 3; attempt++) {
-        // First wait is long (20s): the Windhawk 2.x service spawns its own
-        // tool host and injection can take a while; respawning earlier
-        // produces a duplicate that briefly fights for the mutex. Later
-        // attempts stay at 10s (a host that vanished for real should be
-        // back fast).
-        int waits = attempt == 0 ? 100 : 50;
-        for (int waited = 0; waited < waits; waited++) {
-            Sleep(200);
-            HANDLE mutex = OpenMutexW(SYNCHRONIZE, FALSE,
-                                      L"windhawk-tool-mod_" WH_MOD_ID);
-            if (!mutex) continue;
-            DWORD r = WaitForSingleObject(mutex, 0);
+    // Long-lived lifeguard: 5s poll cadence, respawn after the mutex has
+    // been missing for 3 consecutive polls (~15s — longer than any healthy
+    // injection gap, so a slow service-spawned host is never double-spawned).
+    // Exits only on g_watchdogStop (Wh_ModUninit), never self-expires.
+    int absent = 0;
+    for (;;) {
+        DWORD w = WaitForSingleObject(g_watchdogStop, 5000);
+        if (w == WAIT_OBJECT_0) break;
+        HANDLE mutex = OpenMutexW(SYNCHRONIZE, FALSE,
+                                  L"windhawk-tool-mod_" WH_MOD_ID);
+        if (mutex) {
             CloseHandle(mutex);
-            if (r == WAIT_TIMEOUT || r == WAIT_FAILED) return 0;
+            absent = 0;
+            continue;
         }
-        Wh_Log(L"[CTRL] tool host missing after %d s, respawning", attempt + 1);
-        SpawnToolModProcess();
+        absent++;
+        if (absent >= 3) {
+            CtlLog(L"[CTRL] watchdog: tool host missing ~15s, respawning");
+            Wh_Log(L"[CTRL] watchdog respawning tool host");
+            absent = 0;
+            SpawnToolModProcess();
+        }
     }
+    CtlLog(L"[CTRL] watchdog exiting (stop event)");
     return 0;
 }
 
@@ -15765,7 +15775,9 @@ BOOL Wh_ModInit() {
                 ExitProcess(1);
             }
         }
+        CtlLog(L"[CTRL] tool host init, pid=%lu", GetCurrentProcessId());
         if (!WhTool_ModInit()) {
+            CtlLog(L"[CTRL] WhTool_ModInit FAILED, exiting");
             ExitProcess(1);
         }
         // Hook the host's entry point so windhawk.exe never actually runs in
@@ -15797,18 +15809,28 @@ BOOL Wh_ModInit() {
 
 void Wh_ModAfterInit() {
     if (g_isToolModProcessLauncher) {
-        // Windhawk 2.x spawns the tool host itself for tool mods; spawning
-        // unconditionally created a duplicate that blocked on the mutex for
-        // ~10s (the "initializing" hang). Spawn only when no host holds the
-        // mutex (the 1.x case, where nothing else spawns it).
-        HANDLE existing = OpenMutexW(SYNCHRONIZE, FALSE,
-                                     L"windhawk-tool-mod_" WH_MOD_ID);
-        if (!existing) {
-            SpawnToolModProcess();
-        } else {
-            Wh_Log(L"[CTRL] tool host already running, spawn skipped");
+        g_watchdogStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        // Windhawk 2.x spawns the tool host itself; the host only creates
+        // its mutex once the mod is INJECTED, which lags the spawn. Grace
+        // poll ~3s before deciding nobody else is bringing one up, so we
+        // don't race the service into a duplicate host.
+        bool hostComing = false;
+        for (int i = 0; i < 6 && !hostComing; i++) {
+            HANDLE m = OpenMutexW(SYNCHRONIZE, FALSE,
+                                  L"windhawk-tool-mod_" WH_MOD_ID);
+            if (m) {
+                CloseHandle(m);
+                hostComing = true;
+                break;
+            }
+            Sleep(500);
         }
-        if (existing) CloseHandle(existing);
+        if (hostComing) {
+            CtlLog(L"[CTRL] launcher: tool host already coming up, spawn skipped");
+        } else {
+            CtlLog(L"[CTRL] launcher: no tool host after grace, spawning");
+            SpawnToolModProcess();
+        }
         CloseHandle(
             CreateThread(nullptr, 0, ToolHostWatchdog, nullptr, 0, nullptr));
     }
@@ -15828,10 +15850,12 @@ void Wh_ModSettingsChanged() {
 
 void Wh_ModUninit() {
     if (g_isCtrlToolProcess) {
+        CtlLog(L"[CTRL] tool host uninit");
         WhTool_ModUninit();
         return;
     }
     if (g_isToolModProcessLauncher) {
+        if (g_watchdogStop) SetEvent(g_watchdogStop);
         return;
     }
     Engine_ModUninit();
