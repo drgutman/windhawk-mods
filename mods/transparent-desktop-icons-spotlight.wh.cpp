@@ -2,7 +2,7 @@
 // @id              transparent-desktop-icons-spotlight
 // @name            "Ab Tenebris" - Transparent Desktop Icons with Spotlight and Dynamic Shadows
 // @description     Make desktop icons transparent when idle with an interactive spotlight effect, plus the Ab Tenebris control panel: tray icon and native settings window. Hover over the desktop or select icons to reveal them.
-// @version         2.10.3
+// @version         2.10.12
 // @author          drgutman
 // @github          https://github.com/drgutman
 // @homepage        https://instagram.com/drgutman
@@ -17,10 +17,34 @@
 
 # AB TENEBRIS - Transparent Desktop Icons with Spotlight and Dynamic Shadows
 
+## THE SHELL WALLPAPER CENTERING QUIRK (measured, 2026-11-21)
+When Windows Explorer renders a wallpaper in Fill or Span mode, the image is
+cover-fit (aspect preserved) and the overflow is cropped - but the crop is
+NOT centered mathematically. Measured on Windows 11 26300, dual monitor
+(3840x2160 @125% + 1080x1920 @100%), six configurations, shifts matching
+predictions to 1-2 px:
+
+| Axis of the overflow | Shell's centering divisor |
+|---|---|
+| Horizontal (left/right crop) | `/2` (mathematical centering) |
+| Vertical (top/bottom crop) | `/3` (top gets 1/3 of the overflow) |
+
+Both Fill and Span follow the same per-axis law, at any scale factor (this
+mod replicates the wallpaper with these exact formulas - see
+ComputeWallpaperRects and the SPAN block if you need a reference
+implementation). Fun facts: the /3 vertical quirk was independently
+discovered here in 2026-11 (multimon ghosting hunt) and again for the
+horizontal axis in 2026-11-21 while chasing issue #5793; the earlier belief
+that /3 applied to both axes was correlation - the discriminating variable
+turned out to be which axis overflowed, not the zoom direction.
+
 ## SETTINGS
 All settings live in the **Ab Tenebris settings window** — open it from the
 tray icon this mod adds to the taskbar (left-click the icon, or right-click
-it and choose Settings). The Windhawk settings page is intentionally empty.
+it and choose Settings), or press the hotkey from the Windhawk settings
+page (default Ctrl+Alt+B). The Windhawk page also has a **Diagnostics**
+section: a debug-logging switch and log path for bug reports, off by
+default. Everything else is configured in the settings window.
 
 
 Ab tenebris - latin for "out of the darkness"
@@ -61,6 +85,28 @@ And don't come back to me crying if you set it on fire.
 
 */
 // ==/WindhawkModReadme==
+// ==WindhawkModSettings==
+/*
+- General:
+  - trayIconPath: ""
+    $name: Custom tray icon
+    $description: Path to an icon for the tray - an .ico file, or a DLL/EXE plus icon index like imageres.dll,42. Leave empty for the default moon. Changes apply live (no mod reload needed).
+  - settingsHotkey: "Ctrl+Alt+T"
+    $name: Open settings window (hotkey)
+    $description: Global hotkey that opens the Ab Tenebris settings window (a fallback in case the tray icon is not available). Modifiers plus key, e.g. Ctrl+Alt+B or Ctrl+Shift+S or Alt+F9. Leave empty or set to "none" to disable.
+  $name: General
+
+- Diagnostics:
+  - debugLogging: false
+    $name: Debug logging (for bug reports)
+    $description: Writes a targeted diagnostic log for troubleshooting (tray icon chain, wallpaper fit). Default off; turn on only when asked in a bug report. The log starts fresh each time you flip this on and is capped at 2 MB, so it cannot grow unbounded.
+  - debugLogPath: ""
+    $name: Debug log file path
+    $description: Where the debug log is written. Leave empty for the default - %LOCALAPPDATA%\AbTenebris\debug_log.txt (usually C:\Users\<you>\AppData\Local\AbTenebris\debug_log.txt).
+  $name: Diagnostics
+*/
+// ==/WindhawkModSettings==
+
 
 
 #define _WIN32_WINNT 0x0A00
@@ -451,6 +497,12 @@ UINT WM_APP_FOCUSSTORM = 0;     // render thread -> UI thread: focus-toggle hack
 // external destroy/recreate) is ALSO appended to boot_log.txt in the mod
 // storage dir, timestamped with ms-since-boot. A handful of one-shot writes
 // per boot; the file accumulates across boots as a history.
+// [v2.10.6] boot_log.txt was the THIRD always-on uncapped log (34 MB here by
+// 2026-11-21) - same guards as diag_log: rotate at first write past 1 MB
+// (slow accumulator, ~2 KB/boot), hard cap 2 MB. RotateLogAtBoot itself
+// deletes any .old past 25 MB, so the 34 MB fossil dies on first rotate.
+static bool LogFileTooBig(PCWSTR path, unsigned long long limitBytes);
+static void RotateLogAtBoot(PCWSTR path, unsigned long long rotateBytes);
 static void BootLog(const wchar_t* fmt, ...) {
     wchar_t buf[256];
     va_list args;
@@ -462,6 +514,30 @@ static void BootLog(const wchar_t* fmt, ...) {
     WCHAR storagePath[MAX_PATH];
     if (Wh_GetModStoragePath(storagePath, MAX_PATH) <= 0) return;
     std::wstring filePath = std::wstring(storagePath) + L"\\boot_log.txt";
+    static bool s_bootRotated = false;
+    if (!s_bootRotated) {
+        s_bootRotated = true;
+        RotateLogAtBoot(filePath.c_str(), 1ull * 1024 * 1024);
+    }
+    // Hard cap (2 MB): one marker line, then silence until the next boot
+    // rotation. Racy check is benign - worst case a few extra lines.
+    static bool s_bootCapped = false;
+    if (s_bootCapped) return;
+    if (LogFileTooBig(filePath.c_str(), 2ull * 1024 * 1024)) {
+        s_bootCapped = true;
+        HANDLE hc = CreateFileW(filePath.c_str(), FILE_APPEND_DATA,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hc != INVALID_HANDLE_VALUE) {
+            const wchar_t* marker =
+                L"=== LOG CAP 2MB REACHED, logging stopped until next boot ===\r\n";
+            DWORD w2 = 0;
+            WriteFile(hc, marker,
+                      (DWORD)(wcslen(marker) * sizeof(wchar_t)), &w2, nullptr);
+            CloseHandle(hc);
+        }
+        return;
+    }
     HANDLE hFile = CreateFileW(filePath.c_str(), FILE_APPEND_DATA,
                                FILE_SHARE_READ | FILE_SHARE_WRITE,
                                nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -480,6 +556,24 @@ static void BootLog(const wchar_t* fmt, ...) {
 // Same append-to-file pattern as BootLog but for runtime bug-hunt diagnostics
 // ([GHOST]/[SHADOW]/[MASK] sites) — DbgView isn't always running, so the AI
 // can read these straight off disk during a repro.
+// --- shared log size guards (v2.10.4) ---------------------------------------
+// Every log the mod writes is bounded: rotate at boot past rotateBytes, stop
+// appending past capBytes (with a visible marker line). The runaway
+// diag_log.txt (2.9M lines on the dev machine by 2026-11-20) must not recur.
+static bool LogFileTooBig(PCWSTR path, unsigned long long limitBytes) {
+    WIN32_FILE_ATTRIBUTE_DATA fa{};
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fa)) return false;
+    return (((ULONGLONG)fa.nFileSizeHigh << 32) | fa.nFileSizeLow) > limitBytes;
+}
+static void RotateLogAtBoot(PCWSTR path, unsigned long long rotateBytes) {
+    if (!LogFileTooBig(path, rotateBytes)) return;
+    std::wstring old = std::wstring(path) + L".old";
+    // Never let the .old itself become the runaway: past ~25 MB it has no
+    // forensic value we would ever read - delete it instead of replacing.
+    if (LogFileTooBig(old.c_str(), 25ull * 1024 * 1024)) DeleteFileW(old.c_str());
+    MoveFileExW(path, old.c_str(), MOVEFILE_REPLACE_EXISTING);
+}
+
 static void DiagLog(const wchar_t* fmt, ...) {
     wchar_t buf[512];
     va_list args;
@@ -491,6 +585,25 @@ static void DiagLog(const wchar_t* fmt, ...) {
     WCHAR storagePath[MAX_PATH];
     if (Wh_GetModStoragePath(storagePath, MAX_PATH) <= 0) return;
     std::wstring filePath = std::wstring(storagePath) + L"\\diag_log.txt";
+    // Hard cap (8 MB): one marker line, then silence until the next boot
+    // rotation. Racy check is benign - worst case a few extra lines.
+    static bool s_diagCapped = false;
+    if (s_diagCapped) return;
+    if (LogFileTooBig(filePath.c_str(), 8ull * 1024 * 1024)) {
+        s_diagCapped = true;
+        HANDLE hc = CreateFileW(filePath.c_str(), FILE_APPEND_DATA,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hc != INVALID_HANDLE_VALUE) {
+            const wchar_t* marker =
+                L"=== LOG CAP 8MB REACHED, logging stopped until next boot ===\r\n";
+            DWORD w2 = 0;
+            WriteFile(hc, marker,
+                      (DWORD)(wcslen(marker) * sizeof(wchar_t)), &w2, nullptr);
+            CloseHandle(hc);
+        }
+        return;
+    }
     HANDLE hFile = CreateFileW(filePath.c_str(), FILE_APPEND_DATA,
                                FILE_SHARE_READ | FILE_SHARE_WRITE,
                                nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -2082,6 +2195,8 @@ void     CreateUnderlayWindow();
 void     CreateMessageWindow();
 void     LoadSettings();
 void     RefreshWallpaperAndStyle();   // New unified loader
+static void DebugLog(const wchar_t* fmt, ...); // defined in the config section
+static void OneTimeBigOldSweep(); // defined after GetCfgDir (control section)
 HWND     GetDesktopListView();
 void     UpdateSelectionRects();
 void     RevalidateDesktopWindows();
@@ -3045,6 +3160,8 @@ void RefreshWallpaperAndStyle() {
                 {
                     D2D1_SIZE_U wp = newBitmap ? newBitmap->GetPixelSize() : D2D1::SizeU(0, 0);
                     DiagLog(L"[WALLPAPER] pos=%d img=%ux%u path='%s'",
+                            (int)g_wallpaperPosition, wp.width, wp.height, newPath.c_str());
+                    DebugLog(L"[WALLPAPER] pos=%d img=%ux%u path='%s'",
                             (int)g_wallpaperPosition, wp.width, wp.height, newPath.c_str());
                 }
             } else {
@@ -4299,18 +4416,27 @@ void ComputeWallpaperRects(const D2D1_SIZE_F& imgSize,
             float srcX = (imgSize.width - srcW) / 2.0f;
             float srcY = (imgSize.height - srcH) / 2.0f;
 
-            // 2. THE UNIVERSAL WINDOWS QUIRK
-            // Windows Shell hardcodes a /3 divisor for the centering crop,
-            // completely ignoring standard mathematical centering (/2).
-            // This applies at ALL DPI scales, including 100%.
+            // 2. THE UNIVERSAL WINDOWS QUIRK - final form: PER-AXIS, not
+            // per-regime. Six measurements across two images, two monitors,
+            // Fill + SPAN, both branches (2026-11-21) all decode as:
+            //   - HORIZONTAL centering crop: Shell uses /2 (math truth).
+            //   - VERTICAL centering crop: Shell uses /3 (the quirk).
+            // Evidence: horizontal branches (2560x1080 img: Fill main 214,
+            // Fill portrait 579, SPAN 34 px = overflow/6*scale with our /3
+            // vs Shell /2; 1600x1200 img portrait Fill on-point with /2) AND
+            // vertical branches (1600x1200 img: Fill main 120, SPAN
+            // 254/256 px = overflow/6*scale with our /2 vs Shell /3; the
+            // multimon-era vertical /3 measurements). The earlier
+            // scale>1 regime split was correlation - the discriminating
+            // variable was which axis overflowed.
             float screenAR = refSize.height / refSize.width;
             float correctCropH = imgSize.height - (imgSize.width * screenAR);
             float correctCropW = imgSize.width - (imgSize.height / screenAR);
 
             if (scaleX > scaleY) {
-                srcY = correctCropH / 3.0f;
+                srcY = correctCropH / 3.0f;   // vertical axis: Shell /3
             } else if (scaleY > scaleX) {
-                srcX = correctCropW / 3.0f;
+                srcX = correctCropW / 2.0f;   // horizontal axis: Shell /2
             }
 
             // 3. RESIZE THEN CROP (The Painter's Pipeline)
@@ -4925,36 +5051,20 @@ void RenderOverlay() {
             // deltas (102px @2767.5 drawH, 460px @4920 drawH, 0 @exact)
             // match -overflow/3 three for three, the square case exactly.
             // Center-crop hypotheses were all wrong; the quirk generalizes
-            // across wallpaper positions. Horizontal overflow: same /3
-            // treatment (measured cases were width-driven, so this axis is
-            // inference — probe + Doc's eyes will verdict it).
+            // across wallpaper positions - PER-AXIS (2026-11-21, six
+            // measurements): horizontal overflow centered /2 (2560x1080
+            // SPAN: our /3 sat 33px right of Shell = overflow/6*scale on
+            // both monitors), vertical overflow centered /3 (1600x1200
+            // SPAN: our /2 sat 254px high = overflow/6 on both monitors).
+            // Same law as FILL; see ComputeWallpaperRects for the table.
             float scale = std::max(virtW / imgSize.width, virtH / imgSize.height);
             float drawW = imgSize.width * scale;
             float drawH = imgSize.height * scale;
-            float left = -((drawW - virtW) / 3.0f);
-            float top  = -((drawH - virtH) / 3.0f);
+            float left = -((drawW - virtW) / 2.0f);   // horizontal: Shell /2
+            float top  = -((drawH - virtH) / 3.0f);   // vertical: Shell /3
             D2D1_RECT_F targetRect = D2D1::RectF(left - offsetX, top - offsetY, left - offsetX + drawW, top - offsetY + drawH);
-            // [MULTIMON v2.9.8] SPAN probe (one-shot per wallpaper draw session):
-            // every input of the anchor math. Doc field case: replica sits
-            // HIGHER than Shell's span, same scale — anchor is the variable.
-            // 458px delta = our top-crop misanchored; 116px = monitor-2 offset
-            // leak; something else = DPI-scaled virtual-screen metrics.
-            {
-                static ULONGLONG s_lastSpanProbe = 0;
-                ULONGLONG now = GetTickCount64();
-                if (now - s_lastSpanProbe > 15000) {
-                    s_lastSpanProbe = now;
-                    UINT sysDpi = GetDpiForWindow(g_overlayWnd);
-                    DiagLog(L"[SPAN] virt=%gx%g smXY=(%ld,%ld) overlayScreen=(%ld,%ld) off=(%g,%g) "
-                            L"img=%ux%u draw=%gx%g left/top=(%g,%g) overlayDpi=%u rect=[%g %g %g %g]",
-                            virtW, virtH,
-                            GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN),
-                            pt.x, pt.y, offsetX, offsetY,
-                            (unsigned)spanPx.width, (unsigned)spanPx.height,
-                            drawW, drawH, left, top, sysDpi,
-                            targetRect.left, targetRect.top, targetRect.right, targetRect.bottom);
-                }
-            }
+            // [v2.10.5] SPAN probe stripped: its verdict became the per-axis
+            // centering law (see ComputeWallpaperRects + above).
             g_dc->DrawBitmap(g_wallpaperBitmap.Get(), targetRect, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
         } else {
             D2D1_SIZE_U pixelSize = g_wallpaperBitmap->GetPixelSize();
@@ -10428,25 +10538,11 @@ void RenderUnderlayLoopInner() {
         snapshots = g_iconSnapshots;
         localSnapGen = currentGen;
         iconsChanged = true;
-        // [TEARDOWN v2.6.1] Measure the perceived teardown latency: the
-        // frame that FIRST draws the post-zoom snapshot list. Old shadows
-        // die exactly here — T+X after [ZOOM] IS the removal delay. Also
-        // times the vector copy itself and catches slow copies on
-        // non-zoom publishes (bounded, session-capped).
-        ULONGLONG copyMs = GetTickCount64() - tCopy0;
-        ULONGLONG zTick = g_lastZoomTick.load(std::memory_order_relaxed);
-        ULONGLONG sinceZoom = zTick ? (GetTickCount64() - zTick) : 0;
-        static int s_teardownLogged = 0;
-        if (s_teardownLogged < 24) {
-            if (zTick && sinceZoom < 5000) {
-                ++s_teardownLogged;
-                DiagLog(L"[TEARDOWN] post-zoom swap frame: T+%llums after [ZOOM], copy %llums, %zu snaps",
-                        sinceZoom, copyMs, snapshots.size());
-            } else if (copyMs > 3) {
-                ++s_teardownLogged;
-                DiagLog(L"[TEARDOWN] slow snapshot copy %llums (%zu snaps)", copyMs, snapshots.size());
-            }
-        }
+        // [v2.10.5] TEARDOWN probe stripped: its verdict landed in v2.6.1
+        // (removal latency was fast; the perceived lag was the GPU bake
+        // wave) and the v2.5.3 slither family killed the mechanism it
+        // watched. tCopy0/timing kept for the copy itself.
+
     }
 
     bool forceRender = g_underlayForceRender.exchange(false, std::memory_order_relaxed);
@@ -10506,17 +10602,9 @@ void RenderUnderlayLoopInner() {
 
         // --- PASS 1: DRAW UNIFIED SHADOWS (NEW PIPELINE) ---
         if (shadowsVisible) {
-            // [TEARDOWN v2.6.1] Contention probe: this leaf mutex is held
-            // for the ENTIRE draw loop, and the post-zoom worker hammers
-            // it (177 SILFIRST publishes + preflight + GC). A stall here
-            // delays the teardown frame — the number tells us whether the
-            // perceived slow removal is lock racing or just frame cadence.
-            ULONGLONG tShadowLock0 = GetTickCount64();
+            // [v2.10.5] contention probe stripped (verdict: ZERO stalls
+            // measured across the whole v2.6.1 session).
             std::lock_guard<std::mutex> shadowLock(g_comboShadowCacheMutex);
-            ULONGLONG shadowLockStallMs = GetTickCount64() - tShadowLock0;
-            if (shadowLockStallMs > 5) {
-                DiagLog(L"[TEARDOWN] comboCache mutex stalled %llums before draw pass", shadowLockStallMs);
-            }
 
             for (const auto & snap : snapshots) {
                 if (snap.isDragged || snap.isPendingDrop) continue; // Suppress shadow at old spot during move
@@ -11080,7 +11168,132 @@ LRESULT CALLBACK MessageWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPar
     return 0;
 }
 
+// Engine-side mirror of the control panel's WMAPP_OPENSETTINGS (WM_APP+13).
+// Engine WM_APP literals: WM_APP+1 (snapshot worker ping) is taken; 13 is free.
+static const UINT WMAPP_OPENSETTINGS = WM_APP + 13;
+// Internal: marshal ApplySettingsHotkey onto the message window's thread
+// (RegisterHotKey fails with 1408 "belongs to other thread" otherwise).
+static const UINT WMAPP_APPLYHOTKEY = WM_APP + 14;
+
+static void DebugLog(const wchar_t* fmt, ...);
+
+// --- settings-window hotkey (v2.10.4) ----------------------------------------
+// Engine-side registration (the desktop-owner's message window): the hotkey
+// must work even when the tool host is dead - that is its whole reason to
+// exist. On WM_HOTKEY we post WMAPP_OPENSETTINGS to the tool host's message
+// window (found by class name). Parsed from a plain string setting so it
+// works identically on Windhawk 1.x and 2.x (the $format:hotkey annotation
+// is 2.0-only).
+static UINT g_hotkeyMods = 0;
+static UINT g_hotkeyVk = 0;
+static std::wstring g_hotkeyRaw;
+
+static bool ParseHotkeyString(PCWSTR s, UINT* mods, UINT* vk) {
+    *mods = 0; *vk = 0;
+    if (!s || !*s) return false;
+    std::wstring w = s;
+    for (auto& c : w) c = (wchar_t)towlower(c);
+    if (w == L"none" || w == L"(none)" || w == L"off") { *vk = 0; return true; }
+
+    UINT mods2 = 0;
+    UINT vk2 = 0;
+    size_t start = 0;
+    while (start <= w.size()) {
+        size_t plus = w.find(L'+', start);
+        std::wstring tok = w.substr(start, plus == std::wstring::npos ?
+                                    std::wstring::npos : plus - start);
+        // trim
+        size_t b = tok.find_first_not_of(L" \t");
+        if (b == std::wstring::npos) return false;
+        size_t e = tok.find_last_not_of(L" \t");
+        tok = tok.substr(b, e - b + 1);
+
+        bool isLast = (plus == std::wstring::npos);
+        if (!isLast) {
+            if (tok == L"ctrl" || tok == L"control") mods2 |= MOD_CONTROL;
+            else if (tok == L"alt") mods2 |= MOD_ALT;
+            else if (tok == L"shift") mods2 |= MOD_SHIFT;
+            else if (tok == L"win" || tok == L"windows") mods2 |= MOD_WIN;
+            else return false;
+            start = plus + 1;
+            continue;
+        }
+        // last token = the key
+        if (tok.size() == 1) {
+            wchar_t c = tok[0];
+            if ((c >= L'a' && c <= L'z')) vk2 = 'A' + (c - L'a');
+            else if (c >= L'0' && c <= L'9') vk2 = '0' + (c - L'0');
+            else return false;
+        } else if (tok[0] == L'f' && tok.size() >= 2 && tok.size() <= 3) {
+            int fn = _wtoi(tok.c_str() + 1);
+            if (fn < 1 || fn > 24) return false;
+            vk2 = VK_F1 + (fn - 1);
+        } else if (tok == L"space") vk2 = VK_SPACE;
+        else if (tok == L"esc" || tok == L"escape") vk2 = VK_ESCAPE;
+        else if (tok == L"enter" || tok == L"return") vk2 = VK_RETURN;
+        else if (tok == L"tab") vk2 = VK_TAB;
+        else if (tok == L"backspace") vk2 = VK_BACK;
+        else if (tok == L"ins" || tok == L"insert") vk2 = VK_INSERT;
+        else if (tok == L"del" || tok == L"delete") vk2 = VK_DELETE;
+        else if (tok == L"home") vk2 = VK_HOME;
+        else if (tok == L"end") vk2 = VK_END;
+        else if (tok == L"pgup") vk2 = VK_PRIOR;
+        else if (tok == L"pgdn" || tok == L"pagedown") vk2 = VK_NEXT;
+        else return false;
+        break;
+    }
+    if (!vk2) return false;
+    *mods = mods2; *vk = vk2;
+    return true;
+}
+
+static void ApplySettingsHotkey(HWND hwnd) {
+    PCWSTR raw = Wh_GetStringSetting(L"General.settingsHotkey");
+    std::wstring cur = (raw && *raw) ? raw : L"";
+    Wh_FreeStringSetting(raw);
+    if (cur.empty()) cur = L"Ctrl+Alt+T";   // YAML default mirrors this
+    if (cur == g_hotkeyRaw) return;
+    g_hotkeyRaw = cur;
+    if (g_hotkeyVk) { UnregisterHotKey(hwnd, 1); g_hotkeyVk = 0; g_hotkeyMods = 0; }
+
+    UINT mods = 0, vk = 0;
+    if (!ParseHotkeyString(cur.c_str(), &mods, &vk)) {
+        DiagLog(L"[HOTKEY] parse failed: '%s'", cur.c_str());
+        DebugLog(L"[HOTKEY] parse failed: '%s'", cur.c_str());
+        return;
+    }
+    if (!vk) {  // "none"
+        DiagLog(L"[HOTKEY] disabled by setting");
+        DebugLog(L"[HOTKEY] disabled by setting");
+        return;
+    }
+    if (RegisterHotKey(hwnd, 1, mods | MOD_NOREPEAT, vk)) {
+        g_hotkeyMods = mods; g_hotkeyVk = vk;
+        DiagLog(L"[HOTKEY] registered '%s'", cur.c_str());
+        DebugLog(L"[HOTKEY] registered '%s'", cur.c_str());
+    } else {
+        DiagLog(L"[HOTKEY] RegisterHotKey FAILED '%s' err=%lu", cur.c_str(), GetLastError());
+        DebugLog(L"[HOTKEY] RegisterHotKey FAILED '%s' err=%lu", cur.c_str(), GetLastError());
+    }
+}
+
 LRESULT CALLBACK MessageWndProcInner(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    if (uMsg == WMAPP_APPLYHOTKEY) {
+        ApplySettingsHotkey(hWnd);
+        return 0;
+    }
+    if (uMsg == WM_HOTKEY && wParam == 1) {
+        // Settings-window hotkey: route to the tool host's message window.
+        HWND ctrl = FindWindowW(L"AbTenebrisControl_MsgWnd", nullptr);
+        if (ctrl) {
+            PostMessageW(ctrl, WMAPP_OPENSETTINGS, 0, 0);
+            DebugLog(L"[HOTKEY] fired -> posted WMAPP_OPENSETTINGS to ctrl=%p", (void*)ctrl);
+        } else {
+            DebugLog(L"[HOTKEY] fired but tool host msg window NOT FOUND");
+            DiagLog(L"[HOTKEY] fired but tool host msg window NOT FOUND");
+        }
+        return 0;
+    }
     if (uMsg == WM_APP_FOCUSSTORM) {
         // [FOCUS-STORM HACK] Fire the focus storm on the UI thread. Intermediate
         // target = our own overlay window (topmost, click-transparent). If the
@@ -11833,6 +12046,7 @@ LRESULT CALLBACK BootstrapHookProc(int code, WPARAM wParam, LPARAM lParam) {
         // Safely create the message window on the correct UI thread
         CreateMessageWindow();
         if (g_messageWnd) {
+            ApplySettingsHotkey(g_messageWnd);
             // Hand off the heavy lifting to the message pump to avoid blocking the hook
             PostMessageW(g_messageWnd, WM_APP_DEFERRED_INIT, 0, 0);
         }
@@ -12009,6 +12223,13 @@ static const CfgKeyEntry kCfgKeys[] = {
     {L"Selection.selectionFadeInDuration", false},
     {L"Selection.selectionFadeOutDuration", false},
     {L"Toggle.toggleOnDoubleClick", false},
+    // [v2.10.10] These two lived ONLY in kCfgDefaults (fresh-install
+    // bootstrap) - WriteConfigMap filters by kCfgKeys, so every write of
+    // them (tray menu Overlay toggle, Custom Shortcut Arrow checkbox) was
+    // silently dropped and the engine never saw a change. The 2.9.x era
+    // added the keys after this table existed; nothing flagged the gap.
+    {L"Toggle.overlayEnabled", false},
+    {L"General.customArrowEnabled", false},
     {L"Toggle.toggleFadeInDuration", false},
     {L"Toggle.toggleFadeOutDuration", false},
     {L"General.targetFps", false},
@@ -12097,6 +12318,66 @@ static std::wstring GetAbTenebrisConfigDir() {
         CoTaskMemFree(local);
     }
     return dir;
+}
+
+// --- reporter debug log (v2.10.4) -------------------------------------------
+// Windhawk-settings switch (Diagnostics.debugLogging / Diagnostics.debugLogPath,
+// default %LOCALAPPDATA%\AbTenebris\debug_log.txt). OFF = zero I/O. ON: file
+// starts fresh at the first write after the switch flips on, hard cap 2 MB
+// with a marker line. Reads the Wh_* settings per call: no caching, no
+// invalidation paths, negligible cost at debug-line rates.
+static void DebugLog(const wchar_t* fmt, ...) {
+    if (!Wh_GetIntSetting(L"Diagnostics.debugLogging")) return;
+    wchar_t buf[600];
+    va_list args;
+    va_start(args, fmt);
+    _vsnwprintf_s(buf, _TRUNCATE, fmt, args);
+    va_end(args);
+
+    PCWSTR raw = Wh_GetStringSetting(L"Diagnostics.debugLogPath");
+    std::wstring path = (raw && *raw) ? raw : L"";
+    Wh_FreeStringSetting(raw);
+    if (path.empty()) {
+        PWSTR local = nullptr;
+        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &local))) {
+            path = std::wstring(local) + L"\\" + kAbTenebrisDirName + L"\\debug_log.txt";
+            CoTaskMemFree(local);
+        }
+    }
+    if (path.empty()) return;
+
+    // Fresh file per session: the flip from off->on truncates.
+    static bool s_dbgWasOn = false;
+    static bool s_dbgCapped = false;
+    bool trunc = !s_dbgWasOn;
+    s_dbgWasOn = true;
+    if (s_dbgCapped) return;
+    if (!trunc && LogFileTooBig(path.c_str(), 2ull * 1024 * 1024)) {
+        s_dbgCapped = true;
+    }
+
+    HANDLE h = CreateFileW(path.c_str(),
+                           trunc ? GENERIC_WRITE : FILE_APPEND_DATA, 0,
+                           nullptr, trunc ? CREATE_ALWAYS : OPEN_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    DWORD w = 0;
+    if (s_dbgCapped) {
+        const wchar_t* marker =
+            L"=== DEBUG LOG CAP 2MB REACHED, logging stopped ===\r\n";
+        WriteFile(h, marker, (DWORD)(wcslen(marker) * sizeof(wchar_t)), &w, nullptr);
+    } else {
+        wchar_t line[700];
+        int len = swprintf_s(line,
+                             L"[%02u:%02u:%02u.%03u] [pid %lu] %s\r\n",
+                             st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+                             GetCurrentProcessId(), buf);
+        if (len > 0)
+            WriteFile(h, line, (DWORD)(len * sizeof(wchar_t)), &w, nullptr);
+    }
+    CloseHandle(h);
 }
 
 static std::wstring GetAbTenebrisConfigPath() {
@@ -12402,7 +12683,13 @@ void LoadSettings() {
     bool cacheModeChanged = !s_isFirstSettingsLoad && (s.cacheMode != g_settings.cacheMode);
     bool arrowSettingsChanged = !s_isFirstSettingsLoad && (s.customArrowScale != g_settings.customArrowScale ||
                                  s.customArrowOffsetX != g_settings.customArrowOffsetX ||
-                                 s.customArrowOffsetY != g_settings.customArrowOffsetY);
+                                 s.customArrowOffsetY != g_settings.customArrowOffsetY ||
+                                 // [v2.10.11] The enable flip was NOT here:
+                                 // the arrow is baked into the extracted
+                                 // pixels, so without this the combo cache
+                                 // never cleared and the tray-menu/checkbox
+                                 // flip silently kept the old arrow.
+                                 s.customArrowEnabled != g_settings.customArrowEnabled);
     s_isFirstSettingsLoad = false;
     // [P1.1] Tell Wh_ModSettingsChanged whether the skip guard must stand
     // down. First load is suppressed: at mod boot the mirror is empty
@@ -12715,6 +13002,17 @@ static BOOL Engine_ModInit() {
     // Initialize the disk cache paths now that the Windhawk API is fully ready
     g_diskCache.Init();
 
+    // [v2.10.4] Log hygiene: rotate the runaway-prone logs at boot (5 MB ->
+    // .old), so forensics stay readable and disks stay finite.
+    {
+        WCHAR storagePath[MAX_PATH];
+        if (Wh_GetModStoragePath(storagePath, MAX_PATH) > 0) {
+            std::wstring diag = std::wstring(storagePath) + L"\\diag_log.txt";
+            RotateLogAtBoot(diag.c_str(), 5ull * 1024 * 1024);
+        }
+        OneTimeBigOldSweep();
+    }
+
     WM_APP_CLEANUP = RegisterWindowMessageW(L"TransparentDesktopSpotlight_Cleanup");
     WM_APP_DEVICE_LOST = RegisterWindowMessageW(L"TransparentDesktopSpotlight_DeviceLost");
     WM_APP_TRIGGER_REFRESH = RegisterWindowMessageW(L"TransparentDesktopSpotlight_Refresh");
@@ -12909,6 +13207,7 @@ static void Engine_ModUninit() {
 // callback and the config-file watcher (the settings window's writes).
 void ApplySettingsChanges() {
     LoadSettings();
+    if (g_messageWnd) PostMessageW(g_messageWnd, WMAPP_APPLYHOTKEY, 0, 0);
     // [F1/P1.1] Bump the arrow generation ONLY when a baked-pixel input
     // actually changed (LoadSettings reports via g_bakedInputsChanged). The
     // old unconditional bump invalidated the composite mirror on every
@@ -12945,6 +13244,11 @@ static const UINT WMAPP_TRAYICON = WM_APP + 1;
 static HICON g_trayIcon = nullptr;  // loaded via LoadTrayIcon (system icon)
 static const UINT WMAPP_SCREENSHOT = WM_APP + 11;  // lParam = 0; saves snap.png
 static const UINT WMAPP_SWITCHSECTION = WM_APP + 12;  // lParam = section index
+// [v2.10.12] Tray-menu toggles post this to the settings window's UI thread:
+// cfg changed externally while the window is open, sync the checks NOW (no
+// focus change needed). UI-thread-only work stays on the owning thread.
+static const UINT WMAPP_SYNC_EXTERNAL = WM_APP + 15;
+// (WMAPP_OPENSETTINGS is defined engine-side, WM_APP+13 - same TU, shared.)
 
 static const wchar_t kCfgDirName[] = L"AbTenebris";
 static const wchar_t kCfgFileName[] = L"settings.cfg";
@@ -13016,61 +13320,11 @@ static HFONT MakePtFont(int pt, bool bold, const wchar_t* face = L"Segoe UI") {
 ////////////////////////////////////////////////////////////////////////////////
 // Config file (same format the engine reads: key=value, UTF-16 LE, BOM)
 
-struct CtrlCfgKeyEntry {
-    const wchar_t* key;
-    bool isString;
-};
-
-// Mirrors the engine's kCtrlCfgKeys (order = file layout).
-static const CtrlCfgKeyEntry kCtrlCfgKeys[] = {
-    {L"Shadows.enableShadows", false},
-    {L"Shadows.shadowLength", false},
-    {L"Shadows.shadowPasses", false},
-    {L"Shadows.shadowBaseAlpha", false},
-    {L"Shadows.shadowBlur", false},
-    {L"Shadows.shadowTailSoftness", false},
-    {L"Shadows.shadowTailOpacity", false},
-    {L"Shadows.shadowTailScale", false},
-    {L"Shadows.shadowOffset", false},
-    {L"Shadows.shadowGlobalTracking", false},
-    {L"Shadows.shadowFadeInDuration", false},
-    {L"Shadows.shadowFadeOutDuration", false},
-    {L"Spotlight.enableSpotlight", false},
-    {L"Spotlight.idleOpacity", false},
-    {L"Spotlight.overlayClipToIcons", false},
-    {L"Spotlight.spotlightRadius", false},
-    {L"Spotlight.spotlightRoundness", false},
-    {L"Spotlight.spotlightBlur", false},
-    {L"Spotlight.idleDelay", false},
-    {L"Spotlight.spotlightFadeInDuration", false},
-    {L"Spotlight.spotlightFadeOutDuration", false},
-    {L"Spotlight.mouseSmoothing", false},
-    {L"Tint.tintEnabled", false},
-    {L"Tint.tintStrength", false},
-    {L"Tint.tintPreset", true},
-    {L"Tint.tintColorHex", true},
-    {L"Selection.enableSelectionGlow", false},
-    {L"Selection.selectionOpacity", false},
-    {L"Selection.selectionPadding", false},
-    {L"Selection.selectionRoundness", false},
-    {L"Selection.selectionBlur", false},
-    {L"Selection.selectionTimeout", false},
-    {L"Selection.selectionFadeInDuration", false},
-    {L"Selection.selectionFadeOutDuration", false},
-    {L"Toggle.overlayEnabled", false},
-    {L"Toggle.toggleOnDoubleClick", false},
-    {L"Toggle.toggleFadeInDuration", false},
-    {L"Toggle.toggleFadeOutDuration", false},
-    {L"General.targetFps", false},
-    {L"General.cacheMode", false},
-    {L"General.customArrowEnabled", false},
-    {L"General.customArrowScale", false},
-    {L"General.customArrowOffsetX", false},
-    {L"General.customArrowOffsetY", false},
-    {L"batSignalEnabled", false},
-    {L"batSignalStyle", true},
-    {L"batLogoBlur", true},
-};
+// [v2.10.4 four-tables collapse] The control panel previously kept its own
+// hand-synced mirror of the engine's config key table (they were separate
+// mods then). One file now: the control section below uses the engine's
+// kCfgKeys / CfgKeyEntry directly. Order = settings.cfg layout order.
+// (The deleted mirror is preserved in git history + the pre-merge backup.)
 
 static std::wstring GetCfgDir() {
     std::wstring dir;
@@ -13081,6 +13335,38 @@ static std::wstring GetCfgDir() {
         CoTaskMemFree(local);
     }
     return dir;
+}
+
+// [v2.10.5 ONE-TIME BIG-OLD SWEEP] The pre-2.10.4 builds had no rotation at
+// all, so machines that ran them (ours AND bug reporters') may hold a
+// diag_log.txt.old of hundreds of MB. This runs ONCE per machine on first
+// start of 2.10.5+, regardless of the debug switch (the sweep cleans our
+// sloppy past, it has nothing to do with debugging).
+//
+//  >>> REMOVE-ME WHEN PUSHING TO OFFICIAL MAIN <<<
+//  Once every user has run a 2.10.5+ build, this is dead weight. The marker
+//  file makes it once-per-machine, but the code itself should be deleted in
+//  the first main-repo release after this one. Doc's ruling, 2026-11-21.
+static void OneTimeBigOldSweep() {
+    WCHAR storagePath[MAX_PATH];
+    if (Wh_GetModStoragePath(storagePath, MAX_PATH) > 0) {
+        std::wstring marker = std::wstring(storagePath) + L"\\bigold_sweep_done";
+        if (GetFileAttributesW(marker.c_str()) != INVALID_FILE_ATTRIBUTES) return;
+        HANDLE h = CreateFileW(marker.c_str(), GENERIC_WRITE, 0, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+        std::wstring diagOld = std::wstring(storagePath) + L"\\diag_log.txt.old";
+        if (LogFileTooBig(diagOld.c_str(), 25ull * 1024 * 1024))
+            DeleteFileW(diagOld.c_str());
+    }
+    // control_log lives beside the cfg; sweep its .old too if one exists.
+    std::wstring dir = GetCfgDir();
+    if (!dir.empty()) {
+        std::wstring ctlOld = dir + L"\\control_log.txt.old";
+        if (LogFileTooBig(ctlOld.c_str(), 25ull * 1024 * 1024))
+            DeleteFileW(ctlOld.c_str());
+    }
+    DiagLog(L"[LOG] one-time big-.old sweep done");
 }
 
 static std::wstring GetCfgPath() {
@@ -13166,7 +13452,7 @@ static bool WriteConfigMap(
     WriteFile(h, &bom, sizeof(bom), &wrote, nullptr);
 
     std::wstring body;
-    for (const auto& e : kCtrlCfgKeys) {
+    for (const auto& e : kCfgKeys) {
         auto it = kv.find(e.key);
         if (it == kv.end()) continue;
         body += e.key;
@@ -13226,7 +13512,12 @@ struct SidebarToggle {
 static const SidebarToggle kSidebarToggles[] = {
     {SEC_SHADOWS, L"Shadows.enableShadows"},
     {SEC_SPOTLIGHT, L"Spotlight.enableSpotlight"},
-    {SEC_OVERLAY, L"Tint.tintEnabled"},
+    // [v2.10.12] Was Tint.tintEnabled — which made the sidebar Overlay
+    // checkbox a DUPLICATE of the Tint group checkbox below, while the tray
+    // menu's Overlay entry toggled the master Toggle.overlayEnabled. Same
+    // label, two keys, no sync possible. The sidebar checkbox is now the
+    // master switch (menu == sidebar); tint keeps its own group checkbox.
+    {SEC_OVERLAY, L"Toggle.overlayEnabled"},
     {SEC_SELECTION, L"Selection.enableSelectionGlow"},
 };
 
@@ -13378,7 +13669,16 @@ static bool g_resizing = false;  // inside a WM_ENTERSIZEMOVE drag loop
 static bool g_syncing = false;  // suppress EN_CHANGE loops during programmatic
                                 // slider<->edit sync
 static UINT_PTR g_previewTimer = 0;
+static bool g_updateSyncBaseline = true;  // preview writes set false (they
+                                          // must not move the Cancel baseline)
 static std::unordered_map<std::wstring, std::wstring> g_initialSnapshot;
+// [v2.10.11 HARMONY] The file state the UI was last in step with (load,
+// Apply/Save, or focus-gain sync). The tray menu writes settings.cfg
+// directly, so the window must pull external changes in on activation and
+// Cancel must revert to this baseline, never to the stale open-time
+// snapshot (which would roll menu changes back).
+static std::unordered_map<std::wstring, std::wstring> g_lastSynced;
+static void SyncFromExternalChanges();
 
 static const int ID_BTN_APPLY = 1001;
 static const int ID_BTN_SAVE = 1002;
@@ -13830,12 +14130,29 @@ static void CtlLog(const wchar_t* fmt, ...) {
     std::wstring dir = GetCfgDir();
     if (dir.empty()) return;
     CreateDirectoryW(dir.c_str(), nullptr);
-    HANDLE h = CreateFileW((dir + L"\\control_log.txt").c_str(),
-                           FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
-                           OPEN_ALWAYS, 0, nullptr);
+    std::wstring cpath = dir + L"\\control_log.txt";
+    static bool s_ctlCapped = false;   // racy-benign, same as DiagLog
+    if (s_ctlCapped) return;
+    if (LogFileTooBig(cpath.c_str(), 8ull * 1024 * 1024)) {
+        s_ctlCapped = true;
+        HANDLE hc = CreateFileW(cpath.c_str(), FILE_APPEND_DATA,
+                                FILE_SHARE_READ, nullptr, OPEN_ALWAYS, 0, nullptr);
+        if (hc != INVALID_HANDLE_VALUE) {
+            const wchar_t* marker =
+                L"=== LOG CAP 8MB REACHED, logging stopped ===\r\n";
+            DWORD w2 = 0;
+            WriteFile(hc, marker,
+                      (DWORD)(wcslen(marker) * sizeof(wchar_t)), &w2, nullptr);
+            CloseHandle(hc);
+        }
+        return;
+    }
+    HANDLE h = CreateFileW(cpath.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ,
+                           nullptr, OPEN_ALWAYS, 0, nullptr);
     if (h == INVALID_HANDLE_VALUE) return;
     wchar_t line[600];
-    swprintf_s(line, L"%u %s\r\n", GetTickCount(), buf);
+    swprintf_s(line, L"%u [pid %lu] %s\r\n", GetTickCount(),
+               GetCurrentProcessId(), buf);
     DWORD wrote;
     WriteFile(h, line, (DWORD)(wcslen(line) * sizeof(wchar_t)), &wrote, nullptr);
     CloseHandle(h);
@@ -13977,8 +14294,12 @@ static void SetRowlessKey(const wchar_t* key, bool on) {
     if (g_sidebar) InvalidateRect(g_sidebar, nullptr, TRUE);
 }
 
-// Sidebar checkbox toggle: flip one enable-key, write the file, refresh the
-// row control + sidebar. Not routed through the dirty state — it IS a save.
+static void OnControlChanged();  // fwd: defined after the pane section
+
+// Sidebar checkbox toggle: flip one enable-key. [v2.10.11] STAGED, not a
+// silent save: it routes through OnControlChanged like every other control,
+// so Apply/Save light up and Cancel can revert it (with live preview checked
+// it still hits the file via the debounced preview write).
 // Keys with a row use the row control; row-less keys live in g_toggleState.
 static void ToggleSidebarEnable(const wchar_t* key) {
     Row* row = FindRowByKey(key);
@@ -13988,7 +14309,7 @@ static void ToggleSidebarEnable(const wchar_t* key) {
     } else {
         SetRowlessKey(key, !RowlessOn(key));
     }
-    WriteConfigFromUI();
+    OnControlChanged();
     InvalidateRect(g_sidebar, nullptr, TRUE);
 }
 
@@ -14014,9 +14335,18 @@ static void CtrlMarkDirty() {
 
 static void WriteConfigFromUI() {
     std::unordered_map<std::wstring, std::wstring> kv;
-    CollectAllValues(kv, &g_initialSnapshot);
+    // [v2.10.11] Fill unknown keys from the CURRENT file, not the open-time
+    // snapshot: the tray menu may have toggled keys since the window opened
+    // and a full-file write from stale values would silently roll them back.
+    std::unordered_map<std::wstring, std::wstring> fileNow;
+    ReadConfigFile(GetCfgPath(), fileNow);
+    CollectAllValues(kv, fileNow.empty() ? &g_initialSnapshot : &fileNow);
     if (WriteConfigMap(kv)) {
         Wh_Log(L"[CTRL] config written (%zu keys)", kv.size());
+        // Apply/Save move the sync baseline to what we wrote. Preview-time
+        // writes do NOT (they pass false below) so Cancel still reverts to
+        // the pre-staged state.
+        if (g_updateSyncBaseline) g_lastSynced = kv;
     } else {
         Wh_Log(L"[CTRL] config WRITE FAILED");
     }
@@ -14027,6 +14357,51 @@ static void ApplyClearedDirty() {
     EnableWindow(g_btnApply, FALSE);
     EnableWindow(g_btnSave, FALSE);
     SetWindowTextW(g_btnCancel, L"Close");
+}
+
+// [v2.10.11 HARMONY] Pull externally-changed keys (tray menu, another window
+// instance) into the UI on focus gain. External wins over staged for exactly
+// the keys that changed in the file since our last sync point; untouched
+// staged edits survive untouched. Cost: one file read per activation.
+static void SyncFromExternalChanges() {
+    if (g_loading) return;
+    std::unordered_map<std::wstring, std::wstring> file;
+    if (!ReadConfigFile(GetCfgPath(), file) || file.empty()) return;
+    bool any = false;
+    auto externallyChanged = [&](const wchar_t* key,
+                                 const std::wstring& fileVal) {
+        auto prev = g_lastSynced.find(key);
+        if (prev == g_lastSynced.end()) return false;  // never synced: leave UI alone
+        return prev->second != fileVal;
+    };
+    for (auto& row : g_rows) {
+        auto it = file.find(row.spec->key);
+        if (it == file.end()) continue;
+        if (!externallyChanged(row.spec->key, it->second)) continue;
+        if (GetCtlValueText(row) != it->second) {
+            SetCtlFromValue(row, it->second);
+            any = true;
+        }
+        if (wcscmp(row.spec->key, L"Tint.tintColorHex") == 0)
+            g_customHex = it->second;  // keep the picker's staged hex in step
+    }
+    auto syncRowless = [&](const wchar_t* key) {
+        auto it = file.find(key);
+        if (it == file.end()) return;
+        if (!externallyChanged(key, it->second)) return;
+        SetRowlessKey(key, it->second == L"1" || _wtoi(it->second.c_str()) != 0);
+        any = true;
+    };
+    for (const SidebarToggle& t : kSidebarToggles)
+        if (!FindRowByKey(t.key)) syncRowless(t.key);
+    for (const GroupSpec& g : kGroups)
+        if (!FindRowByKey(g.titleKey)) syncRowless(g.titleKey);
+    g_lastSynced = file;
+    if (any) {
+        ApplyGroupEnableStates();
+        InvalidateRect(g_sidebar, nullptr, TRUE);
+        Wh_Log(L"[CTRL] external changes synced into window");
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -14478,11 +14853,12 @@ static void LoadValuesIntoControls() {
     if (!ReadConfigFile(path, kv) || kv.empty()) {
         // Engine hasn't imported yet: fall back to defaults matching the
         // Windhawk block defaults (the engine will self-import on its side).
-        for (const auto& e : kCtrlCfgKeys) kv[e.key] = e.isString ? L"" : L"0";
+        for (const auto& e : kCfgKeys) kv[e.key] = e.isString ? L"" : L"0";
         kv[L"Toggle.overlayEnabled"] = L"1";      // engine default is TRUE
         kv[L"General.customArrowEnabled"] = L"1";  // engine default is TRUE
     }
     g_initialSnapshot = kv;
+    g_lastSynced = kv;  // window-open state = first sync baseline
     for (auto& row : g_rows) {
         auto it = kv.find(row.spec->key);
         if (it != kv.end()) SetCtlFromValue(row, it->second);
@@ -15008,9 +15384,11 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             }
             if (id == ID_BTN_CANCEL) {
                 if (g_dirty) {
-                    // Revert: restore the file the window opened with; the
-                    // engine's watcher un-applies the preview writes.
-                    WriteConfigMap(g_initialSnapshot);
+                    // Revert: restore the last SYNCED file state, not the
+                    // open-time snapshot — menu toggles made after the
+                    // window opened must survive a cancel.
+                    WriteConfigMap(g_lastSynced.empty() ? g_initialSnapshot
+                                                        : g_lastSynced);
                 }
                 PostMessageW(hwnd, WM_CLOSE, 0, 0);
                 return 0;
@@ -15150,7 +15528,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                 // format: write via temp map, then copy to profile path.
                 std::wstring body;
                 WORD bom = 0xFEFF;
-                for (const auto& e : kCtrlCfgKeys) {
+                for (const auto& e : kCfgKeys) {
                     auto it = kv.find(e.key);
                     if (it == kv.end()) continue;
                     body += e.key;
@@ -15197,6 +15575,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                     if (kv.find(e.first) == kv.end()) kv[e.first] = e.second;
                 WriteConfigMap(kv);
                 g_initialSnapshot = kv;  // cancel baseline = what we applied
+                g_lastSynced = kv;
                 LoadValuesIntoControls();
                 ApplyClearedDirty();
                 return 0;
@@ -15223,10 +15602,23 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             }
             return 0;
         }
+        case WMAPP_SYNC_EXTERNAL:
+            SyncFromExternalChanges();
+            return 0;
         case WM_TIMER:
+        case WM_ACTIVATE:
+            // [v2.10.11] Focus gain = pull tray-menu / external changes in.
+            if (msg == WM_ACTIVATE) {
+                if (LOWORD(wParam) != WA_INACTIVE) SyncFromExternalChanges();
+                return 0;
+            }
             if (wParam == TIMER_PREVIEW) {
                 KillTimer(hwnd, TIMER_PREVIEW);
+                // Preview writes are not user "applies": they must not move
+                // the Cancel baseline, or Cancel would stop reverting.
+                g_updateSyncBaseline = false;
                 WriteConfigFromUI();
+                g_updateSyncBaseline = true;
             }
             return 0;
         case WM_CLOSE: {
@@ -15244,6 +15636,8 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam,
 
 // The native Win32 settings window (the PySide6 experiment is rolled back;
 // the next era rebuilds this UI in WebView2 — see WEBVIEW2_PLAN.md).
+static HICON LoadEffectiveTrayIcon(int size);  // defined in the tray section
+
 static void OpenSettingsWindow() {
     if (g_settingsWnd) {
         ShowWindow(g_settingsWnd, SW_RESTORE);
@@ -15278,6 +15672,25 @@ static void OpenSettingsWindow() {
                                     nullptr, nullptr, wc.hInstance, nullptr);
     if (!g_settingsWnd) return;
 
+    // [v2.10.8] Per-window icons via WM_SETICON, not the class: the class
+    // hIcon is registered once per process (later registrations fail
+    // silently), so a custom icon chosen after the first open never reached
+    // the taskbar - and the class previously got the 16px tray icon, which
+    // is why the taskbar showed a blurry upscale. Big = 48px for the taskbar
+    // (multi-size .ico frames are picked by the loader's size request),
+    // small = the tray icon for the title bar. Handles kept alive for the
+    // window's lifetime; replaced (old destroyed) on next open.
+    static HICON s_wndIconBig = nullptr;
+    HICON big = LoadEffectiveTrayIcon(48);
+    if (big) {
+        SendMessageW(g_settingsWnd, WM_SETICON, ICON_BIG, (LPARAM)big);
+        if (s_wndIconBig) DestroyIcon(s_wndIconBig);
+        s_wndIconBig = big;
+    }
+    if (g_trayIcon)
+        SendMessageW(g_settingsWnd, WM_SETICON, ICON_SMALL,
+                     (LPARAM)g_trayIcon);
+
     ShowWindow(g_settingsWnd, SW_SHOW);
     SetForegroundWindow(g_settingsWnd);
 }
@@ -15285,15 +15698,61 @@ static void OpenSettingsWindow() {
 ////////////////////////////////////////////////////////////////////////////////
 // Tray icon
 
+// [v2.10.6 TRAY QUICK-TOGGLES] Read-modify-write one key in settings.cfg;
+// the engine's ConfigWatcher reloads on the write, so the effect is live.
+// Missing key = built-in default (shadows/spotlight ON, bat OFF).
+static bool GetCfgKeyOn(const std::unordered_map<std::wstring, std::wstring>& kv,
+                        const wchar_t* key, bool def) {
+    auto it = kv.find(key);
+    if (it == kv.end()) return def;
+    return it->second == L"1" || _wtoi(it->second.c_str()) != 0;
+}
+
+static void ToggleCfgKey(const wchar_t* key, bool def) {
+    std::unordered_map<std::wstring, std::wstring> kv;
+    if (!ReadConfigFile(GetCfgPath(), kv)) kv.clear();
+    bool on = GetCfgKeyOn(kv, key, def);
+    kv[key] = on ? L"0" : L"1";
+    if (WriteConfigMap(kv)) {
+        CtlLog(L"[TRAY] toggle %s -> %s", key, on ? L"0" : L"1");
+        // [v2.10.12] Instant harmony: if the settings window is open, push
+        // the change into its checks now (posted — the tray thread must not
+        // touch the window's controls directly).
+        if (g_settingsWnd)
+            PostMessageW(g_settingsWnd, WMAPP_SYNC_EXTERNAL, 0, 0);
+    } else {
+        CtlLog(L"[TRAY] toggle %s WRITE FAILED", key);
+    }
+}
+
 static void ShowTrayContextMenu(HWND hwnd) {
     POINT pt;
     GetCursorPos(&pt);
+
+    // Read state fresh on every open: the engine (or a settings-window edit)
+    // may have changed keys since the last menu.
+    std::unordered_map<std::wstring, std::wstring> kv;
+    if (!ReadConfigFile(GetCfgPath(), kv)) kv.clear();
+    bool overlayOn = GetCfgKeyOn(kv, L"Toggle.overlayEnabled", true);
+    bool spotlightOn = GetCfgKeyOn(kv, L"Spotlight.enableSpotlight", true);
+    bool shadowsOn = GetCfgKeyOn(kv, L"Shadows.enableShadows", true);
+    bool glowOn = GetCfgKeyOn(kv, L"Selection.enableSelectionGlow", true);
 
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
     AppendMenuW(menu, MF_STRING, 1, L"Open Settings");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, 2, L"About");
+    AppendMenuW(menu, MF_STRING | (overlayOn ? MF_CHECKED : 0), 10,
+                L"Overlay");
+    AppendMenuW(menu, MF_STRING | (spotlightOn ? MF_CHECKED : 0), 11,
+                L"Spotlight");
+    AppendMenuW(menu, MF_STRING | (shadowsOn ? MF_CHECKED : 0), 12,
+                L"Icon Shadows");
+    AppendMenuW(menu, MF_STRING | (glowOn ? MF_CHECKED : 0), 13,
+                L"Selection Glow");
+    // About and the Bat Signal deliberately live elsewhere: the bat stays an
+    // easter egg (a menu entry defeats that), About becomes a settings-window
+    // tab before the official-main push.
     SetForegroundWindow(hwnd);
     int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0,
                              hwnd, nullptr);
@@ -15306,13 +15765,17 @@ static void ShowTrayContextMenu(HWND hwnd) {
         case 1:
             OpenSettingsWindow();
             break;
-        case 2:
-            MessageBoxW(hwnd,
-                        L"Ab Tenebris Control Panel\n"
-                        L"Companion of the transparent-desktop-icons-spotlight "
-                        L"engine mod.\n\n"
-                        L"Out of the darkness.",
-                        L"Ab Tenebris", MB_OK);
+        case 10:
+            ToggleCfgKey(L"Toggle.overlayEnabled", true);
+            break;
+        case 11:
+            ToggleCfgKey(L"Spotlight.enableSpotlight", true);
+            break;
+        case 12:
+            ToggleCfgKey(L"Shadows.enableShadows", true);
+            break;
+        case 13:
+            ToggleCfgKey(L"Selection.enableSelectionGlow", true);
             break;
     }
 }
@@ -15343,6 +15806,63 @@ static HICON LoadTrayIcon(int size) {
     return nullptr;
 }
 
+// [v2.10.6 CUSTOM TRAY ICON] "path" or "path,index" (DLL/EXE icon resource).
+// An .ico/.cur file loads via LoadImage; a DLL/EXE with an index (or bare,
+// index 0) extracts via SHDefExtractIconW. Surrounding quotes are stripped
+// (paths with spaces paste badly from some editors). Null = fall back to
+// the default moon.
+static HICON LoadCustomTrayIcon(PCWSTR spec, int size) {
+    if (!spec || !*spec) return nullptr;
+    std::wstring s = spec;
+    // Strip surrounding quotes.
+    if (s.size() >= 2 && s.front() == L'"' && s.back() == L'"')
+        s = s.substr(1, s.size() - 2);
+    // Optional trailing ",index".
+    int index = -1;
+    size_t comma = s.rfind(L',');
+    if (comma != std::wstring::npos) {
+        wchar_t* end = nullptr;
+        long v = wcstol(s.c_str() + comma + 1, &end, 10);
+        if (end && *end == L'\0' && end != s.c_str() + comma + 1 && v >= 0 &&
+            v < 100000) {
+            index = (int)v;
+            s.resize(comma);
+        }
+    }
+    if (s.empty()) return nullptr;
+    // Environment variables (%USERPROFILE% etc.) expand for convenience.
+    wchar_t exp[MAX_PATH];
+    DWORD expLen =
+        ExpandEnvironmentStringsW(s.c_str(), exp, MAX_PATH);
+    if (expLen > 0 && expLen <= MAX_PATH) s = exp;
+    HICON h = nullptr;
+    if (index >= 0) {
+        if (SUCCEEDED(SHDefExtractIconW(s.c_str(), index, 0, nullptr, &h,
+                                        (UINT)MAKEWORD(size, 0))))
+            return h;
+        return nullptr;
+    }
+    // No index: .ico/.cur via LoadImage, anything else extract index 0
+    // (covers bare DLL/EXE paths); LoadImage first so a renamed file with
+    // an exe-ish extension still works.
+    h = (HICON)LoadImageW(nullptr, s.c_str(), IMAGE_ICON, size, size,
+                          LR_LOADFROMFILE);
+    if (h) return h;
+    if (SUCCEEDED(SHDefExtractIconW(s.c_str(), 0, 0, nullptr, &h,
+                                    (UINT)MAKEWORD(size, 0))))
+        return h;
+    return nullptr;
+}
+
+// Effective tray icon = custom (if the setting parses) or the moon.
+static HICON LoadEffectiveTrayIcon(int size) {
+    PCWSTR spec = Wh_GetStringSetting(L"General.trayIconPath");
+    HICON h = LoadCustomTrayIcon(spec, size);
+    Wh_FreeStringSetting(spec);
+    if (h) return h;
+    return LoadTrayIcon(size);
+}
+
 static const UINT_PTR kTrayRetryTimer = 7;
 
 static bool AddTrayIcon(HWND hwnd, const wchar_t* reason) {
@@ -15354,12 +15874,16 @@ static bool AddTrayIcon(HWND hwnd, const wchar_t* reason) {
     g_nid.uCallbackMessage = WMAPP_TRAYICON;
     // Load ONCE: re-adds (TaskbarCreated) reuse the handle — the settings
     // window class holds it too, so it must never be replaced or freed.
+    // Custom icon (General.trayIconPath) wins when it loads; the moon is
+    // the fallback. Swaps via RefreshTrayIcon leak the old handle by one
+    // HICON per settings change — bounded, and safer than freeing a handle
+    // a registered window class may still reference.
     if (!g_trayIcon) {
-        g_trayIcon = LoadTrayIcon(GetSystemMetrics(SM_CXSMICON));
+        g_trayIcon = LoadEffectiveTrayIcon(GetSystemMetrics(SM_CXSMICON));
     }
     if (!g_trayIcon) {
         // Larger size for the settings-window title bar too.
-        g_trayIcon = LoadTrayIcon(48);
+        g_trayIcon = LoadEffectiveTrayIcon(48);
     }
     g_nid.hIcon = g_trayIcon ? g_trayIcon
                              : (HICON)LoadImage(nullptr, IDI_APPLICATION,
@@ -15369,6 +15893,8 @@ static bool AddTrayIcon(HWND hwnd, const wchar_t* reason) {
     // Log every attempt: the boot-race failure (2026-11-09) was silent.
     CtlLog(L"[TRAY] add (%s) ok=%d pid=%lu", reason, (int)g_trayAdded.load(),
            GetCurrentProcessId());
+    DebugLog(L"[TRAY] add (%s) ok=%d pid=%lu", reason, (int)g_trayAdded.load(),
+             GetCurrentProcessId());
     return g_trayAdded;
 }
 
@@ -15376,7 +15902,26 @@ static void RemoveTrayIcon() {
     if (g_trayAdded.exchange(false)) {
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
         CtlLog(L"[TRAY] remove pid=%lu", GetCurrentProcessId());
+        DebugLog(L"[TRAY] remove pid=%lu", GetCurrentProcessId());
     }
+}
+
+// [v2.10.6] Live custom-icon swap: called from Wh_ModSettingsChanged on the
+// tool host's message-loop thread. New icon loaded first; only a successful
+// load touches the tray (a bad path keeps the current icon — no blank slot).
+static void RefreshTrayIcon() {
+    if (!g_trayAdded.load()) return;
+    HICON fresh = LoadEffectiveTrayIcon(GetSystemMetrics(SM_CXSMICON));
+    if (!fresh) return;
+    if (fresh == g_trayIcon) {
+        DestroyIcon(fresh);
+        return;
+    }
+    g_trayIcon = fresh;  // old handle leaked by design (class-reference scar)
+    g_nid.hIcon = fresh;
+    BOOL ok = Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+    CtlLog(L"[TRAY] icon refresh ok=%d", (int)ok);
+    DebugLog(L"[TRAY] icon refresh ok=%d", (int)ok);
 }
 
 // In-process screenshot: BitBlt the settings window's real pixels (children
@@ -15481,6 +16026,11 @@ static LRESULT CALLBACK MsgWndProc(HWND hwnd, UINT msg, WPARAM wParam,
         TakeScreenshot();
         return 0;
     }
+    if (msg == WMAPP_OPENSETTINGS) {
+        // Engine-side hotkey routed here (see MessageWndProcInner WM_HOTKEY).
+        OpenSettingsWindow();
+        return 0;
+    }
     if (msg == WMAPP_TRAYICON) {
         if (LOWORD(lParam) == WM_CONTEXTMENU ||
             LOWORD(lParam) == WM_RBUTTONUP) {
@@ -15569,7 +16119,10 @@ static DWORD WINAPI UIThreadProc(void*) {
 ////////////////////////////////////////////////////////////////////////////////
 // Tool mod callbacks (run only in the dedicated tool process)
 
-static bool WhTool_ModInit() {
+// NON-static on purpose: the 2.x engine recognizes tool mods by exported
+// symbols (mangled _Z14WhTool_ModInitv or the windhawk_tool_mod.h marker).
+// Static linkage = invisible to the service = we self-host forever.
+bool WhTool_ModInit() {
     g_ctrlUnloading = false;
     HANDLE thread =
         CreateThread(nullptr, 0, UIThreadProc, nullptr, 0, &g_uiThreadId);
@@ -15584,6 +16137,18 @@ static bool WhTool_ModInit() {
 
 static void WhTool_ModUninit() {
     g_ctrlUnloading = true;
+    // [v2.10.9] Release the single-instance mutex BEFORE teardown, not after:
+    // this reload (2026-11-21) measured the old host holding the mutex ~4s
+    // past the uninit log (UI-thread wait loop + tray remove) while the
+    // service-spawned replacement gave up at its 2s fail-fast and exited -
+    // and failed launches are NOT retried by the service, so the tray died
+    // until the next settings change. A dying host needs no exclusivity
+    // while it cleans up; hand over immediately.
+    if (g_toolModProcessMutex) {
+        ReleaseMutex(g_toolModProcessMutex);
+        CloseHandle(g_toolModProcessMutex);
+        g_toolModProcessMutex = nullptr;
+    }
     if (g_uiThreadId) {
         PostThreadMessageW(g_uiThreadId, WM_QUIT, 0, 0);
         for (int i = 0; i < 40; ++i) {
@@ -15593,6 +16158,13 @@ static void WhTool_ModUninit() {
         RemoveTrayIcon();
     }
     Wh_Log(L"[CTRL] tool mod uninit");
+    // [v2.10.4] End the process ourselves - the official tool-mod contract's
+    // own rule ("the mod ends the process once the mod is uninitialized").
+    // Relying on WM_QUIT alone left zombies alive-after-uninit holding the
+    // single-instance mutex, which starved the service-spawned replacement
+    // host (it waits 2s for the mutex, exits, and per the engine docs a
+    // failed launch is NOT retried until the next settings change).
+    ExitProcess(0);
 }
 
 static void WhTool_ModSettingsChanged() {
@@ -15660,6 +16232,24 @@ static void SpawnToolModProcess() {
     Wh_Log(L"[CTRL] tool mod process spawned");
 }
 
+// [v2.10.4] Which world are we in? windhawk-mod.exe ships only with
+// Windhawk 2.x, where the SERVICE recognizes tool mods (legacy -tool-mod
+// flag matches) and hosts + respawns them itself in windhawk-mod.exe.
+// On 1.x the file doesn't exist and our own launcher spawn is the
+// documented approach (windhawk wiki "Mods as tools", 1.x snippet).
+// Presence of the file = let the service do the hosting; spawning our own
+// windhawk.exe -tool-mod host on 2.x produced the duplicate-host races.
+static bool IsWindhawk2Install() {
+    WCHAR exePath[MAX_PATH];
+    if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH)) return false;
+    std::wstring dir = exePath;
+    size_t slash = dir.find_last_of(L'\\');
+    if (slash == std::wstring::npos) return false;
+    dir.resize(slash);
+    std::wstring host = dir + L"\\windhawk-mod.exe";
+    return GetFileAttributesW(host.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
 static DWORD WINAPI ToolHostWatchdog(void*) {
     // Long-lived lifeguard: 5s poll cadence, respawn after the mutex has
     // been missing for 3 consecutive polls (~15s — longer than any healthy
@@ -15669,6 +16259,7 @@ static DWORD WINAPI ToolHostWatchdog(void*) {
     for (;;) {
         DWORD w = WaitForSingleObject(g_watchdogStop, 5000);
         if (w == WAIT_OBJECT_0) break;
+        if (IsWindhawk2Install()) continue;  // service owns the lifecycle here
         HANDLE mutex = OpenMutexW(SYNCHRONIZE, FALSE,
                                   L"windhawk-tool-mod_" WH_MOD_ID);
         if (mutex) {
@@ -15679,6 +16270,7 @@ static DWORD WINAPI ToolHostWatchdog(void*) {
         absent++;
         if (absent >= 3) {
             CtlLog(L"[CTRL] watchdog: tool host missing ~15s, respawning");
+            DebugLog(L"[CTRL] watchdog: tool host missing ~15s, respawning");
             Wh_Log(L"[CTRL] watchdog respawning tool host");
             absent = 0;
             SpawnToolModProcess();
@@ -15739,6 +16331,8 @@ BOOL Wh_ModInit() {
     }
 
     if (isCurrentToolModProcess) {
+        CtlLog(L"[BRANCH] tool host, pid=%lu", GetCurrentProcessId());
+        DebugLog(L"[BRANCH] tool host, pid=%lu", GetCurrentProcessId());
         // Tool host: tray + settings window. Same single-instance mutex wait
         // as the standalone control mod (old instance hand-over).
         g_isCtrlToolProcess = true;
@@ -15775,9 +16369,16 @@ BOOL Wh_ModInit() {
                 ExitProcess(1);
             }
         }
+        {
+            std::wstring dir = GetCfgDir();
+            if (!dir.empty())
+                RotateLogAtBoot((dir + L"\\control_log.txt").c_str(), 5ull * 1024 * 1024);
+        }
         CtlLog(L"[CTRL] tool host init, pid=%lu", GetCurrentProcessId());
+        DebugLog(L"[CTRL] tool host init, pid=%lu", GetCurrentProcessId());
         if (!WhTool_ModInit()) {
             CtlLog(L"[CTRL] WhTool_ModInit FAILED, exiting");
+            DebugLog(L"[CTRL] WhTool_ModInit FAILED, exiting");
             ExitProcess(1);
         }
         // Hook the host's entry point so windhawk.exe never actually runs in
@@ -15800,20 +16401,30 @@ BOOL Wh_ModInit() {
         // Plain windhawk.exe (the normal UI app): we only act as the launcher
         // that spawns and watchdogs our dedicated tool host process.
         g_isToolModProcessLauncher = true;
+        CtlLog(L"[BRANCH] windhawk.exe launcher, pid=%lu", GetCurrentProcessId());
+        DebugLog(L"[BRANCH] windhawk.exe launcher, pid=%lu", GetCurrentProcessId());
         return TRUE;
     }
 
     // Everything else that matched @include = explorer.exe family: the engine.
+    CtlLog(L"[BRANCH] explorer engine, pid=%lu", GetCurrentProcessId());
+    DebugLog(L"[BRANCH] explorer engine, pid=%lu", GetCurrentProcessId());
     return Engine_ModInit();
 }
 
 void Wh_ModAfterInit() {
     if (g_isToolModProcessLauncher) {
         g_watchdogStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        // Windhawk 2.x spawns the tool host itself; the host only creates
-        // its mutex once the mod is INJECTED, which lags the spawn. Grace
-        // poll ~3s before deciding nobody else is bringing one up, so we
-        // don't race the service into a duplicate host.
+        if (IsWindhawk2Install()) {
+            CtlLog(L"[CTRL] 2.x install: service hosts us in windhawk-mod.exe, "
+                   L"launcher spawn skipped");
+            DebugLog(L"[CTRL] 2.x install: service hosts us in windhawk-mod.exe, "
+                     L"launcher spawn skipped");
+        } else {
+        // Windhawk 1.x: the service does NOT host tool mods; the wiki
+        // snippet (spawn + mutex) is the documented approach. The host only
+        // creates its mutex once the mod is INJECTED, which lags the spawn,
+        // so grace-poll ~3s before deciding nobody else is bringing one up.
         bool hostComing = false;
         for (int i = 0; i < 6 && !hostComing; i++) {
             HANDLE m = OpenMutexW(SYNCHRONIZE, FALSE,
@@ -15827,18 +16438,22 @@ void Wh_ModAfterInit() {
         }
         if (hostComing) {
             CtlLog(L"[CTRL] launcher: tool host already coming up, spawn skipped");
+            DebugLog(L"[CTRL] launcher: tool host already coming up, spawn skipped");
         } else {
             CtlLog(L"[CTRL] launcher: no tool host after grace, spawning");
+            DebugLog(L"[CTRL] launcher: no tool host after grace, spawning");
             SpawnToolModProcess();
         }
         CloseHandle(
             CreateThread(nullptr, 0, ToolHostWatchdog, nullptr, 0, nullptr));
+        } // end 1.x spawn branch
     }
     // Engine and tool host need no AfterInit work.
 }
 
 void Wh_ModSettingsChanged() {
     if (g_isCtrlToolProcess) {
+        RefreshTrayIcon();
         WhTool_ModSettingsChanged();
         return;
     }
