@@ -2,7 +2,7 @@
 // @id              transparent-desktop-icons-spotlight
 // @name            "Ab Tenebris" - Transparent Desktop Icons with Spotlight and Dynamic Shadows
 // @description     Make desktop icons transparent when idle with an interactive spotlight effect, plus the Ab Tenebris control panel: tray icon and native settings window. Hover over the desktop or select icons to reveal them.
-// @version         2.10.12
+// @version         2.10.13
 // @author          drgutman
 // @github          https://github.com/drgutman
 // @homepage        https://instagram.com/drgutman
@@ -118,6 +118,7 @@ And don't come back to me crying if you set it on fire.
 #include <exception>
 #include <commctrl.h>
 #include <initguid.h>
+#include <tlhelp32.h>
 #include <d2d1_1.h>
 #include <d2d1effects.h>
 #include <d2d1helper.h>
@@ -11176,6 +11177,7 @@ static const UINT WMAPP_OPENSETTINGS = WM_APP + 13;
 static const UINT WMAPP_APPLYHOTKEY = WM_APP + 14;
 
 static void DebugLog(const wchar_t* fmt, ...);
+static bool IsWindhawk2Install();
 
 // --- settings-window hotkey (v2.10.4) ----------------------------------------
 // Engine-side registration (the desktop-owner's message window): the hotkey
@@ -11289,8 +11291,19 @@ LRESULT CALLBACK MessageWndProcInner(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM
             PostMessageW(ctrl, WMAPP_OPENSETTINGS, 0, 0);
             DebugLog(L"[HOTKEY] fired -> posted WMAPP_OPENSETTINGS to ctrl=%p", (void*)ctrl);
         } else {
-            DebugLog(L"[HOTKEY] fired but tool host msg window NOT FOUND");
-            DiagLog(L"[HOTKEY] fired but tool host msg window NOT FOUND");
+            // Self-diagnosing miss: which world are we in, and does the tool
+            // host hold its mutex? install=1.x + mutex=absent means the host
+            // never came up at all (the engine fallback spawn story);
+            // mutex=present means a host exists but its window is not findable.
+            HANDLE m = OpenMutexW(SYNCHRONIZE, FALSE,
+                                  L"windhawk-tool-mod_" WH_MOD_ID);
+            if (m) CloseHandle(m);
+            DebugLog(L"[HOTKEY] tool host msg window NOT FOUND (install=%s, hostMutex=%s)",
+                     IsWindhawk2Install() ? L"2.x" : L"1.x",
+                     m ? L"present" : L"absent");
+            DiagLog(L"[HOTKEY] tool host msg window NOT FOUND (install=%s, hostMutex=%s)",
+                    IsWindhawk2Install() ? L"2.x" : L"1.x",
+                    m ? L"present" : L"absent");
         }
         return 0;
     }
@@ -16179,6 +16192,8 @@ static void WINAPI EntryPoint_Hook() {
     ExitThread(0);
 }
 
+static void SpawnToolModProcessFrom(const WCHAR* exePath);
+
 static void SpawnToolModProcess() {
     WCHAR currentProcessPath[MAX_PATH];
     switch (GetModuleFileName(nullptr, currentProcessPath,
@@ -16188,11 +16203,61 @@ static void SpawnToolModProcess() {
             Wh_Log(L"GetModuleFileName failed");
             return;
     }
+    SpawnToolModProcessFrom(currentProcessPath);
+}
 
+// Resolve windhawk.exe for engine-side spawning: the running UI process's
+// image path is authoritative (covers non-standard install locations); the
+// registry uninstall key covers windhawk.exe not running at all.
+static bool GetWindhawkExePath(WCHAR* buf, DWORD cch) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W pe{};
+        pe.dwSize = sizeof(pe);
+        if (Process32FirstW(snap, &pe)) {
+            do {
+                if (_wcsicmp(pe.szExeFile, L"windhawk.exe") == 0) {
+                    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
+                                           FALSE, pe.th32ProcessID);
+                    if (h) {
+                        DWORD len = cch;
+                        bool ok = QueryFullProcessImageNameW(h, 0, buf, &len) &&
+                                  len > 0;
+                        CloseHandle(h);
+                        if (ok) {
+                            CloseHandle(snap);
+                            return true;
+                        }
+                    }
+                }
+            } while (Process32NextW(snap, &pe));
+        }
+        CloseHandle(snap);
+    }
+    // Fallback: install dir from the uninstall key.
+    WCHAR loc[MAX_PATH];
+    DWORD size = sizeof(loc);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE,
+                     L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\"
+                     L"Windhawk",
+                     L"InstallLocation", RRF_RT_REG_SZ, nullptr, loc,
+                     &size) == ERROR_SUCCESS &&
+        *loc) {
+        WCHAR exePath[MAX_PATH];
+        if (swprintf_s(exePath, L"%s\\windhawk.exe", loc) > 0 &&
+            GetFileAttributesW(exePath) != INVALID_FILE_ATTRIBUTES) {
+            wcscpy_s(buf, cch, exePath);
+            return true;
+        }
+    }
+    return false;
+}
+
+static void SpawnToolModProcessFrom(const WCHAR* exePath) {
     WCHAR commandLine[MAX_PATH + 2 +
                       (sizeof(L" -tool-mod \"" WH_MOD_ID "\"") / sizeof(WCHAR)) -
                       1];
-    swprintf_s(commandLine, L"\"%s\" -tool-mod \"%s\"", currentProcessPath,
+    swprintf_s(commandLine, L"\"%s\" -tool-mod \"%s\"", exePath,
                WH_MOD_ID);
     HMODULE kernelModule = GetModuleHandle(L"kernelbase.dll");
     if (!kernelModule) {
@@ -16220,16 +16285,22 @@ static void SpawnToolModProcess() {
         .dwFlags = STARTF_FORCEOFFFEEDBACK,
     };
     PROCESS_INFORMATION pi;
-    if (!pCreateProcessInternalW(nullptr, currentProcessPath, commandLine,
+    if (!pCreateProcessInternalW(nullptr, exePath, commandLine,
                                  nullptr, nullptr, FALSE, NORMAL_PRIORITY_CLASS,
                                  nullptr, nullptr, &si, &pi, nullptr)) {
         Wh_Log(L"CreateProcess failed (%lu)", GetLastError());
+        CtlLog(L"[CTRL] tool host spawn FAILED err=%lu exe='%s'",
+               GetLastError(), exePath);
+        DiagLog(L"[CTRL] tool host spawn FAILED err=%lu exe='%s'",
+                GetLastError(), exePath);
         return;
     }
 
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     Wh_Log(L"[CTRL] tool mod process spawned");
+    CtlLog(L"[CTRL] tool host spawned from '%s'", exePath);
+    DiagLog(L"[CTRL] tool host spawned from '%s'", exePath);
 }
 
 // [v2.10.4] Which world are we in? windhawk-mod.exe ships only with
@@ -16247,7 +16318,50 @@ static bool IsWindhawk2Install() {
     if (slash == std::wstring::npos) return false;
     dir.resize(slash);
     std::wstring host = dir + L"\\windhawk-mod.exe";
-    return GetFileAttributesW(host.c_str()) != INVALID_FILE_ATTRIBUTES;
+    if (GetFileAttributesW(host.c_str()) != INVALID_FILE_ATTRIBUTES) return true;
+    // Non-windhawk processes (engine in explorer.exe) would otherwise answer
+    // for THEIR OWN directory — probe the real install dir before concluding
+    // 1.x. (v2.10.13: the engine fallback branch misread our 2.x machine as
+    // 1.x through exactly this hole.)
+    // 1st probe: the running windhawk.exe's own dir (authoritative, covers
+    // non-standard install locations).
+    WCHAR whPath[MAX_PATH];
+    if (GetWindhawkExePath(whPath, ARRAYSIZE(whPath))) {
+        std::wstring wdir = whPath;
+        size_t wslash = wdir.find_last_of(L'\\');
+        if (wslash != std::wstring::npos) {
+            wdir.resize(wslash);
+            std::wstring whost = wdir + L"\\windhawk-mod.exe";
+            if (GetFileAttributesW(whost.c_str()) != INVALID_FILE_ATTRIBUTES)
+                return true;
+        }
+    }
+    // 2nd probe: uninstall key, native view then 32-bit view (the installer
+    // is 32-bit, so a 64-bit process sees the key only via WOW64_32KEY).
+    LPCWSTR kUninst =
+        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Windhawk";
+    WCHAR loc[MAX_PATH];
+    DWORD size = sizeof(loc);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, kUninst, L"InstallLocation",
+                     RRF_RT_REG_SZ, nullptr, loc,
+                     &size) == ERROR_SUCCESS &&
+        *loc) {
+        std::wstring regHost = std::wstring(loc) + L"\\windhawk-mod.exe";
+        return GetFileAttributesW(regHost.c_str()) != INVALID_FILE_ATTRIBUTES;
+    }
+    HKEY hk;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kUninst, 0,
+                      KEY_READ | KEY_WOW64_32KEY, &hk) == ERROR_SUCCESS) {
+        size = sizeof(loc);
+        LSTATUS st = RegQueryValueExW(hk, L"InstallLocation", nullptr, nullptr,
+                                      (LPBYTE)loc, &size);
+        RegCloseKey(hk);
+        if (st == ERROR_SUCCESS && *loc) {
+            std::wstring regHost = std::wstring(loc) + L"\\windhawk-mod.exe";
+            return GetFileAttributesW(regHost.c_str()) != INVALID_FILE_ATTRIBUTES;
+        }
+    }
+    return false;
 }
 
 static DWORD WINAPI ToolHostWatchdog(void*) {
@@ -16447,8 +16561,51 @@ void Wh_ModAfterInit() {
         CloseHandle(
             CreateThread(nullptr, 0, ToolHostWatchdog, nullptr, 0, nullptr));
         } // end 1.x spawn branch
+    } else if (!g_isCtrlToolProcess) {
+        // Engine branch (explorer.exe family): on 1.x installs the tool host
+        // exists ONLY if windhawk.exe injected us and the launcher branch ran.
+        // One user machine (Windhawk 1.7.3) showed NO windhawk.exe injection
+        // at all — no launcher, no host, hotkey dead. The engine boots on every
+        // machine, so it now carries the same 1.x fallback spawn + watchdog.
+        // On 2.x the service hosts tool mods in windhawk-mod.exe; spawning
+        // here would duplicate hosts, so the watchdog's 2.x skip stays.
+        bool is2x = IsWindhawk2Install();
+        CtlLog(L"[CTRL] engine: install=%s",
+               is2x ? L"2.x (service hosts tool mods)" : L"1.x (engine fallback armed)");
+        DiagLog(L"[CTRL] engine: install=%s",
+                is2x ? L"2.x (service hosts tool mods)" : L"1.x (engine fallback armed)");
+        if (!is2x) {
+            g_watchdogStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            bool hostComing = false;
+            for (int i = 0; i < 6 && !hostComing; i++) {
+                HANDLE m = OpenMutexW(SYNCHRONIZE, FALSE,
+                                      L"windhawk-tool-mod_" WH_MOD_ID);
+                if (m) {
+                    CloseHandle(m);
+                    hostComing = true;
+                    break;
+                }
+                Sleep(500);
+            }
+            if (hostComing) {
+                CtlLog(L"[CTRL] engine: tool host already coming up, spawn skipped");
+                DiagLog(L"[CTRL] engine: tool host already coming up, spawn skipped");
+            } else {
+                WCHAR whPath[MAX_PATH];
+                if (GetWindhawkExePath(whPath, ARRAYSIZE(whPath))) {
+                    CtlLog(L"[CTRL] engine: no tool host after grace, spawning");
+                    DiagLog(L"[CTRL] engine: no tool host after grace, spawning");
+                    SpawnToolModProcessFrom(whPath);
+                } else {
+                    CtlLog(L"[CTRL] engine: windhawk.exe path NOT FOUND, spawn impossible");
+                    DiagLog(L"[CTRL] engine: windhawk.exe path NOT FOUND, spawn impossible");
+                }
+            }
+            CloseHandle(CreateThread(nullptr, 0, ToolHostWatchdog, nullptr, 0,
+                                     nullptr));
+        }
     }
-    // Engine and tool host need no AfterInit work.
+    // Tool host branch needs no AfterInit work.
 }
 
 void Wh_ModSettingsChanged() {
