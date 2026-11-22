@@ -2,14 +2,13 @@
 // @id              transparent-desktop-icons-spotlight
 // @name            "Ab Tenebris" - Transparent Desktop Icons with Spotlight and Dynamic Shadows
 // @description     Make desktop icons transparent when idle with an interactive spotlight effect, plus the Ab Tenebris control panel: tray icon and native settings window. Hover over the desktop or select icons to reveal them.
-// @version         2.10.13
+// @version         2.10.36
 // @author          drgutman
 // @github          https://github.com/drgutman
 // @homepage        https://instagram.com/drgutman
 // @include         explorer.exe
-// @include         windhawk.exe
 // @architecture    x86-64
-// @compilerOptions -lcomctl32 -ldxgi -ld2d1 -ld3d11 -ldcomp -lgdi32 -lshcore -lwindowscodecs -lole32 -luuid -lshell32 -ladvapi32 -lcomdlg32 -luxtheme -ldwmapi
+// @compilerOptions -lcomctl32 -ldxgi -ld2d1 -ld3d11 -ldcomp -lgdi32 -lshcore -lwindowscodecs -lole32 -luuid -lshell32 -ladvapi32 -lcomdlg32 -luxtheme -ldwmapi -lpsapi
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -42,9 +41,28 @@ turned out to be which axis overflowed, not the zoom direction.
 All settings live in the **Ab Tenebris settings window** — open it from the
 tray icon this mod adds to the taskbar (left-click the icon, or right-click
 it and choose Settings), or press the hotkey from the Windhawk settings
-page (default Ctrl+Alt+B). The Windhawk page also has a **Diagnostics**
+page (default Ctrl+Alt+T). The Windhawk page also has a **Diagnostics**
 section: a debug-logging switch and log path for bug reports, off by
-default. Everything else is configured in the settings window.
+default (with the switch off the mod writes nothing to disk). Everything
+else is configured in the settings window.
+
+## SILHOUETTE COVERAGE CONTROLS (General tab)
+The overlay, cut-outs and shadows are built from baked silhouettes of the
+desktop icons. Two toggles and two sliders shape what goes into them:
+
+- **Disable Icon's Shortcut Arrow (Overlay + Shadow)** / **Disable Label's
+  Text (Overlay + Shadow)** — for setups (like Hide-Desktop-Icon-Text-style
+  mods) that remove the arrow or label from the real desktop: the silhouette
+  follows the real desktop instead of resurrecting what is hidden.
+- **Icon Silhouette Threshold** (0-255, default 16) — at extraction, every
+  icon pixel whose alpha is at or above this value becomes fully opaque in
+  the silhouette. Lower values cover more (faint antialiased edge pixels are
+  sealed too, so the silhouette grows slightly beyond the visible icon);
+  higher values hug only the near-solid pixels.
+- **Label Overlay Y Offset (px)** (-5..+5, default 0) — a fine nudge for the
+  baked label text position, in case a custom system font renders a pixel
+  away from where Windows puts it. The vertical model self-calibrates from
+  GDI metrics of the captured font, so most machines need 0.
 
 
 Ab tenebris - latin for "out of the darkness"
@@ -504,6 +522,19 @@ UINT WM_APP_FOCUSSTORM = 0;     // render thread -> UI thread: focus-toggle hack
 // deletes any .old past 25 MB, so the 34 MB fossil dies on first rotate.
 static bool LogFileTooBig(PCWSTR path, unsigned long long limitBytes);
 static void RotateLogAtBoot(PCWSTR path, unsigned long long rotateBytes);
+// [v2.10.36] ONE GATE for every custom file log (BootLog / DiagLog / CtlLog):
+// the Windhawk page's Diagnostics.debugLogging switch. OFF = the mod writes
+// NOTHING to disk (strangers get zero file I/O; bug reports flip the switch).
+// ON = the full diagnostic surface returns unchanged. Crash evidence
+// ([CRASH] via DiagLogAlways, std::terminate) BYPASSES the gate on purpose:
+// a crash never has the switch pre-flipped, and post-mortem lines are the
+// only forensics a dead process leaves.
+static std::atomic<bool> g_debugFileLogOn{false};
+static void RefreshDebugFileLogGate() {
+    g_debugFileLogOn.store(Wh_GetIntSetting(L"Diagnostics.debugLogging") != 0,
+                           std::memory_order_relaxed);
+}
+
 static void BootLog(const wchar_t* fmt, ...) {
     wchar_t buf[256];
     va_list args;
@@ -511,6 +542,7 @@ static void BootLog(const wchar_t* fmt, ...) {
     _vsnwprintf_s(buf, _TRUNCATE, fmt, args);
     va_end(args);
     Wh_Log(L"%s", buf);
+    if (!g_debugFileLogOn.load(std::memory_order_relaxed)) return;
 
     WCHAR storagePath[MAX_PATH];
     if (Wh_GetModStoragePath(storagePath, MAX_PATH) <= 0) return;
@@ -575,13 +607,77 @@ static void RotateLogAtBoot(PCWSTR path, unsigned long long rotateBytes) {
     MoveFileExW(path, old.c_str(), MOVEFILE_REPLACE_EXISTING);
 }
 
-static void DiagLog(const wchar_t* fmt, ...) {
+static void DiagLog(const wchar_t* fmt, ...);  // fwd: crash reporter
+static void DiagLogAlways(const wchar_t* fmt, ...);  // crash evidence, gate-exempt
+
+// [v2.10.27] The MOD DLL's own module handle. EVERY window class this
+// control UI registers must use this, never GetModuleHandle(nullptr):
+// classes under the host exe survive the mod DLL unmap with a wndproc
+// pointing into unmapped code - first message after a reload = CFG
+// fail-fast (intermittent explorer crash on mod load/reload, both
+// machines). Classes under the DLL hinstance are auto-discarded at unmap.
+static HMODULE GetModHInstance() {
+    static HMODULE h = nullptr;
+    if (!h)
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (PCWSTR)&GetModHInstance, &h);
+    return h;
+}
+
+// [v2.10.25] Vectored crash reporter: an exception whose RIP lands inside
+// THIS module logs [CRASH] code + offset via DiagLog BEFORE the process
+// dies — the VM first-load explorer crash gets a name without SEH
+// (Windhawk's clang mode rejects __try/__except in mod code). Registered
+// in Wh_ModInit, removed in Wh_ModUninit.
+// [v2.10.28] VEH POST-MORTEM: the 2.10.25 vectored handler (registered
+// FIRST in the chain) saw EVERY first-chance exception in explorer — its
+// hooks raise many — and did file I/O + Wh_Log inside exception dispatch:
+// deadlock during window build (the "tabs empty" verdict) and intermittent
+// re-entrant dispatch (the crash). SetUnhandledExceptionFilter instead:
+// fires ONLY when the exception is truly unhandled (fatal). Uninit
+// restores the previous filter (the stored handle IS the old filter).
+static void* g_crashReporterHandle = nullptr;
+
+#include <psapi.h>
+
+static LONG WINAPI AbtCrashReporter(PEXCEPTION_POINTERS ep) {
+    // [v2.10.30] DiagLog (file) instead of Wh_Log-only: in the VM the
+    // Windhawk in-memory log dies with the process — the [CRASH] line must
+    // land on disk. UEF fires exactly once on a truly fatal exception, so
+    // the file I/O here is safe (the 2.10.25 VEH ban was about first-chance
+    // floods, not the post-mortem filter).
+    HMODULE mod = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (PCWSTR)&AbtCrashReporter, &mod);
+    uintptr_t rip = (uintptr_t)ep->ExceptionRecord->ExceptionAddress;
+    if (mod) {
+        MODULEINFO mi;
+        if (GetModuleInformation(GetCurrentProcess(), mod, &mi,
+                                 sizeof(mi)) &&
+            rip >= (uintptr_t)mi.lpBaseOfDll &&
+            rip < (uintptr_t)mi.lpBaseOfDll + mi.SizeOfImage) {
+            DiagLogAlways(L"[CRASH] code=%08X rip=+%llX (mod dll)",
+                    (unsigned)ep->ExceptionRecord->ExceptionCode,
+                    (unsigned long long)(rip - (uintptr_t)mi.lpBaseOfDll));
+        } else {
+            DiagLogAlways(L"[CRASH] code=%08X rip=%p",
+                    (unsigned)ep->ExceptionRecord->ExceptionCode,
+                    (void*)rip);
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void DiagLogV(const wchar_t* fmt, va_list args, bool always) {
     wchar_t buf[512];
-    va_list args;
-    va_start(args, fmt);
-    _vsnwprintf_s(buf, _TRUNCATE, fmt, args);
-    va_end(args);
+    va_list a2;
+    va_copy(a2, args);
+    _vsnwprintf_s(buf, _TRUNCATE, fmt, a2);
+    va_end(a2);
     Wh_Log(L"%s", buf);
+    if (!always && !g_debugFileLogOn.load(std::memory_order_relaxed)) return;
 
     WCHAR storagePath[MAX_PATH];
     if (Wh_GetModStoragePath(storagePath, MAX_PATH) <= 0) return;
@@ -618,6 +714,21 @@ static void DiagLog(const wchar_t* fmt, ...) {
         WriteFile(hFile, line, (DWORD)(len * sizeof(wchar_t)), &written, nullptr);
     }
     CloseHandle(hFile);
+}
+
+static void DiagLog(const wchar_t* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    DiagLogV(fmt, args, false);
+    va_end(args);
+}
+
+// Crash-evidence variant: writes even with Diagnostics.debugLogging off.
+static void DiagLogAlways(const wchar_t* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    DiagLogV(fmt, args, true);
+    va_end(args);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -679,6 +790,13 @@ struct Settings {
     int customArrowScale;
     int customArrowOffsetX;
     int customArrowOffsetY;
+    // [v2.10.33] Silhouette-exclusion toggles (Eric99 genre: mods that hide
+    // the arrow/label on the real desktop — our overlay+shadow must not
+    // resurrect them from the baked silhouette).
+    bool disableIconArrow;
+    bool disableIconLabel;
+    int iconSilThreshold;   // extraction alpha seal (default 16)
+    int labelOffsetY;       // label glyph nudge, px (-5..+5)
 
     // Overlay tint ("out of the darkness" veil). tintColor.a is 1.0; the
     // strength slider scales it at render time.
@@ -696,6 +814,16 @@ struct Settings {
 
 // Flag indicating whether a custom shortcut arrow (e.g. Winaero "29") is in use
 std::atomic<bool> g_isCustomShortcutArrow{false};
+
+// [v2.10.34] Silhouette coverage controls (mirror their Settings fields so
+// the extraction/glyph workers read them lock-free):
+//   iconSilThreshold - the extraction alpha seal (was hardcoded 16): every
+//     extracted pixel with alpha >= threshold is sealed to 255. LOW = cover
+//     more (faint edge pixels become opaque -> silhouette grows slightly
+//     outside the visible icon), HIGH = hug only near-opaque pixels.
+//   labelOffsetY     - user nudge for the label glyph block, px, +/-5.
+std::atomic<int> g_iconSilThreshold{16};
+std::atomic<int> g_labelOffsetY{0};
 
 
 // Icon Snapshot & Light Math
@@ -798,8 +926,14 @@ struct CompositeData {
 };
 
 
-inline uint64_t GenerateComboHash(uint64_t baseIconHash, int overlayIndex, UINT labelW, UINT labelH, uint64_t shadowBakeHash, uint64_t labelTextHash, UINT scalePermille = 1000) {
+inline uint64_t GenerateComboHash(uint64_t baseIconHash, int overlayIndex, UINT labelW, UINT labelH, uint64_t shadowBakeHash, uint64_t labelTextHash, UINT scalePermille = 1000, UINT silhouetteFlags = 0) {
     uint64_t hash = baseIconHash;
+    // [v2.10.33] silhouetteFlags folds the silhouette-exclusion toggles
+    // (bit0 = arrow excluded, bit1 = label excluded) into the address: a
+    // flipped toggle changes the baked pixels, so the combo MUST miss its
+    // old cache entry and rebuild — same contract as shadowBakeHash.
+    hash ^= (uint64_t)silhouetteFlags + 0x2b1e8c9d4a6f7305ULL;
+    hash *= 1099511628211ULL;
     hash ^= (uint64_t)overlayIndex + 0x9e3779b97f4a7c15ULL;
     hash *= 1099511628211ULL;
     hash ^= (uint64_t)labelW + 0x517cc1b727220a95ULL;
@@ -5923,10 +6057,17 @@ bool CacheIconBitmap(HWND hLV, int imageIndex, uint64_t cacheKey, bool isFolder,
 
             } else {
                 // Solid alpha sealing for standard icons: prevents bright pixels from shining through the overlay
-                for (UINT i = 0; i < w * h; ++i) {
-                    uint8_t a = tempBgra[i * 4 + 3];
-                    // Clean threshold: discard faint compression noise (<16), seal real icon pixels to 255
-                    alphaOnly[i] = (a >= 16) ? 255 : 0;
+                // [v2.10.34] The 16 was ALWAYS the silhouette-growth dial Doc
+                // remembered: faint antialiased edge pixels (alpha 16..100)
+                // got sealed to 255 = silhouette covers slightly outside the
+                // visible icon. Now General.iconSilThreshold (0 = everything,
+                // 255 = only fully-opaque pixels); salted into cacheKey.
+                {
+                    const int sealT = g_iconSilThreshold.load(std::memory_order_relaxed);
+                    for (UINT i = 0; i < w * h; ++i) {
+                        uint8_t a = tempBgra[i * 4 + 3];
+                        alphaOnly[i] = (a != 0 && a >= sealT) ? 255 : 0;
+                    }
                 }
             }
 
@@ -7271,6 +7412,17 @@ static bool RenderGlyphSilhouetteD2D(const std::wstring& text, const LOGFONTW& l
     int lineH = haveTm ? (tm.tmHeight + tm.tmExternalLeading) : 0;
     if (lineH <= 0) lineH = (int)std::lround(fontSize * 1.33f);
     int maxLines = (std::max)(1, (h + lineH / 2) / lineH);
+    // [v2.10.34] FONT-AGNOSTIC VERTICAL MODEL. The block was centered with
+    // the GDI probe's lineH, but DWrite placed each line's ink using its own
+    // NATURAL metrics — and a font's ascent share of the line box is
+    // FONT-DEPENDENT (DejaVu vs Segoe differ). The formula was therefore
+    // tuned-on-DejaVu and dragged default-font (VM Segoe) ink ~1px low.
+    // Pin DWrite to GDI: uniform row advance = lineH, baseline = tmAscent —
+    // ink lands where GDI (and Explorer) put it, for every font.
+    if (haveTm && lineH > 0) {
+        format->SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM,
+                               (float)lineH, (float)tm.tmAscent);
+    }
 
     // --- GDI-BASED WORD WRAP & TRUNCATION ---
     std::vector<std::wstring> lines;
@@ -7460,6 +7612,7 @@ static bool RenderGlyphSilhouetteD2D(const std::wstring& text, const LOGFONTW& l
             float blockH = (float)(lines.size() * lineH);
             float yOff = ((float)h - blockH) / 2.0f;
             if (yOff < 0) yOff = 0;
+            yOff += (float)g_labelOffsetY.load(std::memory_order_relaxed);
             g_bakeDc->DrawTextLayout(D2D1::Point2F(0, yOff), layout.Get(), brush.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
         }
     }
@@ -7519,11 +7672,12 @@ struct GlyphCacheKey {
     int w;
     int h;
     int fontHeight; // [MULTIMON v2.9.4] LOGFONT height: per-monitor font sizes (20px primary vs 16px secondary) must never share an entry
+    int labelOff = 0; // [v2.10.34] General.labelOffsetY — offset changes must not hit stale cached glyphs
     uint32_t fontGen;
     bool truncated;
     bool operator==(const GlyphCacheKey& o) const {
         return textHash == o.textHash && w == o.w && h == o.h &&
-               fontHeight == o.fontHeight &&
+               fontHeight == o.fontHeight && labelOff == o.labelOff &&
                fontGen == o.fontGen && truncated == o.truncated;
     }
 };
@@ -7557,6 +7711,7 @@ static bool RenderGlyphSilhouette(const std::wstring& text, HFONT hFont, const L
     key.h = h;
     key.fontHeight = lf.lfHeight; // [MULTIMON v2.9.4]
     key.fontGen = g_labelFontGen.load(std::memory_order_relaxed);
+    key.labelOff = g_labelOffsetY.load(std::memory_order_relaxed);
     key.truncated = truncated;
     {
         std::lock_guard<std::mutex> lock(s_glyphCacheMutex);
@@ -8520,6 +8675,11 @@ void ProcessSnapshotData(const std::vector<RawListItem>& rawItems, const std::ws
             cacheKey *= 1099511628211ULL;
             cacheKey ^= dpiSalt;
             cacheKey *= 1099511628211ULL;
+            // [v2.10.34] Seal-threshold salt: a changed threshold re-seals
+            // every extraction, so ALL cache identities (RAM, persisted
+            // icon_shapes.bin, disk manifest) must move with it.
+            cacheKey ^= (uint64_t)g_iconSilThreshold.load(std::memory_order_relaxed);
+            cacheKey *= 1099511628211ULL;
             int rectW = snap.iconRect.right - snap.iconRect.left;
             int rectH = snap.iconRect.bottom - snap.iconRect.top;
             uint64_t rectSalt = ((uint64_t)rectW << 16) | (uint64_t)rectH;
@@ -8912,9 +9072,12 @@ void ProcessSnapshotData(const std::vector<RawListItem>& rawItems, const std::ws
                 skipTextHash *= 1099511628211ULL;
             }
             UINT skipScalePermille = (UINT)std::lround(GetItemMonitorScale(g_overlayWnd, snap.iconRect) * 1000.0f); // [MULTIMON v2.9.4]
+            UINT skipSilFlags = (localSettings.disableIconArrow ? 1u : 0u) |
+                                (localSettings.disableIconLabel ? 2u : 0u);
             uint64_t skipCandidate = GenerateComboHash(baseShapeHash, snap.overlayIndex,
                                                        skipComboLabelW, skipComboLabelH,
-                                                       skipProfile, skipTextHash, skipScalePermille);
+                                                       skipProfile, skipTextHash, skipScalePermille,
+                                                       skipSilFlags);
             uint64_t skipStored = skipExpanded ? snap.comboHash_e : snap.comboHash_c;
             // [PHASE 3 v2.4.5] oldSnapPtr no longer exists here — the F1
             // guard reads the decision-carried old state instead.
@@ -9045,7 +9208,10 @@ void ProcessSnapshotData(const std::vector<RawListItem>& rawItems, const std::ws
             }
 
             // Blit Shortcut Overlay Arrow into pc1
-            if (snap.overlayIndex > 0) {
+            // [v2.10.33] General.disableIconArrow skips the blit entirely:
+            // mods like Hide Desktop Icon Text remove the arrow from the
+            // real desktop — our overlay + shadow must not resurrect it.
+            if (snap.overlayIndex > 0 && !localSettings.disableIconArrow) {
                 SilhouetteData ovSil;
                 bool hasOv = false;
                 bool isCustom = g_isCustomShortcutArrow.load(std::memory_order_relaxed);
@@ -9132,7 +9298,10 @@ void ProcessSnapshotData(const std::vector<RawListItem>& rawItems, const std::ws
             // DT_END_ELLIPSIS) truncation; EXPANDED labels never ellipsize —
             // expanding exists to show the whole name (the rect grows to fit
             // it), overlong words just char-wrap mid-word onto the next row.
-            if (comboLabelW > 0 && comboLabelH > 0) {
+            if (comboLabelW > 0 && comboLabelH > 0 && !localSettings.disableIconLabel) {
+                // [v2.10.33] General.disableIconLabel: same contract as the
+                // arrow toggle — no label alpha in the silhouette, so both
+                // the overlay cutout and the shadow stay icon-only.
                 int labelOffsetX = snap.labelRect.left - combinedRect.left;
                 int labelOffsetY = snap.labelRect.top - combinedRect.top;
                 std::vector<uint8_t> labelAlpha;
@@ -9186,7 +9355,10 @@ void ProcessSnapshotData(const std::vector<RawListItem>& rawItems, const std::ws
                 labelTextHash *= 1099511628211ULL;
             }
             UINT itemScalePermille = (UINT)std::lround(itemScale * 1000.0f); // [MULTIMON v2.9.4]
-            uint64_t currentComboHash = GenerateComboHash(baseShapeHash, snap.overlayIndex, comboLabelW, comboLabelH, currentProfile, labelTextHash, itemScalePermille);
+            // [v2.10.33] Exclusion toggles are baked-pixel inputs -> hash.
+            UINT silFlags = (localSettings.disableIconArrow ? 1u : 0u) |
+                            (localSettings.disableIconLabel ? 2u : 0u);
+            uint64_t currentComboHash = GenerateComboHash(baseShapeHash, snap.overlayIndex, comboLabelW, comboLabelH, currentProfile, labelTextHash, itemScalePermille, silFlags);
 
             CompositeData compData;
             // Fetch existing data so we don't wipe the other state's composite if it's already cached
@@ -11177,7 +11349,7 @@ static const UINT WMAPP_OPENSETTINGS = WM_APP + 13;
 static const UINT WMAPP_APPLYHOTKEY = WM_APP + 14;
 
 static void DebugLog(const wchar_t* fmt, ...);
-static bool IsWindhawk2Install();
+bool WhTool_ModInit(); // v2.11.0: starts the control UI (bootstrap owner site)
 
 // --- settings-window hotkey (v2.10.4) ----------------------------------------
 // Engine-side registration (the desktop-owner's message window): the hotkey
@@ -11295,15 +11467,8 @@ LRESULT CALLBACK MessageWndProcInner(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM
             // host hold its mutex? install=1.x + mutex=absent means the host
             // never came up at all (the engine fallback spawn story);
             // mutex=present means a host exists but its window is not findable.
-            HANDLE m = OpenMutexW(SYNCHRONIZE, FALSE,
-                                  L"windhawk-tool-mod_" WH_MOD_ID);
-            if (m) CloseHandle(m);
-            DebugLog(L"[HOTKEY] tool host msg window NOT FOUND (install=%s, hostMutex=%s)",
-                     IsWindhawk2Install() ? L"2.x" : L"1.x",
-                     m ? L"present" : L"absent");
-            DiagLog(L"[HOTKEY] tool host msg window NOT FOUND (install=%s, hostMutex=%s)",
-                    IsWindhawk2Install() ? L"2.x" : L"1.x",
-                    m ? L"present" : L"absent");
+            DebugLog(L"[HOTKEY] tool msg window NOT FOUND - control UI not running");
+            DiagLog(L"[HOTKEY] tool msg window NOT FOUND - control UI not running");
         }
         return 0;
     }
@@ -12099,6 +12264,11 @@ void BootstrapThreadInner() {
                 return;
             }
             BootLog(L"[BOOT] Bootstrap: desktop LV found (owner)");
+            // v2.11.0: control UI (tray + settings window) lives HERE —
+            // its own thread + message loop, owned by this process only.
+            if (!WhTool_ModInit()) {
+                BootLog(L"[BOOT] control UI FAILED to start");
+            }
             DWORD tid = GetWindowThreadProcessId(hLV, nullptr);
             if (tid != 0) {
                 // Install hook ONLY on the Explorer UI thread
@@ -12243,6 +12413,10 @@ static const CfgKeyEntry kCfgKeys[] = {
     // added the keys after this table existed; nothing flagged the gap.
     {L"Toggle.overlayEnabled", false},
     {L"General.customArrowEnabled", false},
+    {L"General.disableIconArrow", false},
+    {L"General.disableIconLabel", false},
+    {L"General.iconSilThreshold", false},
+    {L"General.labelOffsetY", false},
     {L"Toggle.toggleFadeInDuration", false},
     {L"Toggle.toggleFadeOutDuration", false},
     {L"General.targetFps", false},
@@ -12301,6 +12475,10 @@ static const CfgDefault kCfgDefaults[] = {
     {L"General.targetFps", 60, nullptr},
     {L"General.cacheMode", 1, nullptr},
     {L"General.customArrowEnabled", 1, nullptr},
+    {L"General.disableIconArrow", 0, nullptr},
+    {L"General.disableIconLabel", 0, nullptr},
+    {L"General.iconSilThreshold", 16, nullptr},
+    {L"General.labelOffsetY", 0, nullptr},
     {L"General.customArrowScale", 75, nullptr},
     {L"General.customArrowOffsetX", 0, nullptr},
     {L"General.customArrowOffsetY", 0, nullptr},
@@ -12659,6 +12837,10 @@ void LoadSettings() {
     s.customArrowScale         = std::clamp(cfgInt(L"General.customArrowScale"), 10, 200);
     s.customArrowOffsetX       = std::clamp(cfgInt(L"General.customArrowOffsetX"), -200, 200);
     s.customArrowOffsetY       = std::clamp(cfgInt(L"General.customArrowOffsetY"), -200, 200);
+    s.disableIconArrow         = cfgIntDef(L"General.disableIconArrow", 0) != 0;
+    s.disableIconLabel         = cfgIntDef(L"General.disableIconLabel", 0) != 0;
+    s.iconSilThreshold         = std::clamp(cfgIntDef(L"General.iconSilThreshold", 16), 0, 255);
+    s.labelOffsetY             = std::clamp(cfgIntDef(L"General.labelOffsetY", 0), -5, 5);
 
     // Overlay tint
     s.tintEnabled              = cfgInt(L"Tint.tintEnabled") != 0;
@@ -12703,11 +12885,23 @@ void LoadSettings() {
                                  // never cleared and the tray-menu/checkbox
                                  // flip silently kept the old arrow.
                                  s.customArrowEnabled != g_settings.customArrowEnabled);
+    // [v2.10.33] Silhouette-exclusion toggles change the BAKED pixels (the
+    // combo builder skips the arrow/label blits), so they ride the same
+    // invalidation contract as arrowSettingsChanged: combo cache cleared +
+    // re-pass queued. (The combo hash folds these flags, so stale entries
+    // can never be trusted even without this — this just makes the change
+    // land live instead of on the next pass trigger.)
+    bool silExclusionChanged = !s_isFirstSettingsLoad &&
+                               (s.disableIconArrow != g_settings.disableIconArrow ||
+                                s.disableIconLabel != g_settings.disableIconLabel ||
+                                s.iconSilThreshold != g_settings.iconSilThreshold ||
+                                s.labelOffsetY != g_settings.labelOffsetY);
     s_isFirstSettingsLoad = false;
     // [P1.1] Tell Wh_ModSettingsChanged whether the skip guard must stand
     // down. First load is suppressed: at mod boot the mirror is empty
     // anyway, and an install-time settings reload changes nothing.
-    g_bakedInputsChanged.store(shadowBakeChanged || arrowSettingsChanged,
+    g_bakedInputsChanged.store(shadowBakeChanged || arrowSettingsChanged ||
+                                   silExclusionChanged,
                                std::memory_order_relaxed);
 
     // 1. Update settings under g_renderMutex and release immediately (prevents deadlocks!)
@@ -12717,6 +12911,8 @@ void LoadSettings() {
         g_forceRender = true;
         BakeSpotlight();
     }
+    g_iconSilThreshold.store(s.iconSilThreshold, std::memory_order_relaxed);
+    g_labelOffsetY.store(s.labelOffsetY, std::memory_order_relaxed);
 
     g_diskCache.SetCacheMode(s.cacheMode);
 
@@ -12765,7 +12961,32 @@ void LoadSettings() {
         g_cpuOverlaySilhouettes.clear();
     }
 
-    if (shadowBakeChanged || arrowSettingsChanged) {
+    if (silExclusionChanged) {
+        // [v2.10.34] Threshold changes re-seal every extraction; cacheKey is
+        // salted with the threshold so disk/persisted identities move too,
+        // but the RAM maps can still hold entries under OLD keys — sweep.
+        {
+            std::lock_guard<std::mutex> lock(g_cacheMutex);
+            g_iconCache.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_hashCacheMutex);
+            g_iconHashCache.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_uniqueShapesMutex);
+            g_uniqueShapes.clear();
+            g_shapeToBitmap.clear();
+            g_genericFileBaselines.clear();
+            g_baselinesReady = false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_persistedShapeIndexMutex);
+            g_persistedShapeIndex.clear();
+        }
+    }
+
+    if (shadowBakeChanged || arrowSettingsChanged || silExclusionChanged) {
         {
             std::lock_guard<std::mutex> comboLock(g_comboShadowCacheMutex);
             g_comboShadowCache.clear();
@@ -12979,22 +13200,28 @@ static BOOL Engine_ModInit() {
     ULONGLONG bootT0 = GetTickCount64();
     BootLog(L"[BOOT] ===== new boot =====");
     BootLog(L"[BOOT] Wh_ModInit enter");
+    // [v2.10.30] Version identity, drift-free: the DLL filename embeds the
+    // compile version (local@<id>_<ver>_<rnd>.dll) — every log can be tied
+    // to the exact build, and a stale-build verdict never needs guessing.
+    wchar_t dllPath[MAX_PATH] = L"?";
+    GetModuleFileNameW(GetModHInstance(), dllPath, MAX_PATH);
+    BootLog(L"[BOOT] dll=%s", dllPath);
 
     // Log std::terminate with the active exception before the runtime aborts
     // (the libc++.whl 0x40000015 crash signature). Process-global: if another
     // mod ever installs its own handler, ours is replaced — acceptable.
     std::set_terminate([]() {
-        BootLog(L"[TERMINATE] std::terminate called!");
+        DiagLogAlways(L"[TERMINATE] std::terminate called!");
         if (std::current_exception()) {
             try {
                 std::rethrow_exception(std::current_exception());
             } catch (const std::exception& e) {
-                BootLog(L"[TERMINATE] exception: %hs", e.what());
+                DiagLogAlways(L"[TERMINATE] exception: %hs", e.what());
             } catch (...) {
                 BootLog(L"[TERMINATE] non-standard exception");
             }
         } else {
-            BootLog(L"[TERMINATE] no active exception (abort/assert path)");
+            DiagLogAlways(L"[TERMINATE] no active exception (abort/assert path)");
         }
         std::abort();
     });
@@ -13274,13 +13501,12 @@ static const int kBottomBarH = 48;
 ////////////////////////////////////////////////////////////////////////////////
 // Tool-mod process plumbing (desktop-window-cards-v2 recipe)
 
-static bool g_isToolModProcessLauncher;
-static bool g_isCtrlToolProcess;
-static HANDLE g_toolModProcessMutex;
+// (v2.11.0: g_isToolModProcessLauncher / g_spawnerMutex / g_isCtrlToolProcess /
+// g_toolModProcessMutex all retired with the dedicated tool host.)
 // Set by Wh_ModUninit (launcher instance) so the long-lived watchdog thread
 // exits before the mod DLL unmaps — the old 3-attempt watchdog self-expired
 // after ~40s, which left the tray with no lifeguard for the rest of the day.
-static HANDLE g_watchdogStop = nullptr;
+// (g_watchdogStop retired with the watchdog in v2.10.15.)
 
 static HWND g_settingsWnd = nullptr;
 static HWND g_msgWnd = nullptr;
@@ -13292,13 +13518,82 @@ static DWORD g_uiThreadId = 0;
 ////////////////////////////////////////////////////////////////////////////////
 // Colors / fonts
 
-static const COLORREF kColBg = RGB(32, 32, 32);       // #202020 window base
-static const COLORREF kColSidebar = RGB(32, 32, 32);  // unified: no two-tone slab
-static const COLORREF kColInputBg = RGB(40, 40, 40);  // #282828 tertiary
-static const COLORREF kColAccent = RGB(68, 138, 255); // the ONE accent
-static const COLORREF kColText = RGB(255, 255, 255);  // primary
-static const COLORREF kColTextSec = RGB(196, 196, 196);  // white @ 77%
-static const COLORREF kColDim = RGB(94, 94, 94);      // white @ 37%
+// [v2.10.21 theme-following] The window follows the WINDOWS app theme
+// (AppsUseLightTheme, read live): dark palette in dark mode, light palette
+// in light mode. The kCol* names were constants across the dark-only era;
+// they are VARIABLES now, filled by ApplyUiPalette() at UI init and at
+// every window open (the Windows theme can flip while the UI thread is
+// alive). Field history that forced this: themed parts (combo closed face,
+// edit borders, spin hover) follow the MACHINE's app-theme state — dark
+// here, light in the 1.7.3 VM and on Eric99's machine — so hardcoding dark
+// can never be right; respecting the theme is correct by construction.
+struct UiPalette {
+    COLORREF bg;          // window base
+    COLORREF sidebar;     // nav column (unified: no two-tone slab)
+    COLORREF sidebarHover;
+    COLORREF inputBg;     // tertiary / inputs
+    COLORREF accent;      // the ONE accent
+    COLORREF text;        // primary
+    COLORREF textSec;     // text @ 77%
+    COLORREF dim;         // text @ 37%
+    COLORREF stroke;      // group frames, checkbox outline
+    COLORREF hover;       // pressed/hover fills
+    COLORREF thumb;       // slider thumb inactive
+    COLORREF disabled;    // disabled text
+    COLORREF boxFill;     // custom checkbox interior
+    COLORREF check;       // custom checkbox check mark
+    COLORREF glyph;       // picker glyph on input fill
+};
+static constexpr UiPalette kPalDark = {
+    RGB(32, 32, 32),   RGB(32, 32, 32),   RGB(44, 44, 44),   RGB(40, 40, 40),
+    RGB(68, 138, 255), RGB(255, 255, 255), RGB(196, 196, 196), RGB(94, 94, 94),
+    RGB(58, 58, 58),   RGB(58, 58, 58),   RGB(150, 150, 150), RGB(150, 150, 150),
+    RGB(24, 24, 24),   RGB(120, 220, 120), RGB(220, 220, 220)};
+static constexpr UiPalette kPalLight = {
+    RGB(243, 243, 243), RGB(243, 243, 243), RGB(234, 234, 234), RGB(255, 255, 255),
+    RGB(0, 103, 192),   RGB(26, 26, 26),    RGB(92, 92, 92),    RGB(155, 155, 155),
+    RGB(214, 214, 214), RGB(229, 229, 229), RGB(138, 138, 138), RGB(138, 138, 138),
+    RGB(255, 255, 255), RGB(16, 124, 16),   RGB(80, 80, 80)};
+
+static bool g_uiDark = true;
+static UiPalette g_pal = kPalDark;
+
+// The window's live chrome colors — everything in the UI reads these.
+static COLORREF kColBg, kColSidebar, kColInputBg, kColAccent, kColText,
+    kColTextSec, kColDim, kColStroke, kColSidebarHover, kColThumb,
+    kColHover, kColDisabled, kColBoxFill, kColCheck, kColGlyph;
+
+static bool WindowsAppsDarkMode() {
+    // Default DARK on a failed read: every Win10/11 machine carries the
+    // key, and dark is the palette this UI was designed against first.
+    DWORD v = 0;
+    DWORD size = sizeof(v);
+    RegGetValueW(HKEY_CURRENT_USER,
+                 L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\"
+                 L"Personalize",
+                 L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &v, &size);
+    return v == 0;
+}
+
+static void ApplyUiPalette() {
+    g_uiDark = WindowsAppsDarkMode();
+    g_pal = g_uiDark ? kPalDark : kPalLight;
+    kColBg = g_pal.bg;
+    kColSidebar = g_pal.sidebar;
+    kColSidebarHover = g_pal.sidebarHover;
+    kColInputBg = g_pal.inputBg;
+    kColAccent = g_pal.accent;
+    kColText = g_pal.text;
+    kColTextSec = g_pal.textSec;
+    kColDim = g_pal.dim;
+    kColStroke = g_pal.stroke;
+    kColHover = g_pal.hover;
+    kColThumb = g_pal.thumb;
+    kColDisabled = g_pal.disabled;
+    kColBoxFill = g_pal.boxFill;
+    kColCheck = g_pal.check;
+    kColGlyph = g_pal.glyph;
+}
 
 static HFONT g_font = nullptr;
 static HFONT g_fontBold = nullptr;
@@ -13310,15 +13605,348 @@ static HBRUSH g_brushInput = nullptr;
 static HBRUSH g_brushAccent = nullptr;
 static HBRUSH g_brushStroke = nullptr;
 static HBRUSH g_brushHover = nullptr;
+static HFONT g_fontMdl2 = nullptr;  // Segoe MDL2 Assets glyphs (system font)
+
 static HBRUSH g_brushThumb = nullptr;
 
-// Dark-mode theming: kills light scrollbar/combo/trackbar artifacts on the
-// dark background (stable since Win10 1809).
-static void Darkize(HWND h) {
-    if (h) SetWindowTheme(h, L"DarkMode_Explorer", nullptr);
+// [v2.10.21] Brushes follow the palette: destroyed + recreated from g_pal
+// at UI init and at every window open (palette can flip between opens).
+static void DestroyUiBrushes() {
+    for (HBRUSH* b : {&g_brushBg, &g_brushSidebar, &g_brushSidebarHover,
+                      &g_brushInput, &g_brushAccent, &g_brushStroke,
+                      &g_brushHover, &g_brushThumb}) {
+        if (*b) {
+            DeleteObject(*b);
+            *b = nullptr;
+        }
+    }
 }
 
-static HFONT g_fontMdl2 = nullptr;  // Segoe MDL2 Assets glyphs (system font)
+static void CreateUiBrushes() {
+    g_brushBg = CreateSolidBrush(g_pal.bg);
+    g_brushSidebar = CreateSolidBrush(g_pal.sidebar);
+    g_brushSidebarHover = CreateSolidBrush(g_pal.sidebarHover);
+    g_brushInput = CreateSolidBrush(g_pal.inputBg);
+    g_brushAccent = CreateSolidBrush(g_pal.accent);
+    g_brushStroke = CreateSolidBrush(g_pal.stroke);
+    g_brushHover = CreateSolidBrush(g_pal.hover);
+    g_brushThumb = CreateSolidBrush(g_pal.thumb);
+}
+
+// Dark-mode theming: kills light scrollbar/combo/trackbar artifacts on the
+// dark background (stable since Win10 1809). [v2.10.21] GATED on dark mode:
+// in light mode the native light themes ARE the correct look — no forcing.
+//
+// [v2.10.18 dark opt-in] SetWindowTheme(DarkMode_*) alone only HALF-applies
+// in a host process that hasn't opted into dark uxtheme mode: themed parts
+// (edit borders, combo closed face/chevron, hover states) keep drawing
+// light. Field-proven in the 1.7.3 VM: list/trackbar parts went dark,
+// borders + closed combos + spin hover stayed light. Two undocumented-
+// since-1809, community-stable ordinals close the gap:
+//   135 SetPreferredAppMode(ForceDark)  - process-level dark preference
+//   133 AllowDarkModeForWindow(hwnd,TRUE) - per-window opt-in, must be
+//     called BEFORE the per-control SetWindowTheme takes full effect.
+enum class PreferredAppMode { Default = 0, AllowDark = 1, ForceDark = 2,
+                              ForceLight = 3 };
+static void (*pfnSetPreferredAppMode)(PreferredAppMode) = nullptr;
+static BOOL (*pfnAllowDarkModeForWindow)(HWND, BOOL) = nullptr;
+static void (*pfnRefreshImmersiveColorPolicyState)(void) = nullptr;
+static void (*pfnFlushMenuThemes)(void) = nullptr;
+
+static void ResolveDarkModeApi() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    HMODULE ux = GetModuleHandleW(L"uxtheme.dll");  // loaded by comctl32 init
+    if (!ux) {
+        DiagLog(L"[THEME] uxtheme.dll NOT in process module list");
+        return;
+    }
+    pfnSetPreferredAppMode = reinterpret_cast<decltype(pfnSetPreferredAppMode)>(
+        GetProcAddress(ux, LPCSTR(135)));
+    pfnAllowDarkModeForWindow =
+        reinterpret_cast<decltype(pfnAllowDarkModeForWindow)>(
+            GetProcAddress(ux, LPCSTR(133)));
+    // 104/136: the canonical recipe's refresh pair. SetPreferredAppMode
+    // alone flips the app-mode flag; the themed paints read a CACHED
+    // immersive color policy computed at process start. Without
+    // RefreshImmersiveColorPolicyState + FlushMenuThemes the cache stays
+    // light — probe 2.10.19 showed the whole chain "succeeding" while the
+    // visuals stayed light (hr=0 everywhere, ShouldSystemUseDarkMode=1).
+    pfnRefreshImmersiveColorPolicyState =
+        reinterpret_cast<decltype(pfnRefreshImmersiveColorPolicyState)>(
+            GetProcAddress(ux, LPCSTR(104)));
+    pfnFlushMenuThemes =
+        reinterpret_cast<decltype(pfnFlushMenuThemes)>(
+            GetProcAddress(ux, LPCSTR(136)));
+    if (pfnRefreshImmersiveColorPolicyState)
+        pfnRefreshImmersiveColorPolicyState();
+    // [v2.10.21] Theme-respecting: ForceDark only when the machine's app
+    // theme IS dark; neutral otherwise (a forced dark in light mode would
+    // darken menus/system paints the window doesn't own).
+    if (pfnSetPreferredAppMode)
+        pfnSetPreferredAppMode(g_uiDark ? PreferredAppMode::ForceDark
+                                        : PreferredAppMode::Default);
+    if (pfnFlushMenuThemes) pfnFlushMenuThemes();
+    // Ordinal 132 = ShouldSystemUseDarkMode: what uxtheme THINKS the system
+    // wants — cross-check against our registry assumption (sandbox sets
+    // AppsUseLightTheme=0 BEFORE explorer restart).
+    auto shouldDark = reinterpret_cast<BOOL (*)(void)>(
+        GetProcAddress(ux, LPCSTR(132)));
+    DiagLog(L"[THEME] uxtheme=%p SetPreferredAppMode=%p AllowDark=%p "
+            L"Refresh=%p Flush=%p ShouldSystemUseDarkMode=%d",
+            (void*)ux, (void*)pfnSetPreferredAppMode,
+            (void*)pfnAllowDarkModeForWindow,
+            (void*)pfnRefreshImmersiveColorPolicyState,
+            (void*)pfnFlushMenuThemes,
+            shouldDark ? (int)shouldDark() : -1);
+}
+
+// [v2.10.22] Square borders on edits/combos: WS_EX_CLIENTEDGE renders the
+// themed edge, which ignores DarkMode_* on a class of machines (1.7.3 VM,
+// Eric99). Edits drop CLIENTEDGE; the subclass overpaints the nonclient
+// frame with the palette stroke on every NCPAINT (DefSubclassProc's themed
+// edge gets covered by ours — same trick every square-UI library uses).
+static bool TextHasEmoji(PCWSTR s) {
+    for (; *s; s++)
+        if (*s >= 0xD800 && *s <= 0xDFFF) return true;  // surrogate = emoji
+    return false;
+}
+
+// [v2.10.25] ref = 0 (combo dropdown list): NCPAINT OVERPAINT ONLY — no
+// client inset. The 2.10.24 NCCALCSIZE change shifted the list's item
+// origin (field verdict: first entry clipped, rest blank until hover).
+// The themed border dies by being painted over, not by client surgery.
+// ref = 1 (edits): 1px NC inset + vertical-centering top shave, and the
+// whole widget face (NC bands included) fills with the INPUT color —
+// bands in window bg read as a transparent slit (2.10.24 verdict).
+static LRESULT CALLBACK SquareBorderProc(HWND h, UINT msg, WPARAM wp,
+                                         LPARAM lp, UINT_PTR,
+                                         DWORD_PTR ref) {
+    {
+        switch (msg) {
+            case WM_NCCALCSIZE:
+                if (wp && ref) {
+                    LRESULT r = DefSubclassProc(h, msg, wp, lp);
+                    RECT* rc = (RECT*)lp;
+                    rc->left += 1;
+                    rc->right -= 1;
+                    rc->top += 1;
+                    rc->bottom -= 1;
+                    // Single-line edits draw text at the CLIENT TOP; shave
+                    // half the slack off the top so text lands centered.
+                    HDC t = GetDC(h);
+                    HFONT old = (HFONT)SelectObject(t, g_font);
+                    TEXTMETRICW tm;
+                    GetTextMetricsW(t, &tm);
+                    SelectObject(t, old);
+                    ReleaseDC(h, t);
+                    int clientH = rc->bottom - rc->top;
+                    int slack = clientH - (int)tm.tmHeight;
+                    if (slack > 4) rc->top += slack / 2;
+                    return r;
+                }
+                break;
+            case WM_NCPAINT: {
+                HDC hdc = GetWindowDC(h);
+                RECT rc;
+                GetWindowRect(h, &rc);
+                rc.right -= rc.left;
+                rc.bottom -= rc.top;
+                rc.left = 0;
+                rc.top = 0;
+                if (ref) FillRect(hdc, &rc, g_brushInput);
+                // List mode: FRAME ONLY — a whole-rect fill here ran after
+                // the items painted and erased the dropdown contents
+                // (2.10.25 field verdict). The 1px frame overpaints the
+                // themed edge; the client is never touched.
+                FrameRect(hdc, &rc, g_brushStroke);
+                ReleaseDC(h, hdc);
+                return 0;  // themed edge never draws (skip DefSubclassProc)
+            }
+        }
+        return DefSubclassProc(h, msg, wp, lp);
+    }
+}
+
+static void SubclassSquareBorder(HWND h, bool edit = false) {
+    if (!h) return;
+    SetWindowSubclass(h, SquareBorderProc, 5, edit ? 1 : 0);
+    // NCCALCSIZE ran during creation, BEFORE the subclass existed — force
+    // a frame recalculation or the NC reservation never applies (the
+    // 2.10.23 "border invisible" verdict).
+    SetWindowPos(h, nullptr, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
+                     SWP_FRAMECHANGED);
+}
+
+// [v2.10.23] Full combo face ownership: an owner-draw combo still gets its
+// FRAME, BUTTON and CHEVRON from the themed combo itself (the 2.10.22 VM
+// verdict: "thick white border, white button, very light chevron"). The
+// subclass intercepts WM_PAINT and paints the whole closed face — fill,
+// text, chevron, border — from the palette; native click/dropdown logic is
+// untouched (WM_LBUTTONDOWN passes through).
+static void PaintComboFace(HWND h, HDC hdc) {
+    RECT rc;
+    GetClientRect(h, &rc);
+    FillRect(hdc, &rc, g_brushInput);
+    int dpi = GetDpiForWindow(h);
+    wchar_t txt[256] = {};
+    int sel = (int)SendMessageW(h, CB_GETCURSEL, 0, 0);
+    if (sel >= 0)
+        SendMessageW(h, CB_GETLBTEXT, sel, (LPARAM)txt);
+    SetBkMode(hdc, TRANSPARENT);
+    // UI font; emoji rows keep emoji metrics (bat combos). Disabled combos
+    // gray out — field verdict "no visible disabled state".
+    bool dis = !IsWindowEnabled(h);
+    HFONT oldFont = (HFONT)SelectObject(
+        hdc, TextHasEmoji(txt) ? g_fontEmoji : g_font);
+    SetTextColor(hdc, dis ? kColDisabled : kColText);
+    RECT rcT = rc;
+    rcT.left += MulDiv(8, dpi, 96);
+    rcT.right -= MulDiv(24, dpi, 96);
+    DrawTextW(hdc, txt, -1, &rcT,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX |
+                  DT_END_ELLIPSIS);
+    SelectObject(hdc, oldFont);
+    // Chevron zone: fill = border gray (Doc spec). Glyph = filled triangle,
+    // smaller and thicker than the MDL2 glyph (Doc 2.10.24 verdict).
+    RECT chev = rc;
+    chev.left = chev.right - MulDiv(20, dpi, 96);
+    FillRect(hdc, &chev, g_brushStroke);
+    int cw = MulDiv(5, dpi, 96), chh = MulDiv(3, dpi, 96);
+    int ccx = (chev.left + chev.right) / 2, ccy = (chev.top + chev.bottom) / 2;
+    POINT tri[3] = {{ccx - cw, ccy - chh}, {ccx + cw, ccy - chh}, {ccx, ccy + chh}};
+    HBRUSH triBr = CreateSolidBrush(IsWindowEnabled(h) ? kColTextSec
+                                                       : kColDisabled);
+    HBRUSH oldBr = (HBRUSH)SelectObject(hdc, triBr);
+    Polygon(hdc, tri, 3);
+    SelectObject(hdc, oldBr);
+    DeleteObject(triBr);
+    FrameRect(hdc, &rc, g_brushStroke);
+}
+
+static LRESULT CALLBACK ComboPaintProc(HWND h, UINT msg, WPARAM wp,
+                                       LPARAM lp, UINT_PTR, DWORD_PTR) {
+    {
+        switch (msg) {
+            case WM_PAINT: {
+                PAINTSTRUCT ps;
+                HDC hdc = BeginPaint(h, &ps);
+                PaintComboFace(h, hdc);
+                EndPaint(h, &ps);
+                return 0;
+            }
+            case WM_PRINTCLIENT:
+                PaintComboFace(h, (HDC)wp);
+                return 0;
+        }
+        return DefSubclassProc(h, msg, wp, lp);
+    }
+}
+
+static void SubclassComboPaint(HWND h) {
+    if (h) SetWindowSubclass(h, ComboPaintProc, 7, 0);
+}
+
+// [v2.10.22] Updown custom paint: the themed hot-track arrows go light on
+// the stubborn machines. We own WM_PAINT (bg + two palette triangles +
+// press feedback via a window prop) and leave the native click/delta logic
+// untouched — UDN_DELTAPOS still arrives at the pane.
+static void SpinTri(HDC hdc, const RECT& cell, bool up, COLORREF col) {
+    int cx = (cell.left + cell.right) / 2;
+    int cy = (cell.top + cell.bottom) / 2;
+    int w = (cell.right - cell.left) / 3;
+    int h4 = (cell.bottom - cell.top) / 4;
+    POINT pts[3];
+    if (up) {
+        pts[0] = {cx - w, cy + h4};
+        pts[1] = {cx + w, cy + h4};
+        pts[2] = {cx, cy - h4};
+    } else {
+        pts[0] = {cx - w, cy - h4};
+        pts[1] = {cx + w, cy - h4};
+        pts[2] = {cx, cy + h4};
+    }
+    HBRUSH br = CreateSolidBrush(col);
+    HBRUSH old = (HBRUSH)SelectObject(hdc, br);
+    Polygon(hdc, pts, 3);
+    SelectObject(hdc, old);
+    DeleteObject(br);
+}
+
+static LRESULT CALLBACK SpinPaintProc(HWND h, UINT msg, WPARAM wp,
+                                      LPARAM lp, UINT_PTR, DWORD_PTR) {
+    static const wchar_t* kPressProp = L"abtSpinPress";
+    switch (msg) {
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC hdc = BeginPaint(h, &ps);
+            RECT rc;
+            GetClientRect(h, &rc);
+            int half = rc.bottom / 2;
+            int press = (int)(INT_PTR)(intptr_t)GetPropW(h, kPressProp);
+            RECT up = {0, 0, rc.right, half};
+            RECT dn = {0, half, rc.right, rc.bottom};
+            FillRect(hdc, &up, press == 1 ? g_brushHover : g_brushBg);
+            FillRect(hdc, &dn, press == 2 ? g_brushHover : g_brushBg);
+            HBRUSH strokeB = CreateSolidBrush(kColStroke);
+            FrameRect(hdc, &up, strokeB);
+            FrameRect(hdc, &dn, strokeB);
+            DeleteObject(strokeB);
+            COLORREF arrowCol =
+                IsWindowEnabled(h) ? kColTextSec : kColDisabled;
+            SpinTri(hdc, up, true, arrowCol);
+            SpinTri(hdc, dn, false, arrowCol);
+            EndPaint(h, &ps);
+            return 0;
+        }
+        case WM_LBUTTONDOWN: {
+            RECT rc;
+            GetClientRect(h, &rc);
+            int y = (short)HIWORD(lp);
+            SetPropW(h, kPressProp,
+                     (HANDLE)(INT_PTR)(y < rc.bottom / 2 ? 1 : 2));
+            InvalidateRect(h, nullptr, FALSE);
+            break;  // fall through to native: UDN_DELTAPOS logic intact
+        }
+        case WM_LBUTTONUP:
+        case WM_CAPTURECHANGED: {
+            if (GetPropW(h, kPressProp)) {
+                RemovePropW(h, kPressProp);
+                InvalidateRect(h, nullptr, FALSE);
+            }
+            break;
+        }
+    }
+    return DefSubclassProc(h, msg, wp, lp);
+}
+
+static void SubclassSpinPaint(HWND h) {
+    if (h) SetWindowSubclass(h, SpinPaintProc, 6, 0);
+}
+
+static void Darkize(HWND h, bool combo = false) {
+    if (!h) return;
+    if (!g_uiDark) return;  // light mode: native light themes are correct
+    ResolveDarkModeApi();
+    BOOL allowed = FALSE;
+    if (pfnAllowDarkModeForWindow) allowed = pfnAllowDarkModeForWindow(h, TRUE);
+    // The closed combo box (face fill, border, chevron button) does not
+    // respond to DarkMode_Explorer — that theme only covers the OPENED
+    // dropdown list. DarkMode_CFE is the combo-closed theme (community-
+    // stable name since 1809); the opened list keeps its own theming.
+    HRESULT hr = SetWindowTheme(
+        h, combo ? L"DarkMode_CFE" : L"DarkMode_Explorer", nullptr);
+    // Probe build 2.10.19: cap at 40 lines so one window build tells all.
+    static int logged = 0;
+    if (logged < 40) {
+        logged++;
+        DiagLog(L"[THEME] Darkize hwnd=%p combo=%d allow=%d hr=0x%08X", (void*)h,
+                combo ? 1 : 0, (int)allowed, (unsigned)hr);
+    }
+}
+
 
 static HFONT MakePtFont(int pt, bool bold, const wchar_t* face = L"Segoe UI") {
     HDC hdc = GetDC(nullptr);
@@ -13488,7 +14116,7 @@ static bool WriteConfigMap(
 ////////////////////////////////////////////////////////////////////////////////
 // Control spec table (drives pane construction + read/write)
 
-enum class Kind { Chk, Slider, Combo, Color };
+enum class Kind { Chk, Slider, Combo, Color, Hint };
 
 struct CtlSpec {
     int section;
@@ -13573,12 +14201,32 @@ static const wchar_t* const kCacheModeDisplay[] = {
 #define CBOS(s, k, lbl, opts) {s, Kind::Combo, k, lbl, 0, 0, opts, ARRAYSIZE(opts), nullptr}
 #define CBOSD(s, k, lbl, opts, disp) {s, Kind::Combo, k, lbl, 0, 0, opts, ARRAYSIZE(opts), disp}
 #define COLR(s, k, lbl) {s, Kind::Color, k, lbl, 0, 0, nullptr, 0}
+#define HINT(s, txt) {s, Kind::Hint, L"", txt, 0, 0, nullptr, 0}
 
 static const CtlSpec kSpecs[] = {
     // General (engine "General" + 🦇)
     CBOS(SEC_GENERAL, L"General.targetFps", L"Target Framerate", kFps),
     CBOSD(SEC_GENERAL, L"General.cacheMode", L"Disk Cache Mode", kCacheModes,
           kCacheModeDisplay),
+    // [v2.10.33] Mouse smoothing moved from Spotlight to General (Doc ask).
+    // Key stays Spotlight.mouseSmoothing — tab placement is UI-only, the
+    // engine contract is untouched.
+    SLD(SEC_GENERAL, L"Spotlight.mouseSmoothing", L"Mouse Smoothing", 0, 20),
+    // [v2.10.33] Silhouette-exclusion toggles (Eric99 genre: desktop mods
+    // that remove the arrow/label from the icons — the silhouette must
+    // follow the real desktop, not resurrect what's hidden).
+    CHKS(SEC_GENERAL, L"General.disableIconArrow",
+         L"Disable Icon's Shortcut Arrow (Overlay + Shadow)"),
+    CHKS(SEC_GENERAL, L"General.disableIconLabel",
+         L"Disable Label's Text (Overlay + Shadow)"),
+    // [v2.10.34] Silhouette coverage controls (Doc: the extraction seal he
+    // remembered as "a growth of sorts" is now dial-able; the label nudge
+    // trims any residual vertical misfit per machine).
+    SLD(SEC_GENERAL, L"General.iconSilThreshold", L"Icon Silhouette Threshold", 0, 255),
+    HINT(SEC_GENERAL,
+         L"Pixels above this alpha become fully opaque in the icon's silhouette "
+         L"- lower covers more around the icon, higher hugs its solid shape."),
+    SLD(SEC_GENERAL, L"General.labelOffsetY", L"Label Overlay Y Offset (px)", -5, 5),
     // Overlay (Doc 2026-11-08: dim veil + toggle/tint/arrow groups; the
     // sidebar checkbox toggles veil AND tint. Group titles are the enable
     // checkboxes and live in kGroups, not here.)
@@ -13625,9 +14273,8 @@ static const CtlSpec kSpecs[] = {
         L"Fade In Duration (ms)", 0, 3000),
     SLD(SEC_SPOTLIGHT, L"Spotlight.spotlightFadeOutDuration",
         L"Fade Out Duration (ms)", 0, 5000),
-    SLD(SEC_SPOTLIGHT, L"Spotlight.mouseSmoothing", L"Mouse Smoothing", 0, 20),
-    CBOS(SEC_SPOTLIGHT, L"batSignalStyle", L"🦇 style", kBatStyles),
-    CBOS(SEC_SPOTLIGHT, L"batLogoBlur", L"🦇 blur", kBatBlurs),
+    CBOS(SEC_SPOTLIGHT, L"batSignalStyle", L"🦇", kBatStyles),
+    CBOS(SEC_SPOTLIGHT, L"batLogoBlur", L"🦇", kBatBlurs),
     // Selection (Enable lives in the sidebar)
     SLD(SEC_SELECTION, L"Selection.selectionOpacity", L"Opacity", 0, 255),
     SLD(SEC_SELECTION, L"Selection.selectionPadding", L"Padding (px)", 0, 500),
@@ -13670,6 +14317,7 @@ static std::unordered_map<std::wstring, bool> g_toggleState;
 static Row* FindRowByKey(const wchar_t* key);
 static bool RowlessOn(const wchar_t* key);
 static void ApplyGroupEnableStates();
+static void RefreshSquareFrames();
 static HWND g_btnApply = nullptr;
 static HWND g_btnSave = nullptr;
 static HWND g_btnCancel = nullptr;
@@ -13741,7 +14389,7 @@ static const GroupSpec kGroups[] = {
     {SEC_OVERLAY, L"Tint.tintEnabled", L"Tint", kTintMembers, 2},
     {SEC_OVERLAY, L"General.customArrowEnabled", L"Custom Shortcut Arrow:",
      kArrowMembers, 3},
-    {SEC_SPOTLIGHT, L"batSignalEnabled", L"🦇 Bat Signal",
+    {SEC_SPOTLIGHT, L"batSignalEnabled", L"🦇",
      kBatMembers, 2},
     {SEC_SHADOWS, L"Shadows.shadowGlobalTracking", L"Global Tracking",
      kShadowFadeMembers, 2},
@@ -13780,7 +14428,7 @@ static LRESULT CALLBACK GroupProc(HWND hwnd, UINT msg, WPARAM wParam,
             int dpi = GetDpiForWindow(hwnd);
             int gapL = MulDiv(10, dpi, 96);
             int gapR = gapL + (int)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-            HPEN pen = CreatePen(PS_SOLID, 1, RGB(58, 58, 58));
+            HPEN pen = CreatePen(PS_SOLID, 1, kColStroke);
             HPEN old = (HPEN)SelectObject(hdc, pen);
             MoveToEx(hdc, gapR, 0, nullptr);
             LineTo(hdc, rc.right - 1, 0);
@@ -13805,7 +14453,7 @@ static void RegisterGroupClass() {
     done = true;
     WNDCLASSW wc = {};
     wc.lpfnWndProc = GroupProc;
-    wc.hInstance = GetModuleHandle(nullptr);
+    wc.hInstance = GetModHInstance();
     wc.hbrBackground = nullptr;
     wc.lpszClassName = L"AbTenebrisControl_Group";
     RegisterClassW(&wc);
@@ -13854,6 +14502,116 @@ static LRESULT CALLBACK WheelReverseProc(HWND hwnd, UINT msg, WPARAM wParam,
     return DefSubclassProc(hwnd, msg, wParam, lParam);
 }
 
+// [v2.10.28] Disabled dimming: GDI FillRect has no alpha, and the old
+// 32-gray/white checkerboard averaged to an opaque LIGHT-gray slab (Doc
+// verdict 2026-11-22: "should become slightly darker"). Real answer =
+// AlphaBlend a 1x1 semi-transparent black pixel stretched over the
+// trackbar: true per-pixel compositing that darkens whatever the native
+// paint drew (channel, ticks, thumb) uniformly.
+// msimg32 resolved dynamically (Windhawk lld ignores #pragma lib).
+typedef BOOL(WINAPI* AlphaBlendFn)(
+    HDC, int, int, int, int, HDC, int, int, int, int, BLENDFUNCTION);
+static AlphaBlendFn GetAlphaBlend() {
+    static AlphaBlendFn fn = nullptr;
+    if (!fn) {
+        // GetModuleHandle finds only ALREADY-LOADED modules: on the dev
+        // machine some shell component had msimg32 resident in explorer, in
+        // the VM nothing did -> null fn -> the disabled-dim wash silently
+        // no-op'd ("VM sliders don't change", every 2.10.3x). LoadLibrary it.
+        HMODULE h = GetModuleHandleW(L"msimg32.dll");
+        if (!h) h = LoadLibraryW(L"msimg32.dll");
+        fn = h ? (AlphaBlendFn)GetProcAddress(h, "AlphaBlend") : nullptr;
+        // Never FreeLibrary: the cached fn pointer must stay mapped.
+    }
+    return fn;
+}
+
+static void DimSliderIfDisabled(HWND h) {
+    if (IsWindowEnabled(h)) return;
+    RECT rc;
+    GetClientRect(h, &rc);
+    if (rc.right <= rc.left || rc.bottom <= rc.top) return;
+    HDC hdc = GetDC(h);
+    // [v2.10.34] Pixel probe, first 4 applications: the log names actual
+    // colors pre/post blend, so the field verdict no longer needs guessing
+    // (2.10.33's one-shot proved the wash paints but not WHAT it produces).
+    {
+        static int s_probe = 0;
+        if (s_probe < 4) {
+            s_probe++;
+            int my = (rc.top + rc.bottom) / 2;
+            COLORREF pre1 = GetPixel(hdc, 2, my);
+            COLORREF pre2 = GetPixel(hdc, (rc.right - rc.left) / 2, my);
+            DiagLog(L"[DIM] #%d hwnd=%p rect=%dx%d pre=(%02X,%02X,%02X)mid=(%02X,%02X,%02X)",
+                    s_probe, (void*)h, (int)(rc.right - rc.left),
+                    (int)(rc.bottom - rc.top), (int)GetRValue(pre1),
+                    (int)GetGValue(pre1), (int)GetBValue(pre1),
+                    (int)GetRValue(pre2), (int)GetGValue(pre2),
+                    (int)GetBValue(pre2));
+        }
+    }
+    // 1x1 top-down 32bpp DIB, premultiplied WASH @ 40% alpha, cached.
+    // Wash color = the palette's window background (Doc: "the exact color
+    // of the window background #202020 at 40% opacity"): over the bg the
+    // blend is a color onto itself = invisible, so only the lighter slider
+    // pixels darken — no rectangle around the trackbar.
+    // NOTE: the wash DC is cached once; if the theme flips while the
+    // window is open the palette changes but ApplyUiPalette should reset
+    // s_wash (brush-recreation law).
+    static HDC s_src = nullptr;
+    static COLORREF s_wash = 0xFFFFFFFF;  // invalid -> build on first use
+    if (!s_src || s_wash != g_pal.bg) {
+        if (s_src) { DeleteDC(s_src); s_src = nullptr; }
+        BITMAPINFO bi = {};
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = 1;
+        bi.bmiHeader.biHeight = -1;  // top-down
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        void* bits = nullptr;
+        HBITMAP bm = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits,
+                                      nullptr, 0);
+        if (bm) {
+            // [v2.10.34] PREMULTIPLIED is load-bearing: AlphaBlend's
+            // AC_SRC_ALPHA math is dst' = src + dst*(1-a/255) — storing
+            // full-brightness RGB made #202020 blend to #333 (Doc's "gray
+            // rectangle LIGHTER than the background" on main). RGB must
+            // already carry the 40% factor.
+            const int A = 102;  // 40%
+            BYTE* p = (BYTE*)bits;  // B,G,R,A
+            p[0] = (BYTE)(GetBValue(g_pal.bg) * A / 255);
+            p[1] = (BYTE)(GetGValue(g_pal.bg) * A / 255);
+            p[2] = (BYTE)(GetRValue(g_pal.bg) * A / 255);
+            p[3] = (BYTE)A;
+            s_src = CreateCompatibleDC(hdc);
+            SelectObject(s_src, bm);
+            DeleteObject(bm);  // DC keeps the selection alive
+            s_wash = g_pal.bg;
+        }
+    }
+    if (s_src) {
+        if (AlphaBlendFn ab = GetAlphaBlend()) {
+            BLENDFUNCTION bf = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+            ab(hdc, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
+               s_src, 0, 0, 1, 1, bf);
+            // [v2.10.34] post-blend sample: the expected result over a bg
+            // pixel is UNCHANGED #202020; over the channel it darkens.
+            static int s_probe2 = 0;
+            if (s_probe2 < 4) {
+                s_probe2++;
+                int my = (rc.top + rc.bottom) / 2;
+                COLORREF post1 = GetPixel(hdc, 2, my);
+                COLORREF post2 = GetPixel(hdc, (rc.right - rc.left) / 2, my);
+                DiagLog(L"[DIM] post=(%02X,%02X,%02X)mid=(%02X,%02X,%02X)",
+                        (int)GetRValue(post1), (int)GetGValue(post1),
+                        (int)GetBValue(post1), (int)GetRValue(post2),
+                        (int)GetGValue(post2), (int)GetBValue(post2));
+            }
+        }
+    }
+    ReleaseDC(h, hdc);
+}
+
 static void ReverseWheel(HWND hwnd, bool sidebar = false) {
     SetWindowSubclass(hwnd, WheelReverseProc, 1, sidebar ? 1 : 0);
 }
@@ -13874,7 +14632,37 @@ static LRESULT CALLBACK TrackbarWheelProc(HWND hwnd, UINT msg,
                      lParam);
         return 0;
     }
-    return DefSubclassProc(hwnd, msg, wParam, lParam);
+    if (msg == WM_ERASEBKGND) {
+        // [v2.10.33] A THEMED trackbar ignores the CTLCOLORSTATIC brush and
+        // paints its own background part — on main that dark gray is
+        // LIGHTER than the pane bg (the wash only partially darkened it,
+        // still lighter than the background), and in the light-theme VM it
+        // matches the palette bg so closely that the bg-colored wash was
+        // INVISIBLE ("no difference"). Own the erase like the checkbox case:
+        // fill with the palette bg, so the disabled-dim wash blends onto its
+        // own color over the background and darkens only channel/thumb —
+        // self-masking by construction on any theme.
+        HDC hdc = (HDC)wParam;
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        FillRect(hdc, &rc, g_brushBg);
+        return 1;
+    }
+    if (msg == WM_ENABLE) {
+        // [v2.10.32] Enable-state flips don't reliably requeue a paint on
+        // every machine (VM verdict: dim never appeared). Force a SYNCHRONOUS
+        // repaint on both directions; WM_PAINT then runs the dim (or clears
+        // it by simply repainting enabled).
+        LRESULT r = DefSubclassProc(hwnd, msg, wParam, lParam);
+        RedrawWindow(hwnd, nullptr, nullptr,
+                     RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN |
+                         RDW_UPDATENOW);
+        if (!wParam) DimSliderIfDisabled(hwnd);
+        return r;
+    }
+    LRESULT r = DefSubclassProc(hwnd, msg, wParam, lParam);
+    if (msg == WM_PAINT) DimSliderIfDisabled(hwnd);
+    return r;
 }
 
 static void RouteTrackbarWheel(HWND hwnd) {
@@ -13932,6 +14720,18 @@ static void LayoutRows(HWND hwnd) {
         }
         int y = margin + i * rowH + extras[s] - scroll;
         row.lastY = y;
+
+        // [v2.10.35] Hint rows are label-only: full content width, then out
+        // of the control grid. afterGroup/extras are already consumed above,
+        // so the group rhythm stays intact.
+        if (row.spec->kind == Kind::Hint) {
+            if (row.label)
+                MoveWindow(row.label, margin + MulDiv(12, dpi, 96), y,
+                           content.right - content.left -
+                               MulDiv(24, dpi, 96),
+                           rowH, !g_resizing);
+            continue;
+        }
 
         int ctlH = MulDiv(row.spec->kind == Kind::Slider ? 28 : 24, dpi, 96);
         int ctlY = y + (rowH - ctlH) / 2;
@@ -14140,6 +14940,7 @@ static void CtlLog(const wchar_t* fmt, ...) {
     va_start(a, fmt);
     vswprintf(buf, 512, fmt, a);
     va_end(a);
+    if (!g_debugFileLogOn.load(std::memory_order_relaxed)) return;
     std::wstring dir = GetCfgDir();
     if (dir.empty()) return;
     CreateDirectoryW(dir.c_str(), nullptr);
@@ -14196,6 +14997,8 @@ static std::wstring GetCtlValueText(const Row& row) {
             GetWindowTextW(row.ctl, hex, 32);
             return hex;
         }
+        case Kind::Hint:
+            break;
     }
     return L"";
 }
@@ -14239,6 +15042,8 @@ static void SetCtlFromValue(Row& row, const std::wstring& val) {
         }
         case Kind::Color:
             SetWindowTextW(row.ctl, val.c_str());
+            break;
+        case Kind::Hint:
             break;
     }
 }
@@ -14291,8 +15096,45 @@ static void ApplyGroupEnableStates() {
             EnableWindow(r->ctl, on);
             if (r->value) EnableWindow(r->value, on);
             if (r->spin) EnableWindow(r->spin, on);
-            if (r->label) EnableWindow(r->label, on);
+            // [v2.10.32] Synchronous repaint on enable-state flips: the
+            // disabled-slider dim is painted after the native WM_PAINT, and
+            // some machines (VM) never requeued that paint — sliders looked
+            // identical enabled vs disabled. RDW_UPDATENOW makes the paint
+            // (and thus the dim) deterministic.
+            RedrawWindow(r->ctl, nullptr, nullptr,
+                         RDW_INVALIDATE | RDW_ERASE | RDW_FRAME |
+                             RDW_ALLCHILDREN | RDW_UPDATENOW);
+            if (r->label) {
+                // [v2.10.26] A disabled STATIC paints its text via DrawState
+                // emboss (the white shadow). Labels stay ENABLED and dim by
+                // the abtDim prop -> kColDim in CTLCOLORSTATIC instead.
+                if (on)
+                    RemovePropW(r->label, L"abtDim");
+                else
+                    SetPropW(r->label, L"abtDim", (HANDLE)1);
+                InvalidateRect(r->label, nullptr, TRUE);
+            }
         }
+    }
+    RefreshSquareFrames();
+}
+
+// [v2.10.26] Frame/NC repaint sweep: the subclass NCPAINT only fires when
+// Windows thinks the frame is invalid — at creation (FRAMECHANGED arrives
+// before some children are shown), on group disable, and on pane switches
+// it often doesn't, leaving edits borderless with a stale top band until a
+// hover heals them (VM verdict). Force the frame redraw.
+static void RefreshSquareFrames() {
+    for (HWND p : g_panes) {
+        if (!p) continue;
+        EnumChildWindows(
+            p,
+            [](HWND h, LPARAM) -> BOOL {
+                RedrawWindow(h, nullptr, nullptr,
+                             RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW);
+                return TRUE;
+            },
+            0);
     }
 }
 
@@ -14434,6 +15276,16 @@ static LRESULT CALLBACK PaneProc(HWND hwnd, UINT msg, WPARAM wParam,
         case WM_DRAWITEM:
         case WM_MEASUREITEM:
         case WM_NOTIFY:
+        // v2.10.17: the five CtlColor messages MUST forward too — the dark
+        // theme handlers live in SettingsWndProc, and every row control's
+        // parent is the PANE, not the settings window. Without forwarding,
+        // DefWindowProc answered rows with the system LIGHT brush: white
+        // labels/edits/sliders/checkbox bgs (field-reported in the 1.7.3 VM).
+        case WM_CTLCOLORSTATIC:
+        case WM_CTLCOLOREDIT:
+        case WM_CTLCOLORLISTBOX:
+        case WM_CTLCOLORBTN:
+        case WM_CTLCOLORSCROLLBAR:
             return SendMessageW(GetParent(hwnd), msg, wParam, lParam);
         case WM_VSCROLL: {
             SCROLLINFO si = {sizeof(si), SIF_ALL};
@@ -14543,7 +15395,7 @@ static void RegisterPaneClass() {
     done = true;
     WNDCLASSW wc = {};
     wc.lpfnWndProc = PaneProc;
-    wc.hInstance = GetModuleHandle(nullptr);
+    wc.hInstance = GetModHInstance();
     wc.hbrBackground = nullptr;
     wc.lpszClassName = L"AbTenebrisControl_Pane";
     RegisterClassW(&wc);
@@ -14555,7 +15407,7 @@ static void BuildSectionPanes(HWND parent, const RECT& content) {
     int rowH = MulDiv(36, dpi, 96);
     int labelW = MulDiv(210, dpi, 96);
     int margin = MulDiv(12, dpi, 96);
-    HINSTANCE hInst = GetModuleHandle(nullptr);
+    HINSTANCE hInst = GetModHInstance();
 
     g_rows.clear();
     for (int s = 0; s < SEC_COUNT; s++) g_panes[s] = nullptr;
@@ -14582,7 +15434,10 @@ static void BuildSectionPanes(HWND parent, const RECT& content) {
                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                     0, 0, 0, 0, g_panes[spec.section],
                     (HMENU)(INT_PTR)(5000 + gi), hInst, nullptr);
-                SendMessageW(g_groupTitle[gi], WM_SETFONT, (WPARAM)g_font,
+                SendMessageW(g_groupTitle[gi], WM_SETFONT,
+                             (WPARAM)(TextHasEmoji(kGroups[gi].titleText)
+                                          ? g_fontEmoji
+                                          : g_font),
                              TRUE);
                 Darkize(g_groupTitle[gi]);
             }
@@ -14601,9 +15456,19 @@ static void BuildSectionPanes(HWND parent, const RECT& content) {
         // Checkboxes carry their OWN text — no separate label STATIC. Only
         // non-checkbox rows get the label column. Labels span the full row
         // height (SS_CENTERIMAGE) so descenders never clip.
-        bool isBat = wcsstr(spec.key, L"batSignal") != nullptr;
+        bool isBat = wcsstr(spec.key, L"bat") != nullptr;
         HWND label = nullptr;
-        if (spec.kind != Kind::Chk) {
+        if (spec.kind == Kind::Hint) {
+            // [v2.10.35] Full-width explanatory line (Doc: the threshold
+            // slider's name doesn't say what it does). abtDim prop -> dim
+            // text via the root CTLCOLORSTATIC; no control.
+            label = CreateWindowExW(
+                0, L"STATIC", spec.label,
+                WS_CHILD | WS_VISIBLE, x, y, content.right - content.left,
+                rowH, pane, nullptr, hInst, nullptr);
+            SetPropW(label, L"abtDim", (HANDLE)1);
+            SendMessageW(label, WM_SETFONT, (WPARAM)g_font, TRUE);
+        } else if (spec.kind != Kind::Chk) {
             label = CreateWindowExW(
                 0, L"STATIC", spec.label,
                 WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, x, y, labelW, rowH,
@@ -14627,6 +15492,9 @@ static void BuildSectionPanes(HWND parent, const RECT& content) {
                     y + (rowH - ctlH) / 2, labelW + ctlW, ctlH, pane,
                     (HMENU)(INT_PTR)(2000 + (int)g_rows.size()), hInst, nullptr);
                 break;
+            case Kind::Hint:
+                ctl = nullptr;
+                break;
             case Kind::Slider:
                 ctl = CreateWindowExW(0, TRACKBAR_CLASSW, nullptr,
                                       style | WS_TABSTOP | TBS_HORZ |
@@ -14640,25 +15508,49 @@ static void BuildSectionPanes(HWND parent, const RECT& content) {
                              MAKELPARAM(spec.minV, spec.maxV));
                 RouteTrackbarWheel(ctl);
                 break;
-            case Kind::Combo:
+            case Kind::Combo: {
+                // [v2.10.22/24] OWNER-DRAW combo: the closed combo (face,
+                // border, chevron) is themed-paint that ignores DarkMode_*
+                // on a class of machines (1.7.3 VM, Eric99) even with the
+                // full opt-in chain applied. We own every pixel: closed
+                // face painted by ComboPaintProc (WM_PAINT intercept), list
+                // items via WM_DRAWITEM, all palette-driven. CBS_HASSTRINGS
+                // keeps GetWindowText = selected display text.
                 ctl = CreateWindowExW(0, L"COMBOBOX", nullptr,
-                                      style | WS_TABSTOP | CBS_DROPDOWNLIST,
+                                      style | WS_TABSTOP | CBS_DROPDOWNLIST |
+                                          CBS_OWNERDRAWFIXED | CBS_HASSTRINGS,
                                       cx, y, MulDiv(220, dpi, 96),
                                       MulDiv(300, dpi, 96), pane,
                                       (HMENU)(INT_PTR)(2000 + (int)g_rows.size()),
                                       hInst, nullptr);
+                SubclassComboPaint(ctl);
+                // [v2.10.27] Dropdown entries get their own height (packed
+                // at the closed-face height — Doc). CB_SETITEMHEIGHT(0, h)
+                // retunes the LIST rows only; the closed field keeps
+                // MEASUREITEM's 17 raw.
+                SendMessageW(ctl, CB_SETITEMHEIGHT, 0, MulDiv(24, dpi, 96));
+                // The hidden dropdown listbox (ComboLBox) draws its own
+                // themed edge — the field-reported white/blue menu border.
+                // Same square-border treatment, list mode (no text shave).
+                COMBOBOXINFO cbi = {sizeof(cbi)};
+                if (SendMessageW(ctl, CB_GETCOMBOBOXINFO, 0,
+                                 (LPARAM)&cbi) &&
+                    cbi.hwndList)
+                    SubclassSquareBorder(cbi.hwndList, false);
                 for (int i = 0; i < spec.optionCount; i++)
                     SendMessageW(ctl, CB_ADDSTRING, 0,
                                  (LPARAM)(spec.displayNames
                                               ? spec.displayNames[i]
                                               : spec.options[i]));
                 break;
+            }
             case Kind::Color:
                 ctl = CreateWindowExW(
-                    WS_EX_CLIENTEDGE, L"EDIT", nullptr,
+                    0, L"EDIT", nullptr,
                     style | WS_TABSTOP | ES_AUTOHSCROLL, cx, y,
                     MulDiv(110, dpi, 96), ctlH, pane,
                     (HMENU)(INT_PTR)(2000 + (int)g_rows.size()), hInst, nullptr);
+                SubclassSquareBorder(ctl, true);
                 row.swatch = CreateWindowExW(
                     0, L"BUTTON", nullptr,
                     style | BS_OWNERDRAW, cx + MulDiv(116, dpi, 96),
@@ -14688,18 +15580,19 @@ static void BuildSectionPanes(HWND parent, const RECT& content) {
         }
         row.ctl = ctl;
         SendMessageW(ctl, WM_SETFONT, (WPARAM)g_font, TRUE);
-        Darkize(ctl);
+        Darkize(ctl, spec.kind == Kind::Combo);
         if (isBat) SendMessageW(ctl, WM_SETFONT, (WPARAM)g_fontEmoji, TRUE);
 
         if (spec.kind == Kind::Slider) {
             // Numeric edit next to the slider, two-way synced (id 3000+idx).
             row.value = CreateWindowExW(
-                WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE |
+                0, L"EDIT", L"", WS_CHILD | WS_VISIBLE |
                                                   WS_TABSTOP | ES_NUMBER,
                 cx + ctlW - MulDiv(70, dpi, 96), y + MulDiv(4, dpi, 96),
                 MulDiv(66, dpi, 96), MulDiv(24, dpi, 96), pane,
                 (HMENU)(INT_PTR)(3000 + (int)g_rows.size()), hInst, nullptr);
             SendMessageW(row.value, WM_SETFONT, (WPARAM)g_font, TRUE);
+            SubclassSquareBorder(row.value, true);
             Darkize(row.value);
             // Native up-down spinner — placed BY HAND in LayoutRows at the
             // value edit's right edge (UDS_ALIGNRIGHT auto-dock didn't track
@@ -14712,6 +15605,8 @@ static void BuildSectionPanes(HWND parent, const RECT& content) {
                 0, 0, 0, 0, pane,
                 (HMENU)(INT_PTR)(4000 + (int)g_rows.size()), hInst, nullptr);
             SendMessageW(row.spin, UDM_SETRANGE32, spec.minV, spec.maxV);
+            SubclassSpinPaint(row.spin);
+            Darkize(row.spin);
         }
 
         g_rows.push_back(row);
@@ -14728,7 +15623,7 @@ static void BuildSectionPanes(HWND parent, const RECT& content) {
 static void RefreshProfileList(HWND parent) {}
 
 static void BuildProfilesPane(HWND parent, const RECT& content) {
-    HINSTANCE hInst = GetModuleHandle(nullptr);
+    HINSTANCE hInst = GetModHInstance();
     // Docked INSIDE the General tab, below its rows (Doc: no Profiles
     // section; the widgets live under General's own rows).
     int dpi = GetDpiForWindow(parent);
@@ -14750,7 +15645,7 @@ static void BuildProfilesPane(HWND parent, const RECT& content) {
         0, L"STATIC",
         L"A profile is a named snapshot of all settings.\n"
         L"Loading one applies it live — the engine picks it up instantly.",
-        WS_CHILD | WS_VISIBLE | WS_DISABLED, m, m,
+        WS_CHILD | WS_VISIBLE, m, m,
         content.right - content.left - 2 * m,
         MulDiv(36, dpi, 96), pane, nullptr, hInst, nullptr);
     SendMessageW(hint, WM_SETFONT, (WPARAM)g_font, TRUE);
@@ -14762,19 +15657,23 @@ static void BuildProfilesPane(HWND parent, const RECT& content) {
         content.right - content.left - 2 * m, MulDiv(18, dpi, 96), pane,
         nullptr, hInst, nullptr);
     SendMessageW(avail, WM_SETFONT, (WPARAM)g_font, TRUE);
+    // Disabled text = DrawState emboss (white shadow, VM verdict). Dim
+    // statics stay ENABLED and carry the abtDim prop -> kColDim instead.
+    SetPropW(hint, L"abtDim", (HANDLE)1);
 
-    // Profile selector: editable combo (CBS_DROPDOWN = built-in edit box,
-    // no custom widget needed) - DISABLED placeholder until the profiles
-    // infrastructure lands.
+    // Profile selector: [v2.10.24] readonly EDIT (was a CBS_DROPDOWN combo
+    // — a disabled combo still renders its themed button + edge, white on
+    // the stubborn machines). Edit-only placeholder, same square border.
     int rowY = MulDiv(96, dpi, 96);  // well below hint + NOT-AVAILABLE banner
     HWND name = CreateWindowExW(
-        WS_EX_CLIENTEDGE, L"COMBOBOX", L"NOT AVAILABLE",
-        WS_CHILD | WS_VISIBLE | CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_DISABLED,
-        m, rowY, MulDiv(220, dpi, 96), MulDiv(120, dpi, 96), pane,
+        0, L"EDIT", L"NOT AVAILABLE",
+        WS_CHILD | WS_VISIBLE | ES_READONLY,
+        m, rowY, MulDiv(220, dpi, 96), MulDiv(24, dpi, 96), pane,
         (HMENU)(INT_PTR)ID_PROFILE_NAME, hInst, nullptr);
     SendMessageW(name, WM_SETFONT, (WPARAM)g_font, TRUE);
+    SubclassSquareBorder(name, true);
     Darkize(name);
-    EnableWindow(name, FALSE);
+    SetPropW(name, L"abtDim", (HANDLE)1);
 
     struct Btn {
         int id;
@@ -14805,7 +15704,7 @@ static void BuildProfilesPane(HWND parent, const RECT& content) {
 }
 
 static void BuildDiagnosticsPane(HWND parent, const RECT& content) {
-    HINSTANCE hInst = GetModuleHandle(nullptr);
+    HINSTANCE hInst = GetModHInstance();
     HWND pane = CreateWindowExW(0, L"AbTenebrisControl_Pane", nullptr,
                                 WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
                                 content.left, content.top,
@@ -14825,7 +15724,7 @@ static void BuildDiagnosticsPane(HWND parent, const RECT& content) {
 
     // Readonly edit = selectable/copyable path field.
     std::wstring cfg = GetCfgPath();
-    HWND path = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", cfg.c_str(),
+    HWND path = CreateWindowExW(0, L"EDIT", cfg.c_str(),
                                 WS_CHILD | WS_VISIBLE | ES_READONLY |
                                     ES_AUTOHSCROLL,
                                 m, m + MulDiv(28, dpi, 96),
@@ -14833,6 +15732,7 @@ static void BuildDiagnosticsPane(HWND parent, const RECT& content) {
                                 MulDiv(24, dpi, 96), pane, nullptr, hInst,
                                 nullptr);
     SendMessageW(path, WM_SETFONT, (WPARAM)g_font, TRUE);
+    SubclassSquareBorder(path, true);
     Darkize(path);
 
     HWND info = CreateWindowExW(
@@ -14956,7 +15856,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                                         LPARAM lParam) {
     switch (msg) {
         case WM_CREATE: {
-            HINSTANCE hInst = GetModuleHandle(nullptr);
+            HINSTANCE hInst = GetModHInstance();
             int dpi = GetDpiForWindow(hwnd);
             RECT rc;
             GetClientRect(hwnd, &rc);
@@ -15125,8 +16025,55 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             }
             break;
         }
+        case WM_MEASUREITEM: {
+            // [v2.10.22] Owner-draw combo items: match the row control
+            // height (24 raw, same as every other non-slider control).
+            MEASUREITEMSTRUCT* mi = (MEASUREITEMSTRUCT*)lParam;
+            if (mi->CtlType == ODT_COMBOBOX) {
+                // [v2.10.25] 24 raw made the closed combo ~38px at 125%
+                // (item height drives the closed height on ownerdraw
+                // combos). 17 raw lands at Doc's ~28px.
+                mi->itemHeight = (UINT)MulDiv(17, GetDpiForWindow(hwnd), 96);
+                return TRUE;
+            }
+            break;
+        }
         case WM_DRAWITEM: {
             DRAWITEMSTRUCT* di = (DRAWITEMSTRUCT*)lParam;
+            if (di->CtlType == ODT_COMBOBOX) {
+                // [v2.10.24] LIST ITEMS ONLY. Ground-truth fact learned in
+                // the field: for ODT_COMBOBOX the DRAWITEMSTRUCT's
+                // hwndItem is ALWAYS the combo handle — closed face AND
+                // list items — so no handle check can tell them apart.
+                // It doesn't need to: the closed face is painted by the
+                // ComboPaintProc WM_PAINT intercept now, and the combo's
+                // own paint (which would send the closed-face DRAWITEM)
+                // never runs. Anything arriving here is a dropdown entry:
+                // fill + text in the UI font, no chevron, no frame.
+                HDC hdc = di->hDC;
+                bool sel = (di->itemState & ODS_SELECTED) != 0;
+                FillRect(hdc, &di->rcItem,
+                         sel ? g_brushHover : g_brushInput);
+                if (di->itemID != (UINT)-1) {
+                    wchar_t txt[256] = {};
+                    SendMessageW(di->hwndItem, CB_GETLBTEXT, di->itemID,
+                                 (LPARAM)txt);
+                    int dpi2 = GetDpiForWindow(di->hwndItem);
+                    SetBkMode(hdc, TRANSPARENT);
+                    bool dis = (di->itemState & ODS_DISABLED) != 0 ||
+                               !IsWindowEnabled(di->hwndItem);
+                    SetTextColor(hdc, dis ? kColDisabled : kColText);
+                    HFONT oldF = (HFONT)SelectObject(
+                        hdc, TextHasEmoji(txt) ? g_fontEmoji : g_font);
+                    RECT rc = di->rcItem;
+                    rc.left += MulDiv(8, dpi2, 96);
+                    DrawTextW(hdc, txt, -1, &rc,
+                              DT_LEFT | DT_VCENTER | DT_SINGLELINE |
+                                  DT_NOPREFIX | DT_END_ELLIPSIS);
+                    SelectObject(hdc, oldF);
+                }
+                return TRUE;
+            }
             if (di->CtlType == ODT_BUTTON && di->CtlID == ID_COLOR_SWATCH) {
                 // Swatch = the EFFECTIVE tint color: preset table color, or
                 // the picked hex when the combo is on Custom.
@@ -15134,7 +16081,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                     if (r.swatch != di->hwndItem) continue;
                     wchar_t sel[32] = {};
                     GetWindowTextW(r.ctl, sel, 32);  // combo text = display
-                    COLORREF col = RGB(40, 40, 40);
+                    COLORREF col = kColInputBg;
                     bool found = false;
                     for (const TintPresetColor& p : kTintPresetColors) {
                         if (wcscmp(sel, p.name) == 0) {
@@ -15166,10 +16113,13 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             }
             if (di->CtlType == ODT_BUTTON && di->CtlID == ID_TINT_PICK) {
                 // Color-picker icon: Segoe MDL2 Assets "Color" glyph E790
-                // (system font - nothing shipped with the mod).
+                // (system font - nothing shipped with the mod). Fill the
+                // button bg FIRST: an unfilled owner-draw button shows the
+                // class's system white behind the glyph.
+                FillRect(di->hDC, &di->rcItem, g_brushInput);
                 HFONT old = (HFONT)SelectObject(di->hDC, g_fontMdl2);
                 SetBkMode(di->hDC, TRANSPARENT);
-                SetTextColor(di->hDC, RGB(220, 220, 220));
+                SetTextColor(di->hDC, kColGlyph);
                 DrawTextW(di->hDC, L"", 1, &di->rcItem,
                           DT_CENTER | DT_VCENTER | DT_SINGLELINE);
                 SelectObject(di->hDC, old);
@@ -15188,8 +16138,9 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                 wchar_t btext[64] = {};
                 GetWindowTextW(di->hwndItem, btext, 64);
                 SetBkMode(hdc, TRANSPARENT);
-                SetTextColor(hdc, disabled ? RGB(150, 150, 150) : kColText);
-                HFONT oldF = (HFONT)SelectObject(hdc, g_font);
+                SetTextColor(hdc, disabled ? kColDisabled : kColText);
+                HFONT oldF = (HFONT)SelectObject(
+                    hdc, TextHasEmoji(btext) ? g_fontEmoji : g_font);
                 DrawTextW(hdc, btext, -1, &rcB,
                           DT_CENTER | DT_VCENTER | DT_SINGLELINE);
                 SelectObject(hdc, oldF);
@@ -15235,14 +16186,14 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                                 full.right - MulDiv(14, dpi2, 96),
                                 0};
                     box.bottom = box.top + MulDiv(16, dpi2, 96);
-                    HBRUSH boxFill = CreateSolidBrush(RGB(24, 24, 24));
+                    HBRUSH boxFill = CreateSolidBrush(kColBoxFill);
                     FillRect(di->hDC, &box, boxFill);
                     FrameRect(di->hDC, &box, g_brushStroke);
                     DeleteObject(boxFill);
                     if (SidebarToggleOn(t)) {
                         // Check mark: two accent lines.
                         HPEN pen = CreatePen(PS_SOLID, MulDiv(2, dpi2, 96),
-                                             RGB(120, 220, 120));
+                                             kColCheck);
                         HPEN oldPen = (HPEN)SelectObject(di->hDC, pen);
                         int cx1 = box.left + MulDiv(3, dpi2, 96);
                         int cy = box.top + MulDiv(8, dpi2, 96);
@@ -15264,12 +16215,55 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam,
         case WM_CTLCOLORBTN: {
             // Checkboxes paint their themed (lighter) background across their
             // full control width — which IS the whole row. Return the window
-            // brush so no banding strips appear behind checkbox rows.
+            // brush so no banding strips appear behind checkbox rows, and
+            // set the text explicitly: the checkbox draws its own label, and
+            // an unset text color reads as black-on-dark or white-on-white
+            // depending on the host's defaults.
+            HDC hdc = (HDC)wParam;
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, kColText);
             return (LRESULT)g_brushBg;
+        }
+        case WM_CTLCOLOREDIT: {
+            // [v2.10.23] GAP FOUND: this case never existed — editable
+            // interiors and their text color fell to DefWindowProc, which
+            // resolves through the MACHINE's theme state (light-app
+            // machines: white interior, theme-black text, white themed
+            // hover — the exact VM/Eric99 symptom set). Every editable
+            // control gets the input fill + palette text now.
+            HDC hdc = (HDC)wParam;
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, kColText);
+            SetBkColor(hdc, kColInputBg);
+            return (LRESULT)g_brushInput;
         }
         case WM_CTLCOLORSTATIC: {
             HDC hdc = (HDC)wParam;
             HWND ctl = (HWND)lParam;
+            // Readonly edits (diagnostics path field) send CTLCOLORSTATIC
+            // but are editable ZONES — give them the input fill so they
+            // read as fields, not labels.
+            {
+                wchar_t cls2[32] = {};
+                GetClassNameW(ctl, cls2, 32);
+                if (wcscmp(cls2, L"Edit") == 0) {
+                    // Any EDIT-class control in its static phase (readonly,
+                    // disabled) paints the input fill — NOT the window bg,
+                    // or the centered top band mismatches.
+                    SetBkMode(hdc, TRANSPARENT);
+                    SetTextColor(hdc,
+                                 GetPropW(ctl, L"abtDim") ? kColDim
+                                                          : kColText);
+                    SetBkColor(hdc, kColInputBg);
+                    return (LRESULT)g_brushInput;
+                }
+            }
+            if (GetPropW(ctl, L"abtDim")) {
+                SetBkMode(hdc, TRANSPARENT);
+                SetTextColor(hdc, kColDim);
+                SetBkColor(hdc, kColBg);
+                return (LRESULT)g_brushBg;
+            }
             if (ctl == g_sidebar) {
                 SetBkColor(hdc, kColSidebar);
                 SetTextColor(hdc, kColText);
@@ -15658,9 +16652,15 @@ static void OpenSettingsWindow() {
         return;
     }
 
+    // [v2.10.21] Palette follows the Windows app theme at every open —
+    // the theme may have flipped since UI init (or since the last open).
+    ApplyUiPalette();
+    DestroyUiBrushes();
+    CreateUiBrushes();
+
     WNDCLASSW wc = {};
     wc.lpfnWndProc = SettingsWndProc;
-    wc.hInstance = GetModuleHandle(nullptr);
+    wc.hInstance = GetModHInstance();
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hIcon = g_trayIcon ? g_trayIcon
                           : LoadIcon(nullptr, IDI_APPLICATION);
@@ -15684,6 +16684,14 @@ static void OpenSettingsWindow() {
         x, y, wndW, wndH,
                                     nullptr, nullptr, wc.hInstance, nullptr);
     if (!g_settingsWnd) return;
+
+    // [v2.10.18] The settings window opts into dark uxtheme mode too —
+    // themed parts of the frame and children only fully honor DarkMode_*
+    // after this per-window opt-in (see ResolveDarkModeApi above).
+    ResolveDarkModeApi();
+    if (pfnAllowDarkModeForWindow)
+        DiagLog(L"[THEME] settings window allow-dark=%d",
+                (int)pfnAllowDarkModeForWindow(g_settingsWnd, TRUE));
 
     // [v2.10.8] Per-window icons via WM_SETICON, not the class: the class
     // hIcon is registered once per process (later registrations fail
@@ -15902,6 +16910,13 @@ static bool AddTrayIcon(HWND hwnd, const wchar_t* reason) {
                              : (HICON)LoadImage(nullptr, IDI_APPLICATION,
                                                 IMAGE_ICON, 0, 0, LR_SHARED);
     wcscpy_s(g_nid.szTip, L"Ab Tenebris");
+    // [v2.10.22] Re-adds are idempotent: when the icon is already
+    // registered, NIM_ADD fails AND flips g_trayAdded false, which then
+    // lets the 5s retry timer re-fire forever (each retry failing against
+    // the still-registered icon — reload-race log spam, live-caught).
+    // Clear the old slot first so a re-add is a clean DELETE+ADD.
+    if (g_trayAdded.exchange(false))
+        Shell_NotifyIconW(NIM_DELETE, &g_nid);
     g_trayAdded = Shell_NotifyIconW(NIM_ADD, &g_nid) != FALSE;
     // Log every attempt: the boot-race failure (2026-11-09) was silent.
     CtlLog(L"[TRAY] add (%s) ok=%d pid=%lu", reason, (int)g_trayAdded.load(),
@@ -16075,20 +17090,14 @@ static DWORD WINAPI UIThreadProc(void*) {
     g_font = MakePtFont(10, false);
     g_fontBold = MakePtFont(10, true);
     // 🦇 rows need emoji fallback — Segoe UI alone renders tofu boxes.
-    g_fontEmoji = MakePtFont(10, false, L"Segoe UI Emoji");
+    g_fontEmoji = MakePtFont(12, false, L"Segoe UI Emoji");
     g_fontMdl2 = MakePtFont(12, false, L"Segoe MDL2 Assets");
-    g_brushBg = CreateSolidBrush(kColBg);
-    g_brushSidebar = CreateSolidBrush(kColSidebar);
-    g_brushSidebarHover = CreateSolidBrush(RGB(44, 44, 44));
-    g_brushInput = CreateSolidBrush(kColInputBg);
-    g_brushAccent = CreateSolidBrush(kColAccent);
-    g_brushStroke = CreateSolidBrush(RGB(58, 58, 58));
-    g_brushHover = CreateSolidBrush(RGB(58, 58, 58));
-    g_brushThumb = CreateSolidBrush(RGB(150, 150, 150));
+    ApplyUiPalette();
+    CreateUiBrushes();
 
     WNDCLASSW wc = {};
     wc.lpfnWndProc = MsgWndProc;
-    wc.hInstance = GetModuleHandle(nullptr);
+    wc.hInstance = GetModHInstance();
     wc.lpszClassName = kMessageClassName;
     RegisterClassW(&wc);
 
@@ -16123,6 +17132,7 @@ static DWORD WINAPI UIThreadProc(void*) {
     if (g_brushStroke) DeleteObject(g_brushStroke);
     if (g_brushHover) DeleteObject(g_brushHover);
     if (g_brushThumb) DeleteObject(g_brushThumb);
+    if (g_brushSidebarHover) DeleteObject(g_brushSidebarHover);
     if (g_trayIcon) DestroyIcon(g_trayIcon);
     if (SUCCEEDED(hrCom)) CoUninitialize();
     Wh_Log(L"[CTRL] UI thread exit");
@@ -16130,38 +17140,36 @@ static DWORD WINAPI UIThreadProc(void*) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// Tool mod callbacks (run only in the dedicated tool process)
-
-// NON-static on purpose: the 2.x engine recognizes tool mods by exported
-// symbols (mangled _Z14WhTool_ModInitv or the windhawk_tool_mod.h marker).
-// Static linkage = invisible to the service = we self-host forever.
+// Control UI callbacks (v2.11.0: run inside the desktop-owner explorer
+// process, started from BootstrapThreadInner once desktop ownership is
+// confirmed. WhTool_ModInit keeps its exported name for history.)
 bool WhTool_ModInit() {
     g_ctrlUnloading = false;
+    {
+        std::wstring dir = GetCfgDir();
+        if (!dir.empty())
+            RotateLogAtBoot((dir + L"\\control_log.txt").c_str(), 5ull * 1024 * 1024);
+    }
     HANDLE thread =
         CreateThread(nullptr, 0, UIThreadProc, nullptr, 0, &g_uiThreadId);
     if (!thread) {
-        Wh_Log(L"[CTRL] failed to start UI thread");
+        Wh_Log(L"[CTRL] failed to start control UI thread");
+        CtlLog(L"[CTRL] failed to start control UI thread");
+        DiagLog(L"[CTRL] failed to start control UI thread");
         return false;
     }
     CloseHandle(thread);
-    Wh_Log(L"[CTRL] tool mod init, uiThreadId=%u", g_uiThreadId);
+    Wh_Log(L"[CTRL] control UI init, uiThreadId=%u", g_uiThreadId);
+    CtlLog(L"[CTRL] control UI init, uiThreadId=%u", g_uiThreadId);
+    DiagLog(L"[CTRL] control UI init, uiThreadId=%u", g_uiThreadId);
     return true;
 }
 
 static void WhTool_ModUninit() {
     g_ctrlUnloading = true;
-    // [v2.10.9] Release the single-instance mutex BEFORE teardown, not after:
-    // this reload (2026-11-21) measured the old host holding the mutex ~4s
-    // past the uninit log (UI-thread wait loop + tray remove) while the
-    // service-spawned replacement gave up at its 2s fail-fast and exited -
-    // and failed launches are NOT retried by the service, so the tray died
-    // until the next settings change. A dying host needs no exclusivity
-    // while it cleans up; hand over immediately.
-    if (g_toolModProcessMutex) {
-        ReleaseMutex(g_toolModProcessMutex);
-        CloseHandle(g_toolModProcessMutex);
-        g_toolModProcessMutex = nullptr;
-    }
+    // v2.11.0: runs INSIDE the desktop-owner explorer now — no process to
+    // exit (ExitProcess here would kill the shell), no mutex to hand over
+    // (no other instance exists). Just shut the UI thread down cleanly.
     if (g_uiThreadId) {
         PostThreadMessageW(g_uiThreadId, WM_QUIT, 0, 0);
         for (int i = 0; i < 40; ++i) {
@@ -16170,465 +17178,39 @@ static void WhTool_ModUninit() {
         }
         RemoveTrayIcon();
     }
-    Wh_Log(L"[CTRL] tool mod uninit");
-    // [v2.10.4] End the process ourselves - the official tool-mod contract's
-    // own rule ("the mod ends the process once the mod is uninitialized").
-    // Relying on WM_QUIT alone left zombies alive-after-uninit holding the
-    // single-instance mutex, which starved the service-spawned replacement
-    // host (it waits 2s for the mutex, exits, and per the engine docs a
-    // failed launch is NOT retried until the next settings change).
-    ExitProcess(0);
+    Wh_Log(L"[CTRL] control UI uninit");
 }
 
 static void WhTool_ModSettingsChanged() {
     Wh_Log(L"[CTRL] settings changed (no-op)");
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tool-host plumbing: process classification, spawn, watchdog
-
-static void WINAPI EntryPoint_Hook() {
-    Wh_Log(L">");
-    ExitThread(0);
-}
-
-static void SpawnToolModProcessFrom(const WCHAR* exePath);
-
-static void SpawnToolModProcess() {
-    WCHAR currentProcessPath[MAX_PATH];
-    switch (GetModuleFileName(nullptr, currentProcessPath,
-                              ARRAYSIZE(currentProcessPath))) {
-        case 0:
-        case ARRAYSIZE(currentProcessPath):
-            Wh_Log(L"GetModuleFileName failed");
-            return;
-    }
-    SpawnToolModProcessFrom(currentProcessPath);
-}
-
-// Resolve windhawk.exe for engine-side spawning: the running UI process's
-// image path is authoritative (covers non-standard install locations); the
-// registry uninstall key covers windhawk.exe not running at all.
-static bool GetWindhawkExePath(WCHAR* buf, DWORD cch) {
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap != INVALID_HANDLE_VALUE) {
-        PROCESSENTRY32W pe{};
-        pe.dwSize = sizeof(pe);
-        if (Process32FirstW(snap, &pe)) {
-            do {
-                if (_wcsicmp(pe.szExeFile, L"windhawk.exe") == 0) {
-                    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
-                                           FALSE, pe.th32ProcessID);
-                    if (h) {
-                        DWORD len = cch;
-                        bool ok = QueryFullProcessImageNameW(h, 0, buf, &len) &&
-                                  len > 0;
-                        CloseHandle(h);
-                        if (ok) {
-                            CloseHandle(snap);
-                            return true;
-                        }
-                    }
-                }
-            } while (Process32NextW(snap, &pe));
-        }
-        CloseHandle(snap);
-    }
-    // Fallback: install dir from the uninstall key.
-    WCHAR loc[MAX_PATH];
-    DWORD size = sizeof(loc);
-    if (RegGetValueW(HKEY_LOCAL_MACHINE,
-                     L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\"
-                     L"Windhawk",
-                     L"InstallLocation", RRF_RT_REG_SZ, nullptr, loc,
-                     &size) == ERROR_SUCCESS &&
-        *loc) {
-        WCHAR exePath[MAX_PATH];
-        if (swprintf_s(exePath, L"%s\\windhawk.exe", loc) > 0 &&
-            GetFileAttributesW(exePath) != INVALID_FILE_ATTRIBUTES) {
-            wcscpy_s(buf, cch, exePath);
-            return true;
-        }
-    }
-    return false;
-}
-
-static void SpawnToolModProcessFrom(const WCHAR* exePath) {
-    WCHAR commandLine[MAX_PATH + 2 +
-                      (sizeof(L" -tool-mod \"" WH_MOD_ID "\"") / sizeof(WCHAR)) -
-                      1];
-    swprintf_s(commandLine, L"\"%s\" -tool-mod \"%s\"", exePath,
-               WH_MOD_ID);
-    HMODULE kernelModule = GetModuleHandle(L"kernelbase.dll");
-    if (!kernelModule) {
-        kernelModule = GetModuleHandle(L"kernel32.dll");
-        if (!kernelModule) {
-            Wh_Log(L"No kernelbase.dll/kernel32.dll");
-            return;
-        }
-    }
-
-    using CreateProcessInternalW_t = BOOL(WINAPI*)(
-        HANDLE, LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES,
-        WINBOOL, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION,
-        PHANDLE);
-    CreateProcessInternalW_t pCreateProcessInternalW =
-        (CreateProcessInternalW_t)GetProcAddress(kernelModule,
-                                                 "CreateProcessInternalW");
-    if (!pCreateProcessInternalW) {
-        Wh_Log(L"No CreateProcessInternalW");
-        return;
-    }
-
-    STARTUPINFO si{
-        .cb = sizeof(STARTUPINFO),
-        .dwFlags = STARTF_FORCEOFFFEEDBACK,
-    };
-    PROCESS_INFORMATION pi;
-    if (!pCreateProcessInternalW(nullptr, exePath, commandLine,
-                                 nullptr, nullptr, FALSE, NORMAL_PRIORITY_CLASS,
-                                 nullptr, nullptr, &si, &pi, nullptr)) {
-        Wh_Log(L"CreateProcess failed (%lu)", GetLastError());
-        CtlLog(L"[CTRL] tool host spawn FAILED err=%lu exe='%s'",
-               GetLastError(), exePath);
-        DiagLog(L"[CTRL] tool host spawn FAILED err=%lu exe='%s'",
-                GetLastError(), exePath);
-        return;
-    }
-
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    Wh_Log(L"[CTRL] tool mod process spawned");
-    CtlLog(L"[CTRL] tool host spawned from '%s'", exePath);
-    DiagLog(L"[CTRL] tool host spawned from '%s'", exePath);
-}
-
-// [v2.10.4] Which world are we in? windhawk-mod.exe ships only with
-// Windhawk 2.x, where the SERVICE recognizes tool mods (legacy -tool-mod
-// flag matches) and hosts + respawns them itself in windhawk-mod.exe.
-// On 1.x the file doesn't exist and our own launcher spawn is the
-// documented approach (windhawk wiki "Mods as tools", 1.x snippet).
-// Presence of the file = let the service do the hosting; spawning our own
-// windhawk.exe -tool-mod host on 2.x produced the duplicate-host races.
-static bool IsWindhawk2Install() {
-    WCHAR exePath[MAX_PATH];
-    if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH)) return false;
-    std::wstring dir = exePath;
-    size_t slash = dir.find_last_of(L'\\');
-    if (slash == std::wstring::npos) return false;
-    dir.resize(slash);
-    std::wstring host = dir + L"\\windhawk-mod.exe";
-    if (GetFileAttributesW(host.c_str()) != INVALID_FILE_ATTRIBUTES) return true;
-    // Non-windhawk processes (engine in explorer.exe) would otherwise answer
-    // for THEIR OWN directory — probe the real install dir before concluding
-    // 1.x. (v2.10.13: the engine fallback branch misread our 2.x machine as
-    // 1.x through exactly this hole.)
-    // 1st probe: the running windhawk.exe's own dir (authoritative, covers
-    // non-standard install locations).
-    WCHAR whPath[MAX_PATH];
-    if (GetWindhawkExePath(whPath, ARRAYSIZE(whPath))) {
-        std::wstring wdir = whPath;
-        size_t wslash = wdir.find_last_of(L'\\');
-        if (wslash != std::wstring::npos) {
-            wdir.resize(wslash);
-            std::wstring whost = wdir + L"\\windhawk-mod.exe";
-            if (GetFileAttributesW(whost.c_str()) != INVALID_FILE_ATTRIBUTES)
-                return true;
-        }
-    }
-    // 2nd probe: uninstall key, native view then 32-bit view (the installer
-    // is 32-bit, so a 64-bit process sees the key only via WOW64_32KEY).
-    LPCWSTR kUninst =
-        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Windhawk";
-    WCHAR loc[MAX_PATH];
-    DWORD size = sizeof(loc);
-    if (RegGetValueW(HKEY_LOCAL_MACHINE, kUninst, L"InstallLocation",
-                     RRF_RT_REG_SZ, nullptr, loc,
-                     &size) == ERROR_SUCCESS &&
-        *loc) {
-        std::wstring regHost = std::wstring(loc) + L"\\windhawk-mod.exe";
-        return GetFileAttributesW(regHost.c_str()) != INVALID_FILE_ATTRIBUTES;
-    }
-    HKEY hk;
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kUninst, 0,
-                      KEY_READ | KEY_WOW64_32KEY, &hk) == ERROR_SUCCESS) {
-        size = sizeof(loc);
-        LSTATUS st = RegQueryValueExW(hk, L"InstallLocation", nullptr, nullptr,
-                                      (LPBYTE)loc, &size);
-        RegCloseKey(hk);
-        if (st == ERROR_SUCCESS && *loc) {
-            std::wstring regHost = std::wstring(loc) + L"\\windhawk-mod.exe";
-            return GetFileAttributesW(regHost.c_str()) != INVALID_FILE_ATTRIBUTES;
-        }
-    }
-    return false;
-}
-
-static DWORD WINAPI ToolHostWatchdog(void*) {
-    // Long-lived lifeguard: 5s poll cadence, respawn after the mutex has
-    // been missing for 3 consecutive polls (~15s — longer than any healthy
-    // injection gap, so a slow service-spawned host is never double-spawned).
-    // Exits only on g_watchdogStop (Wh_ModUninit), never self-expires.
-    int absent = 0;
-    for (;;) {
-        DWORD w = WaitForSingleObject(g_watchdogStop, 5000);
-        if (w == WAIT_OBJECT_0) break;
-        if (IsWindhawk2Install()) continue;  // service owns the lifecycle here
-        HANDLE mutex = OpenMutexW(SYNCHRONIZE, FALSE,
-                                  L"windhawk-tool-mod_" WH_MOD_ID);
-        if (mutex) {
-            CloseHandle(mutex);
-            absent = 0;
-            continue;
-        }
-        absent++;
-        if (absent >= 3) {
-            CtlLog(L"[CTRL] watchdog: tool host missing ~15s, respawning");
-            DebugLog(L"[CTRL] watchdog: tool host missing ~15s, respawning");
-            Wh_Log(L"[CTRL] watchdog respawning tool host");
-            absent = 0;
-            SpawnToolModProcess();
-        }
-    }
-    CtlLog(L"[CTRL] watchdog exiting (stop event)");
-    return 0;
-}
-
-
-////////////////////////////////////////////////////////////////////////////////
-// Merged lifecycle entry points (the ONLY Wh_* callbacks Windhawk sees)
-////////////////////////////////////////////////////////////////////////////////
-
-
-static bool IsWindhawkLauncherProcess() {
-    wchar_t exePath[MAX_PATH];
-    if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH)) return false;
-    wchar_t* base = wcsrchr(exePath, L'\\');
-    base = base ? base + 1 : exePath;
-    return _wcsicmp(base, L"windhawk.exe") == 0;
-}
-
 BOOL Wh_ModInit() {
-    DWORD sessionId;
-    if (ProcessIdToSessionId(GetCurrentProcessId(), &sessionId) &&
-        sessionId == 0) {
-        return FALSE;
-    }
-
-    bool isExcluded = false;
-    bool isToolModProcess = false;
-    bool isCurrentToolModProcess = false;
-    int argc;
-    LPWSTR* argv = CommandLineToArgvW(GetCommandLine(), &argc);
-    if (argv) {
-        for (int i = 1; i < argc; i++) {
-            if (wcscmp(argv[i], L"-service") == 0 ||
-                wcscmp(argv[i], L"-service-start") == 0 ||
-                wcscmp(argv[i], L"-service-stop") == 0) {
-                isExcluded = true;
-                break;
-            }
-        }
-        for (int i = 1; i < argc - 1; i++) {
-            if (wcscmp(argv[i], L"-tool-mod") == 0) {
-                isToolModProcess = true;
-                if (wcscmp(argv[i + 1], WH_MOD_ID) == 0) {
-                    isCurrentToolModProcess = true;
-                }
-                break;
-            }
-        }
-        LocalFree(argv);
-    }
-    if (isExcluded) {
-        return FALSE;
-    }
-
-    if (isCurrentToolModProcess) {
-        CtlLog(L"[BRANCH] tool host, pid=%lu", GetCurrentProcessId());
-        DebugLog(L"[BRANCH] tool host, pid=%lu", GetCurrentProcessId());
-        // Tool host: tray + settings window. Same single-instance mutex wait
-        // as the standalone control mod (old instance hand-over).
-        g_isCtrlToolProcess = true;
-        g_toolModProcessMutex =
-            CreateMutex(nullptr, TRUE, L"windhawk-tool-mod_" WH_MOD_ID);
-        if (!g_toolModProcessMutex) {
-            Wh_Log(L"CreateMutex failed");
-            ExitProcess(1);
-        }
-        if (GetLastError() == ERROR_ALREADY_EXISTS) {
-            Wh_Log(L"Tool mod already running (%s), waiting for the old instance",
-                   WH_MOD_ID);
-            bool owned = false;
-            // Fail fast: 2s, not 10s. A second host that can't win the
-            // mutex within 2s is a duplicate spawn (Windhawk 2.x spawns its
-            // own tool host) — exiting keeps Windhawk's "initializing" state
-            // from lingering ~20s while the loser waits out the old hand-over.
-            for (int i = 0; i < 8 && !owned; i++) {
-                if (g_toolModProcessMutex) CloseHandle(g_toolModProcessMutex);
-                g_toolModProcessMutex =
-                    CreateMutex(nullptr, TRUE, L"windhawk-tool-mod_" WH_MOD_ID);
-                if (!g_toolModProcessMutex) {
-                    Sleep(250);
-                    continue;
-                }
-                if (GetLastError() != ERROR_ALREADY_EXISTS) {
-                    owned = true;
-                    break;
-                }
-                WaitForSingleObject(g_toolModProcessMutex, 250);
-            }
-            if (!owned) {
-                Wh_Log(L"Old tool instance never released the mutex");
-                ExitProcess(1);
-            }
-        }
-        {
-            std::wstring dir = GetCfgDir();
-            if (!dir.empty())
-                RotateLogAtBoot((dir + L"\\control_log.txt").c_str(), 5ull * 1024 * 1024);
-        }
-        CtlLog(L"[CTRL] tool host init, pid=%lu", GetCurrentProcessId());
-        DebugLog(L"[CTRL] tool host init, pid=%lu", GetCurrentProcessId());
-        if (!WhTool_ModInit()) {
-            CtlLog(L"[CTRL] WhTool_ModInit FAILED, exiting");
-            DebugLog(L"[CTRL] WhTool_ModInit FAILED, exiting");
-            ExitProcess(1);
-        }
-        // Hook the host's entry point so windhawk.exe never actually runs in
-        // this process — it exists purely to host our message loop.
-        IMAGE_DOS_HEADER* dosHeader = (IMAGE_DOS_HEADER*)GetModuleHandle(nullptr);
-        IMAGE_NT_HEADERS* ntHeaders =
-            (IMAGE_NT_HEADERS*)((BYTE*)dosHeader + dosHeader->e_lfanew);
-        DWORD entryPointRVA = ntHeaders->OptionalHeader.AddressOfEntryPoint;
-        void* entryPoint = (BYTE*)dosHeader + entryPointRVA;
-        Wh_SetFunctionHook(entryPoint, (void*)EntryPoint_Hook, nullptr);
-        return TRUE;
-    }
-
-    if (isToolModProcess) {
-        // Another mod's tool host: not ours, not the engine's business.
-        return FALSE;
-    }
-
-    if (IsWindhawkLauncherProcess()) {
-        // Plain windhawk.exe (the normal UI app): we only act as the launcher
-        // that spawns and watchdogs our dedicated tool host process.
-        g_isToolModProcessLauncher = true;
-        CtlLog(L"[BRANCH] windhawk.exe launcher, pid=%lu", GetCurrentProcessId());
-        DebugLog(L"[BRANCH] windhawk.exe launcher, pid=%lu", GetCurrentProcessId());
-        return TRUE;
-    }
-
-    // Everything else that matched @include = explorer.exe family: the engine.
-    CtlLog(L"[BRANCH] explorer engine, pid=%lu", GetCurrentProcessId());
-    DebugLog(L"[BRANCH] explorer engine, pid=%lu", GetCurrentProcessId());
+    RefreshDebugFileLogGate();
+    // v2.11.0 SINGLE-PROCESS ARCHITECTURE: everything runs in the
+    // desktop-owner explorer process. The dedicated windhawk.exe tool host
+    // is GONE — the tool-mod pattern bought crash isolation but cost the
+    // entire 1.x/2.x fork surface (spawn, mutexes, watchdog, undocumented
+    // injection gates) for what is a Win32 window and a tray icon. The
+    // control UI (tray + settings window) starts on its own thread once
+    // BootstrapThreadInner confirms desktop-LV ownership.
+    CtlLog(L"[BRANCH] explorer (engine + control UI), pid=%lu", GetCurrentProcessId());
+    // [v2.10.28] Fatal-crash reporter (see AbtCrashReporter above).
+    g_crashReporterHandle =
+        (void*)SetUnhandledExceptionFilter(AbtCrashReporter);
     return Engine_ModInit();
 }
 
-void Wh_ModAfterInit() {
-    if (g_isToolModProcessLauncher) {
-        g_watchdogStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        if (IsWindhawk2Install()) {
-            CtlLog(L"[CTRL] 2.x install: service hosts us in windhawk-mod.exe, "
-                   L"launcher spawn skipped");
-            DebugLog(L"[CTRL] 2.x install: service hosts us in windhawk-mod.exe, "
-                     L"launcher spawn skipped");
-        } else {
-        // Windhawk 1.x: the service does NOT host tool mods; the wiki
-        // snippet (spawn + mutex) is the documented approach. The host only
-        // creates its mutex once the mod is INJECTED, which lags the spawn,
-        // so grace-poll ~3s before deciding nobody else is bringing one up.
-        bool hostComing = false;
-        for (int i = 0; i < 6 && !hostComing; i++) {
-            HANDLE m = OpenMutexW(SYNCHRONIZE, FALSE,
-                                  L"windhawk-tool-mod_" WH_MOD_ID);
-            if (m) {
-                CloseHandle(m);
-                hostComing = true;
-                break;
-            }
-            Sleep(500);
-        }
-        if (hostComing) {
-            CtlLog(L"[CTRL] launcher: tool host already coming up, spawn skipped");
-            DebugLog(L"[CTRL] launcher: tool host already coming up, spawn skipped");
-        } else {
-            CtlLog(L"[CTRL] launcher: no tool host after grace, spawning");
-            DebugLog(L"[CTRL] launcher: no tool host after grace, spawning");
-            SpawnToolModProcess();
-        }
-        CloseHandle(
-            CreateThread(nullptr, 0, ToolHostWatchdog, nullptr, 0, nullptr));
-        } // end 1.x spawn branch
-    } else if (!g_isCtrlToolProcess) {
-        // Engine branch (explorer.exe family): on 1.x installs the tool host
-        // exists ONLY if windhawk.exe injected us and the launcher branch ran.
-        // One user machine (Windhawk 1.7.3) showed NO windhawk.exe injection
-        // at all — no launcher, no host, hotkey dead. The engine boots on every
-        // machine, so it now carries the same 1.x fallback spawn + watchdog.
-        // On 2.x the service hosts tool mods in windhawk-mod.exe; spawning
-        // here would duplicate hosts, so the watchdog's 2.x skip stays.
-        bool is2x = IsWindhawk2Install();
-        CtlLog(L"[CTRL] engine: install=%s",
-               is2x ? L"2.x (service hosts tool mods)" : L"1.x (engine fallback armed)");
-        DiagLog(L"[CTRL] engine: install=%s",
-                is2x ? L"2.x (service hosts tool mods)" : L"1.x (engine fallback armed)");
-        if (!is2x) {
-            g_watchdogStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-            bool hostComing = false;
-            for (int i = 0; i < 6 && !hostComing; i++) {
-                HANDLE m = OpenMutexW(SYNCHRONIZE, FALSE,
-                                      L"windhawk-tool-mod_" WH_MOD_ID);
-                if (m) {
-                    CloseHandle(m);
-                    hostComing = true;
-                    break;
-                }
-                Sleep(500);
-            }
-            if (hostComing) {
-                CtlLog(L"[CTRL] engine: tool host already coming up, spawn skipped");
-                DiagLog(L"[CTRL] engine: tool host already coming up, spawn skipped");
-            } else {
-                WCHAR whPath[MAX_PATH];
-                if (GetWindhawkExePath(whPath, ARRAYSIZE(whPath))) {
-                    CtlLog(L"[CTRL] engine: no tool host after grace, spawning");
-                    DiagLog(L"[CTRL] engine: no tool host after grace, spawning");
-                    SpawnToolModProcessFrom(whPath);
-                } else {
-                    CtlLog(L"[CTRL] engine: windhawk.exe path NOT FOUND, spawn impossible");
-                    DiagLog(L"[CTRL] engine: windhawk.exe path NOT FOUND, spawn impossible");
-                }
-            }
-            CloseHandle(CreateThread(nullptr, 0, ToolHostWatchdog, nullptr, 0,
-                                     nullptr));
-        }
-    }
-    // Tool host branch needs no AfterInit work.
-}
-
 void Wh_ModSettingsChanged() {
-    if (g_isCtrlToolProcess) {
-        RefreshTrayIcon();
-        WhTool_ModSettingsChanged();
-        return;
-    }
-    if (g_isToolModProcessLauncher) {
-        return;
-    }
+    RefreshDebugFileLogGate();
+    RefreshTrayIcon();
     Engine_ModSettingsChanged();
 }
 
 void Wh_ModUninit() {
-    if (g_isCtrlToolProcess) {
-        CtlLog(L"[CTRL] tool host uninit");
-        WhTool_ModUninit();
-        return;
-    }
-    if (g_isToolModProcessLauncher) {
-        if (g_watchdogStop) SetEvent(g_watchdogStop);
-        return;
-    }
+    if (g_crashReporterHandle)
+        SetUnhandledExceptionFilter(
+            (LPTOP_LEVEL_EXCEPTION_FILTER)g_crashReporterHandle);
+    WhTool_ModUninit();
     Engine_ModUninit();
 }
