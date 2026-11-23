@@ -2,7 +2,7 @@
 // @id              transparent-desktop-icons-spotlight
 // @name            "Ab Tenebris" - Transparent Desktop Icons with Spotlight and Dynamic Shadows
 // @description     Make desktop icons transparent when idle with an interactive spotlight effect, plus the Ab Tenebris control panel: tray icon and native settings window. Hover over the desktop or select icons to reveal them.
-// @version         2.10.36
+// @version         2.10.50
 // @author          drgutman
 // @github          https://github.com/drgutman
 // @homepage        https://instagram.com/drgutman
@@ -485,6 +485,7 @@ constexpr uint32_t CACHE_VERSION = 207; // [CORE-CENTER v2.8.3] layer offsetX/Y 
 #define TIMER_ID_EXPLORER_SETTLE    10  // Once-a-second check for Explorer settling, then one resync
 #define TIMER_ID_COLLAPSE_POLL      11  // Fast poll while a selection-collapse hold is active
 #define TIMER_ID_ZOOM_SETTLE        12  // [SLITHER v2.5.2] One-shot re-poll after a zoom change
+#define TIMER_ID_IDLE_FADE          13  // [v2.10.39] Idle-trigger fade poll (125ms)
 
 // WM_APP_TRIGGER_REFRESH wParam tags: how deep the refresh must go.
 // Wallpaper-only churn (Colors/Wallpapers keys) must NOT wipe icon caches.
@@ -530,9 +531,13 @@ static void RotateLogAtBoot(PCWSTR path, unsigned long long rotateBytes);
 // a crash never has the switch pre-flipped, and post-mortem lines are the
 // only forensics a dead process leaves.
 static std::atomic<bool> g_debugFileLogOn{false};
+// [v2.10.49] Mirrors DebugLog's s_dbgWasOn: when logging is switched OFF the
+// flag resets, so the next off->on flip truncates (fresh file per session).
+static std::atomic<bool> g_dbgWasOn{false};
 static void RefreshDebugFileLogGate() {
-    g_debugFileLogOn.store(Wh_GetIntSetting(L"Diagnostics.debugLogging") != 0,
-                           std::memory_order_relaxed);
+    bool on = Wh_GetIntSetting(L"Diagnostics.debugLogging") != 0;
+    g_debugFileLogOn.store(on, std::memory_order_relaxed);
+    if (!on) g_dbgWasOn.store(false, std::memory_order_relaxed);
 }
 
 static void BootLog(const wchar_t* fmt, ...) {
@@ -605,6 +610,10 @@ static void RotateLogAtBoot(PCWSTR path, unsigned long long rotateBytes) {
     // forensic value we would ever read - delete it instead of replacing.
     if (LogFileTooBig(old.c_str(), 25ull * 1024 * 1024)) DeleteFileW(old.c_str());
     MoveFileExW(path, old.c_str(), MOVEFILE_REPLACE_EXISTING);
+    // [v2.10.37] The file we just MOVED can itself be oversized (the 655 MB
+    // fossil was exactly this shape: the pre-existing check above never sees
+    // it, and the "next rotate" that would clean it may never come).
+    if (LogFileTooBig(old.c_str(), 25ull * 1024 * 1024)) DeleteFileW(old.c_str());
 }
 
 static void DiagLog(const wchar_t* fmt, ...);  // fwd: crash reporter
@@ -638,6 +647,8 @@ static HMODULE GetModHInstance() {
 // fires ONLY when the exception is truly unhandled (fatal). Uninit
 // restores the previous filter (the stored handle IS the old filter).
 static void* g_crashReporterHandle = nullptr;
+// [v2.10.49] Previous std::terminate handler (restored at uninit).
+static std::terminate_handler g_prevTerminate = nullptr;
 
 #include <psapi.h>
 
@@ -771,6 +782,12 @@ struct Settings {
     bool overlayEnabled;
     int toggleFadeInDuration;
     int toggleFadeOutDuration;
+    // [v2.10.39] Fade trigger: 0 = double-click toggle (old behavior),
+    // 1 = desktop idle, 2 = system idle. idleFadeTimeout gates the idle
+    // modes in ms; idle -> overlay fades OUT, input -> fades back.
+    int fadeTriggerMode;
+    int idleFadeTimeout;
+    bool idleFadeInvert;  // idle -> overlay fades IN (full opacity) instead of out
 
     int shadowLength;
     int shadowPasses;
@@ -1140,7 +1157,9 @@ SilhouetteData g_genericFileBaseline;
 // any of them, so placeholder detection compares against all variants.
 std::vector<SilhouetteData> g_genericFileBaselines;
 SilhouetteData g_genericFolderBaseline;
-bool g_baselinesReady = false;
+// [v2.10.49] Atomic: written by the extraction-pool worker threads, read on
+// render/UI paths — a torn non-atomic bool across threads is UB.
+std::atomic<bool> g_baselinesReady{false};
 int g_baselineTargetSize = 0;
 
 // Cached image list info (UI thread writes, worker/render threads read)
@@ -1266,6 +1285,17 @@ std::atomic<float> g_dpiScale{1.0f};
 std::atomic<bool> g_initialized_desktop{false};
 std::atomic<bool> g_initialized{false};
 
+// [v2.10.39] Idle-fade trigger. Stamp of the last input seen ON THE DESKTOP
+// (mouse move/click/wheel/key over the listview); 0 = nothing yet. The
+// double-click fade toggle stays the manual path; the idle timer automates
+// the same g_overlayBypassed bit. 0-initialized so a fresh boot never
+// insta-fades before the first desktop touch.
+std::atomic<ULONGLONG> g_lastDesktopInputMs{0};
+// [v2.10.42] Idle-fade Invert support: true while "idle & not inverted" —
+// the overlay renders at FULL alpha (255) regardless of idleOpacity, so the
+// icons go completely invisible (Doc: "fully visible or fully invisible").
+std::atomic<bool> g_idleFadeOpaque{false};
+
 // Cold-start retry tracking
 std::atomic<int>       g_initAttempts{0};
 std::atomic<ULONGLONG> g_lastInitFailure{0};
@@ -1273,6 +1303,11 @@ std::atomic<ULONGLONG> g_lastInitFailure{0};
 // Overlay toggle
 std::atomic<bool> g_overlayBypassed{false};
 float g_masterFade = 1.0f;
+// [v2.10.46] Idle-fade opaque animator (render thread only, like
+// g_masterFade): ramps 0->1 while idle+non-inverted so the 255 target is
+// REACHED through toggleFadeIn/OutDuration instead of snapping (the alpha
+// override used to jump straight to full, ignoring the durations).
+float g_idleFadeCur = 0.0f;
 
 float g_shadowFade = 0.0f;
 
@@ -3033,6 +3068,64 @@ uint64_t GetShadowBakeHash() {
     return GetShadowBakeHash(s);
 }
 
+// [v2.10.39] Idle-trigger fade (ZenDesktop replacement, Doc): after
+// idleFadeTimeout of idleness the overlay fades OUT (bypassed = true); any
+// input fades it back IN. Modes: 0 = double-click only (no timer),
+// 1 = desktop idle (no input ON the desktop), 2 = system idle
+// (GetLastInputInfo). The Fade group checkbox (toggleOnDoubleClick) gates
+// the whole family.
+static void IdleFadeTick() {
+    Settings s = SnapshotSettings();
+    if (!s.toggleOnDoubleClick || s.fadeTriggerMode == 0) return;
+    ULONGLONG now = GetTickCount64();
+    bool idle = false;
+    if (s.fadeTriggerMode == 1) {
+        ULONGLONG last = g_lastDesktopInputMs.load(std::memory_order_relaxed);
+        // `last` guard: no desktop input seen yet this session = don't fire.
+        idle = last != 0 && (now - last) >= (ULONGLONG)s.idleFadeTimeout;
+    } else {
+        LASTINPUTINFO li = {sizeof(li)};
+        idle = GetLastInputInfo(&li) &&
+               (now - (ULONGLONG)li.dwTime) >= (ULONGLONG)s.idleFadeTimeout;
+    }
+    bool cur = g_overlayBypassed.load(std::memory_order_relaxed);
+    // [v2.10.43] Invert (Doc): idle + unchecked = overlay to FULL 255 (icons
+    // fully invisible); idle + checked = overlay to 0 (icons fully visible);
+    // activity ALWAYS returns the normal state (overlay at the global
+    // opacity, never bypassed — the extremes exist only while idle).
+    bool target = idle && s.idleFadeInvert;
+    bool opaque = idle && !s.idleFadeInvert;
+    if (target != cur || opaque != g_idleFadeOpaque.load(std::memory_order_relaxed)) {
+        g_overlayBypassed.store(target, std::memory_order_relaxed);
+        g_idleFadeOpaque.store(opaque, std::memory_order_relaxed);
+        if (g_renderEvent) SetEvent(g_renderEvent);
+        if (g_underlayRenderEvent) SetEvent(g_underlayRenderEvent);
+        DiagLog(L"[IDLEFADE] mode=%d idle=%d inv=%d -> bypassed=%d opaque=%d",
+                s.fadeTriggerMode, (int)idle, (int)s.idleFadeInvert,
+                (int)target, (int)opaque);
+    }
+}
+
+// Arm/disarm the idle poll. Called from ApplySettingsChanges (cfg reload)
+// and once after the overlay window is created.
+static void UpdateIdleFadeTimer() {
+    if (!g_overlayWnd || !IsWindow(g_overlayWnd)) return;
+    Settings s = SnapshotSettings();
+    if (s.toggleOnDoubleClick && s.fadeTriggerMode != 0) {
+        SetTimer(g_overlayWnd, TIMER_ID_IDLE_FADE, 125, nullptr);
+    } else {
+        KillTimer(g_overlayWnd, TIMER_ID_IDLE_FADE);
+        // [v2.10.42] Leave NO stale automation state behind: a flip back to
+        // double-click mode while idle must not keep the overlay pinned at
+        // 255 or bypassed forever.
+        if (g_idleFadeOpaque.exchange(false, std::memory_order_relaxed) ||
+            g_overlayBypassed.exchange(false, std::memory_order_relaxed)) {
+            if (g_renderEvent) SetEvent(g_renderEvent);
+            if (g_underlayRenderEvent) SetEvent(g_underlayRenderEvent);
+        }
+    }
+}
+
 // [MULTIMON v2.9.4, CORRECTED v2.9.5] Explorer draws desktop items at
 // PER-MONITOR DPI scale. Measured coherently on the field rig (125% primary
 // + 100% portrait secondary): LVIR_LABEL rects 20px vs 16px tall (the label
@@ -3113,6 +3206,20 @@ HMONITOR GetPrimaryMonitor() {
 EXTERN_C IMAGE_DOS_HEADER __ImageBase;
 inline HMODULE GetCurrentModuleHandle() {
     return (HMODULE)&__ImageBase;
+}
+
+// [v2.10.47] Per-LOAD unique class suffix: every window class this instance
+// registers gets "_<pid>_<tick>" appended. A class pinned by a previous
+// instance's survivor window (raced teardown) then can NEVER collide with
+// ours, so no push can ever create a window whose wndproc points into the
+// unmapped previous DLL (the every-push CFG crash). Built once per load.
+static wchar_t g_clsSuffix[48] = L"";
+static void InitClassSuffix() {
+    swprintf_s(g_clsSuffix, L"_%u_%llu", GetCurrentProcessId(),
+               (unsigned long long)(GetTickCount64() & 0xFFFFFFFFull));
+}
+static std::wstring Uq(const wchar_t* base) {
+    return std::wstring(base) + g_clsSuffix;
 }
 
 // Reads TranscodedImageCache binary value for the guaranteed active image path (fixes Slideshows)
@@ -3555,12 +3662,16 @@ LRESULT CALLBACK ListViewSubclassProcInner(HWND hWnd, UINT uMsg, WPARAM wParam, 
                     s_dragStarted = false;
                 }
                 HandleDesktopMouseMove(hWnd);
+                g_lastDesktopInputMs.store(GetTickCount64(),
+                                           std::memory_order_relaxed);
                 break;
             }
             case WM_MOUSELEAVE:
                 HandleDesktopMouseLeave(hWnd);
                 break;
             case WM_MOUSEWHEEL:
+                g_lastDesktopInputMs.store(GetTickCount64(),
+                                           std::memory_order_relaxed);
                 if (GetKeyState(VK_CONTROL) & 0x8000) {
                     UpdateCachedImageList(hWnd);
                     ArmSnapRetry(300);
@@ -3590,6 +3701,8 @@ LRESULT CALLBACK ListViewSubclassProcInner(HWND hWnd, UINT uMsg, WPARAM wParam, 
 
             case WM_KEYDOWN:
             case WM_CHAR:
+                g_lastDesktopInputMs.store(GetTickCount64(),
+                                           std::memory_order_relaxed);
                 QueueSelectionUpdate();
                 g_selectionJustChanged.store(true, std::memory_order_relaxed);
                 if (g_renderEvent) SetEvent(g_renderEvent);
@@ -3597,8 +3710,13 @@ LRESULT CALLBACK ListViewSubclassProcInner(HWND hWnd, UINT uMsg, WPARAM wParam, 
 
             case WM_LBUTTONDBLCLK:
                 {
+                    g_lastDesktopInputMs.store(GetTickCount64(),
+                                               std::memory_order_relaxed);
                     bool suppressSpotlight = false;
-                    if (SnapshotSettings().toggleOnDoubleClick) {
+                    // [v2.10.39] Manual double-click toggle only in the
+                    // double-click trigger mode; idle modes own the bit.
+                    if (SnapshotSettings().toggleOnDoubleClick &&
+                        SnapshotSettings().fadeTriggerMode == 0) {
                         LVHITTESTINFO hti = {};
                         hti.pt.x = (short)LOWORD(lParam);
                         hti.pt.y = (short)HIWORD(lParam);
@@ -3620,11 +3738,15 @@ LRESULT CALLBACK ListViewSubclassProcInner(HWND hWnd, UINT uMsg, WPARAM wParam, 
             break;
 
             case WM_MBUTTONDOWN:
+                g_lastDesktopInputMs.store(GetTickCount64(),
+                                           std::memory_order_relaxed);
                 g_clickOnDesktop.store(true, std::memory_order_relaxed);
                 if (g_renderEvent) SetEvent(g_renderEvent);
                 if (g_underlayRenderEvent) SetEvent(g_underlayRenderEvent);
                 break;
             case WM_LBUTTONDOWN:
+                g_lastDesktopInputMs.store(GetTickCount64(),
+                                           std::memory_order_relaxed);
                 g_isLeftButtonDown.store(true, std::memory_order_relaxed);
                 [[fallthrough]];
             case WM_RBUTTONDOWN: {
@@ -4808,6 +4930,11 @@ void UpdateMouseAndAnimations(float deltaTime) {
 
     g_masterFade = AnimateFade(g_masterFade, targetMasterFade, g_settings.toggleFadeInDuration, g_settings.toggleFadeOutDuration, deltaTime);
 
+    // [v2.10.46] The idle-opaque 255 target animates with the SAME durations
+    // as the toggle fade (Doc: fade durations must apply in every mode).
+    float targetIdleFade = g_idleFadeOpaque.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
+    g_idleFadeCur = AnimateFade(g_idleFadeCur, targetIdleFade, g_settings.toggleFadeInDuration, g_settings.toggleFadeOutDuration, deltaTime);
+
     // 4. Clean up the cached geometry ONLY after the fade-out animation is completely finished
     if (currentSelectedRects.empty() && g_selectionFade <= 0.0f && targetSelFade < 0.5f) {
         g_cachedSelectedRects.clear();
@@ -5132,8 +5259,10 @@ void RenderOverlay() {
     g_dc->Clear(D2D1::ColorF(0, 0, 0, 0));
 
     float idleAlpha = (g_settings.idleOpacity / 255.0f) * g_masterFade;
-
-    // PREPARE LAYER: Apply idleOpacity uniformly
+    // [v2.10.46] Idle-fade opaque state rides its own animator: ramps toward
+    // full 255 with the toggle fade durations (never snaps).
+    if (g_idleFadeCur > 0.0f)
+        idleAlpha = (std::max)(idleAlpha, g_idleFadeCur * g_masterFade);
     D2D1_LAYER_PARAMETERS layerParams;
     layerParams.contentBounds = D2D1::InfiniteRect();
     layerParams.geometricMask = nullptr;
@@ -5556,6 +5685,7 @@ void RenderLoopInner() {
     float s_lastRenderedSpotFade  = -1.0f;
     float s_lastRenderedSelFade   = -1.0f;
     float s_lastRenderedMasterFade = 1.0f;
+    float s_lastRenderedIdleFade = 0.0f;  // [v2.10.48] idle-opaque animator
 
     D2D1_POINT_2F s_lastRenderedMousePos = {-1.0f, -1.0f};
     std::vector<RECT> s_lastRenderedSelectedRects; // Track geometry changes
@@ -5606,6 +5736,11 @@ void RenderLoopInner() {
                 bool stateChanged =
                     selectionChanged ||
                     (std::abs(g_masterFade - s_lastRenderedMasterFade) > 0.001f) ||
+                    // [v2.10.48] The idle-opaque ramp MUST drive renders on
+                    // its own: with the mouse over another app there is no
+                    // mouse jitter to mask it (Doc: desktop-idle fade must
+                    // work when the mouse leaves the desktop too).
+                    (std::abs(g_idleFadeCur - s_lastRenderedIdleFade) > 0.001f) ||
                     (std::abs(g_spotlightFade.load(std::memory_order_relaxed) - s_lastRenderedSpotFade) > 0.001f) ||
                     (std::abs(g_selectionFade - s_lastRenderedSelFade) > 0.001f) ||
                     (mouseMovedSignificantly && g_spotlightFade > 0.001f) ||
@@ -5615,6 +5750,8 @@ void RenderLoopInner() {
                 bool isBypassed = g_overlayBypassed.load(std::memory_order_relaxed);
                     float targetMaster = isBypassed ? 0.0f : 1.0f;
                     float idleAlpha = (g_settings.idleOpacity / 255.0f) * g_masterFade;
+                    if (g_idleFadeCur > 0.0f)
+                        idleAlpha = (std::max)(idleAlpha, g_idleFadeCur * g_masterFade);  // [v2.10.46]
 
                 // Determine if we actually need to draw pixels to the screen
                 // If bypassed, completely shut down the overlay renders to prevent GPU spikes (unless Bat-Signal keeps the tint active)!
@@ -5631,6 +5768,7 @@ void RenderLoopInner() {
                             g_selectionFade <= 0.001f &&
                             g_isIdle &&
                             std::abs(g_masterFade - targetMaster) <= 0.001f &&
+                            std::abs(g_idleFadeCur - (g_idleFadeOpaque.load(std::memory_order_relaxed) ? 1.0f : 0.0f)) <= 0.001f &&
                             !shadowFading &&
                             !batActive);
 
@@ -5646,6 +5784,7 @@ void RenderLoopInner() {
                         RenderOverlay();
 
                         s_lastRenderedMasterFade = g_masterFade;
+                        s_lastRenderedIdleFade = g_idleFadeCur;
                         s_lastRenderedSpotFade   = g_spotlightFade.load(std::memory_order_relaxed);
                         s_lastRenderedSelFade   = g_selectionFade;
                         s_lastRenderedSelectedRects = g_cachedSelectedRects;
@@ -11241,6 +11380,7 @@ LRESULT CALLBACK OverlayWndProcInner(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM
 
         case WM_TIMER:
             if (!g_unloading && wParam == TIMER_ID_STATE_POLL) RevalidateDesktopWindows();
+            if (!g_unloading && wParam == TIMER_ID_IDLE_FADE) IdleFadeTick();
             if (!g_unloading && wParam == TIMER_ID_COLLAPSE_POLL) QuickSnapshotStatePoll();
             if (!g_unloading && wParam == TIMER_ID_ZOOM_SETTLE) {
                 // [SLITHER v2.5.2] Post-zoom settle re-measure: the poll
@@ -11873,6 +12013,26 @@ LRESULT CALLBACK UnderlayWndProcInner(HWND hWnd, UINT uMsg, WPARAM wParam, LPARA
 ////////////////////////////////////////////////////////////////////////////////
 // Setup
 
+// [v2.10.43] Reload-safety class guard: RegisterClass returning
+// ERROR_CLASS_ALREADY_EXISTS used to be tolerated, but a stale class pinned
+// by a window that survived the previous instance's teardown carries a
+// wndproc into UNMAPPED memory - creating a window on it fail-fasts
+// explorer (CFG guard, c0000409/0xa). Accept ALREADY_EXISTS only when the
+// existing class is registered by THIS instance; otherwise refuse (caller
+// degrades gracefully, no crash).
+static bool RegisterClassGuarded(WNDCLASSW& wc) {
+    if (RegisterClassW(&wc)) return true;
+    if (GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
+    WNDCLASSEXW ci = {sizeof(ci)};
+    if (GetClassInfoExW(wc.hInstance, wc.lpszClassName, &ci) &&
+        ci.hInstance == wc.hInstance)
+        return true;  // our own earlier registration in this instance
+    Wh_Log(L"[RELOAD] stale class '%s' from previous instance - refusing window creation (crash guard)",
+           wc.lpszClassName);
+    DiagLog(L"[RELOAD] stale class '%s'", wc.lpszClassName);
+    return false;
+}
+
 HWND CreateDesktopOverlayWindow(LPCWSTR className, WNDPROC wndProc, int* outWidth, int* outHeight) {
     HWND hParent = GetDesktopParent();
     if (!hParent) return nullptr;
@@ -11881,7 +12041,7 @@ HWND CreateDesktopOverlayWindow(LPCWSTR className, WNDPROC wndProc, int* outWidt
     wc.lpfnWndProc   = wndProc;
     wc.hInstance     = GetCurrentModuleHandle();
     wc.lpszClassName = className;
-    if (RegisterClass(&wc) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+    if (!RegisterClassGuarded(wc)) {
         return nullptr;
     }
 
@@ -11929,7 +12089,8 @@ void CreateOverlayWindow() {
 
     if (!g_overlayWnd) {
         int width = 0, height = 0;
-        g_overlayWnd = CreateDesktopOverlayWindow(OVERLAY_WINDOW_CLASS, OverlayWndProc, &width, &height);
+        g_overlayWnd = CreateDesktopOverlayWindow(
+            Uq(OVERLAY_WINDOW_CLASS).c_str(), OverlayWndProc, &width, &height);
         if (!g_overlayWnd) {
             Wh_Log(L"CreateOverlayWindow: CreateDesktopOverlayWindow failed, error=%lu", GetLastError());
             scheduleRetry();
@@ -11974,6 +12135,13 @@ void CreateOverlayWindow() {
         }
     }
 
+    // [v2.10.40] MUST stay OUTSIDE the g_renderMutex block above:
+    // UpdateIdleFadeTimer reads settings via SnapshotSettings, and re-locking
+    // the non-recursive mutex on the same thread = instant self-deadlock
+    // (2.10.39's crash loop: init thread frozen here, shell hung ~35s later
+    // when the first recreate message needed the mutex).
+    UpdateIdleFadeTimer();
+
     HWND hLV = GetDesktopListView();
     if (hLV) ApplyDesktopSubclasses(hLV);
 
@@ -11987,7 +12155,9 @@ void CreateUnderlayWindow() {
 
     if (!g_underlayWnd) {
         int width = 0, height = 0;
-        g_underlayWnd = CreateDesktopOverlayWindow(UNDERLAY_WINDOW_CLASS, UnderlayWndProc, &width, &height);
+        g_underlayWnd = CreateDesktopOverlayWindow(
+            Uq(UNDERLAY_WINDOW_CLASS).c_str(), UnderlayWndProc, &width,
+            &height);
         if (!g_underlayWnd) {
             return;
         }
@@ -12187,12 +12357,13 @@ void CreateUnderlayWindow() {
 }
 
 bool RegisterMessageWindowClass() {
+    // [v2.10.47] Unique per-load class name (static: stable per instance).
+    static const std::wstring s_cls = Uq(MESSAGE_WINDOW_CLASS);
     WNDCLASS wc = {};
     wc.lpfnWndProc   = MessageWndProc;
     wc.hInstance     = GetCurrentModuleHandle();
-    wc.lpszClassName = MESSAGE_WINDOW_CLASS;
-    if (RegisterClass(&wc) == 0)
-        return GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+    wc.lpszClassName = s_cls.c_str();
+    if (!RegisterClassGuarded(wc)) return false;
     return true;
 }
 
@@ -12200,8 +12371,11 @@ void CreateMessageWindow() {
     if (g_messageWnd) return;
     if (!RegisterMessageWindowClass()) return;
 
-    g_messageWnd = CreateWindowEx(0, MESSAGE_WINDOW_CLASS, nullptr, 0, 0, 0, 0, 0,
-                                  nullptr, nullptr, GetCurrentModuleHandle(), nullptr);
+    {
+        static const std::wstring s_cls = Uq(MESSAGE_WINDOW_CLASS);
+        g_messageWnd = CreateWindowEx(0, s_cls.c_str(), nullptr, 0, 0, 0, 0, 0,
+                                      nullptr, nullptr, GetCurrentModuleHandle(), nullptr);
+    }
     if (g_messageWnd) {
         g_hPowerNotify = RegisterPowerSettingNotification(g_messageWnd, &GUID_CONSOLE_DISPLAY_STATE, DEVICE_NOTIFY_WINDOW_HANDLE);
     }
@@ -12406,6 +12580,9 @@ static const CfgKeyEntry kCfgKeys[] = {
     {L"Selection.selectionFadeInDuration", false},
     {L"Selection.selectionFadeOutDuration", false},
     {L"Toggle.toggleOnDoubleClick", false},
+    {L"Toggle.fadeTrigger", true},        // dblclick | desktopIdle | systemIdle
+    {L"Toggle.idleFadeTimeout", false},
+    {L"Toggle.idleFadeInvert", false},
     // [v2.10.10] These two lived ONLY in kCfgDefaults (fresh-install
     // bootstrap) - WriteConfigMap filters by kCfgKeys, so every write of
     // them (tray menu Overlay toggle, Custom Shortcut Arrow checkbox) was
@@ -12469,6 +12646,9 @@ static const CfgDefault kCfgDefaults[] = {
     {L"Selection.selectionFadeInDuration", 250, nullptr},
     {L"Selection.selectionFadeOutDuration", 4000, nullptr},
     {L"Toggle.toggleOnDoubleClick", 1, nullptr},
+    {L"Toggle.fadeTrigger", 0, L"dblclick"},
+    {L"Toggle.idleFadeTimeout", 10000, nullptr},
+    {L"Toggle.idleFadeInvert", 0, nullptr},
     {L"Toggle.overlayEnabled", 1, nullptr},
     {L"Toggle.toggleFadeInDuration", 400, nullptr},
     {L"Toggle.toggleFadeOutDuration", 400, nullptr},
@@ -12538,10 +12718,9 @@ static void DebugLog(const wchar_t* fmt, ...) {
     if (path.empty()) return;
 
     // Fresh file per session: the flip from off->on truncates.
-    static bool s_dbgWasOn = false;
     static bool s_dbgCapped = false;
-    bool trunc = !s_dbgWasOn;
-    s_dbgWasOn = true;
+    bool trunc = !g_dbgWasOn.load(std::memory_order_relaxed);
+    g_dbgWasOn.store(true, std::memory_order_relaxed);
     if (s_dbgCapped) return;
     if (!trunc && LogFileTooBig(path.c_str(), 2ull * 1024 * 1024)) {
         s_dbgCapped = true;
@@ -12820,6 +12999,16 @@ void LoadSettings() {
     s.overlayEnabled           = cfgIntDef(L"Toggle.overlayEnabled", 1) != 0;
     s.toggleFadeInDuration     = std::max(cfgInt(L"Toggle.toggleFadeInDuration"), 0);
     s.toggleFadeOutDuration    = std::max(cfgInt(L"Toggle.toggleFadeOutDuration"), 0);
+    // [v2.10.39] Trigger mode: string key so the UI combo can stay
+    // text-contract (unknown value = double-click, the old behavior).
+    {
+        std::wstring trig = cfgStr(L"Toggle.fadeTrigger");
+        if (trig == L"desktopIdle")     s.fadeTriggerMode = 1;
+        else if (trig == L"systemIdle") s.fadeTriggerMode = 2;
+        else                            s.fadeTriggerMode = 0;
+    }
+    s.idleFadeTimeout          = std::max(cfgInt(L"Toggle.idleFadeTimeout"), 100);
+    s.idleFadeInvert           = cfgInt(L"Toggle.idleFadeInvert") != 0;
     s.shadowLength             = std::max(cfgInt(L"Shadows.shadowLength"), 0);
     s.shadowPasses             = std::clamp(cfgInt(L"Shadows.shadowPasses"), 1, 64);
     s.shadowBaseAlpha          = std::clamp(cfgInt(L"Shadows.shadowBaseAlpha"), 0, 255);
@@ -13208,9 +13397,12 @@ static BOOL Engine_ModInit() {
     BootLog(L"[BOOT] dll=%s", dllPath);
 
     // Log std::terminate with the active exception before the runtime aborts
-    // (the libc++.whl 0x40000015 crash signature). Process-global: if another
-    // mod ever installs its own handler, ours is replaced — acceptable.
-    std::set_terminate([]() {
+    // (the libc++.whl 0x40000015 crash signature). Process-global: the
+    // previous handler is saved and RESTORED in Wh_ModUninit — a lambda into
+    // this DLL surviving the unmap would fail-fast explorer on the next
+    // std::terminate (same genre as the SetUnhandledExceptionFilter handoff
+    // below).
+    g_prevTerminate = std::set_terminate([]() {
         DiagLogAlways(L"[TERMINATE] std::terminate called!");
         if (std::current_exception()) {
             try {
@@ -13425,9 +13617,9 @@ static void Engine_ModUninit() {
     // survived (hung UI thread), unregistering would fail silently and leave a
     // wndproc pointing into an unloading DLL.
     if (!IsWindow(g_overlayWnd) && !IsWindow(g_underlayWnd) && !IsWindow(g_messageWnd)) {
-        UnregisterClass(OVERLAY_WINDOW_CLASS, GetCurrentModuleHandle());
-        UnregisterClass(UNDERLAY_WINDOW_CLASS, GetCurrentModuleHandle());
-        UnregisterClass(MESSAGE_WINDOW_CLASS, GetCurrentModuleHandle());
+        UnregisterClass(Uq(OVERLAY_WINDOW_CLASS).c_str(), GetCurrentModuleHandle());
+        UnregisterClass(Uq(UNDERLAY_WINDOW_CLASS).c_str(), GetCurrentModuleHandle());
+        UnregisterClass(Uq(MESSAGE_WINDOW_CLASS).c_str(), GetCurrentModuleHandle());
     }
 
     // 6. THE EXECUTIONER: Hierarchically release all GPU & COM resources
@@ -13447,6 +13639,8 @@ static void Engine_ModUninit() {
 // callback and the config-file watcher (the settings window's writes).
 void ApplySettingsChanges() {
     LoadSettings();
+    // [v2.10.39] Trigger mode / timeout changed: re-arm the idle poll.
+    UpdateIdleFadeTimer();
     if (g_messageWnd) PostMessageW(g_messageWnd, WMAPP_APPLYHOTKEY, 0, 0);
     // [F1/P1.1] Bump the arrow generation ONLY when a baked-pixel input
     // actually changed (LoadSettings reports via g_bakedInputsChanged). The
@@ -14128,6 +14322,7 @@ struct CtlSpec {
     const wchar_t* const* options;       // for Combo (stored values)
     int optionCount;
     const wchar_t* const* displayNames;  // optional user-facing combo names
+    bool pct = false;  // [v2.10.37] slider edits a 0-100% view of a 0-255 cfg value
 };
 
 // Sections mirror the ENGINE MOD's own settings groups — no invented names.
@@ -14201,6 +14396,9 @@ static const wchar_t* const kCacheModeDisplay[] = {
 #define CBOS(s, k, lbl, opts) {s, Kind::Combo, k, lbl, 0, 0, opts, ARRAYSIZE(opts), nullptr}
 #define CBOSD(s, k, lbl, opts, disp) {s, Kind::Combo, k, lbl, 0, 0, opts, ARRAYSIZE(opts), disp}
 #define COLR(s, k, lbl) {s, Kind::Color, k, lbl, 0, 0, nullptr, 0}
+// [v2.10.37] Percentage slider: the ENGINE value stays 0-255 (existing
+// settings.cfg files stay valid); the UI edits a 0-100 view.
+#define SLDP(s, k, lbl, mn, mx) {s, Kind::Slider, k, lbl, mn, mx, nullptr, 0, nullptr, true}
 #define HINT(s, txt) {s, Kind::Hint, L"", txt, 0, 0, nullptr, 0}
 
 static const CtlSpec kSpecs[] = {
@@ -14230,9 +14428,16 @@ static const CtlSpec kSpecs[] = {
     // Overlay (Doc 2026-11-08: dim veil + toggle/tint/arrow groups; the
     // sidebar checkbox toggles veil AND tint. Group titles are the enable
     // checkboxes and live in kGroups, not here.)
-    SLD(SEC_OVERLAY, L"Spotlight.idleOpacity", L"Overlay Opacity", 0, 255),
+    // [v2.10.37] Doc: "Opacity" - the tab IS the context; shown as %.
+    SLDP(SEC_OVERLAY, L"Spotlight.idleOpacity", L"Opacity", 0, 100),
     CHKS(SEC_OVERLAY, L"Spotlight.overlayClipToIcons",
          L"Clip Overlay to Icons"),
+    // [v2.10.42] Fade group row order (Doc): Invert checkbox FIRST, then
+    // Idle Timeout, then the durations. Invert + Idle Timeout enabled only
+    // when the Fade group's trigger combo is an idle mode.
+    CHKS(SEC_OVERLAY, L"Toggle.idleFadeInvert", L"Invert"),
+    SLD(SEC_OVERLAY, L"Toggle.idleFadeTimeout",
+        L"Idle Timeout (ms)", 500, 120000),
     SLD(SEC_OVERLAY, L"Toggle.toggleFadeInDuration",
         L"Fade In Duration (ms)", 0, 3000),
     SLD(SEC_OVERLAY, L"Toggle.toggleFadeOutDuration",
@@ -14252,7 +14457,7 @@ static const CtlSpec kSpecs[] = {
     // the sidebar)
     SLD(SEC_SHADOWS, L"Shadows.shadowLength", L"Length (px)", 0, 1000),
     SLD(SEC_SHADOWS, L"Shadows.shadowPasses", L"Quality", 1, 32),
-    SLD(SEC_SHADOWS, L"Shadows.shadowBaseAlpha", L"Opacity", 0, 255),
+    SLDP(SEC_SHADOWS, L"Shadows.shadowBaseAlpha", L"Opacity", 0, 100),
     SLD(SEC_SHADOWS, L"Shadows.shadowBlur", L"Blur (px)", 0, 50),
     SLD(SEC_SHADOWS, L"Shadows.shadowTailSoftness", L"Tail Softness (%)", 0,
         100),
@@ -14274,9 +14479,12 @@ static const CtlSpec kSpecs[] = {
     SLD(SEC_SPOTLIGHT, L"Spotlight.spotlightFadeOutDuration",
         L"Fade Out Duration (ms)", 0, 5000),
     CBOS(SEC_SPOTLIGHT, L"batSignalStyle", L"🦇", kBatStyles),
-    CBOS(SEC_SPOTLIGHT, L"batLogoBlur", L"🦇", kBatBlurs),
+    // [v2.10.37] The blur combo became a slider (fit + intuitive, Doc).
+    // Engine contract kept: -1 = Auto (follow spotlight edge blur), 0..60 =
+    // explicit blur (logo = value/6). -1 range needs signed-safe set below.
+    SLD(SEC_SPOTLIGHT, L"batLogoBlur", L"🦇", -1, 60),
     // Selection (Enable lives in the sidebar)
-    SLD(SEC_SELECTION, L"Selection.selectionOpacity", L"Opacity", 0, 255),
+    SLDP(SEC_SELECTION, L"Selection.selectionOpacity", L"Opacity", 0, 100),
     SLD(SEC_SELECTION, L"Selection.selectionPadding", L"Padding (px)", 0, 500),
     SLD(SEC_SELECTION, L"Selection.selectionRoundness", L"Roundness (%)", 0,
         100),
@@ -14371,8 +14579,16 @@ struct GroupSpec {
     const wchar_t* titleText;   // checkbox label
     const wchar_t* const* memberKeys;
     int memberCount;
+    // [v2.10.39] Optional combo living NEXT to the title checkbox, ON the
+    // frame's top border (the "Fade" group: trigger mode picker). Null for
+    // plain groups.
+    const wchar_t* titleComboKey;
+    const wchar_t* const* titleComboOptions;
+    const wchar_t* const* titleComboDisplay;
+    int titleComboCount;
 };
 static const wchar_t* const kFadeMembers[] = {
+    L"Toggle.idleFadeInvert", L"Toggle.idleFadeTimeout",
     L"Toggle.toggleFadeInDuration", L"Toggle.toggleFadeOutDuration"};
 static const wchar_t* const kTintMembers[] = {
     L"Tint.tintStrength", L"Tint.tintPreset"};
@@ -14383,19 +14599,28 @@ static const wchar_t* const kShadowFadeMembers[] = {
 static const wchar_t* const kArrowMembers[] = {
     L"General.customArrowScale", L"General.customArrowOffsetX",
     L"General.customArrowOffsetY"};
+// [v2.10.39] Fade trigger options (values = engine cfg contract; display =
+// user-facing). dblclick keeps the old double-click toggle behavior.
+static const wchar_t* const kFadeTriggerVals[] = {
+    L"dblclick", L"desktopIdle", L"systemIdle"};
+static const wchar_t* const kFadeTriggerDisplay[] = {
+    L"On Double-Click (Toggle)", L"On Desktop Idle", L"On System Idle"};
 static const GroupSpec kGroups[] = {
-    {SEC_OVERLAY, L"Toggle.toggleOnDoubleClick", L"Toggle on Double-Click",
-     kFadeMembers, 2},
-    {SEC_OVERLAY, L"Tint.tintEnabled", L"Tint", kTintMembers, 2},
+    {SEC_OVERLAY, L"Toggle.toggleOnDoubleClick", L"Fade",
+     kFadeMembers, 4, L"Toggle.fadeTrigger", kFadeTriggerVals,
+     kFadeTriggerDisplay, ARRAYSIZE(kFadeTriggerVals)},
+    {SEC_OVERLAY, L"Tint.tintEnabled", L"Tint", kTintMembers, 2, nullptr,
+     nullptr, nullptr, 0},
     {SEC_OVERLAY, L"General.customArrowEnabled", L"Custom Shortcut Arrow:",
-     kArrowMembers, 3},
+     kArrowMembers, 3, nullptr, nullptr, nullptr, 0},
     {SEC_SPOTLIGHT, L"batSignalEnabled", L"🦇",
-     kBatMembers, 2},
+     kBatMembers, 2, nullptr, nullptr, nullptr, 0},
     {SEC_SHADOWS, L"Shadows.shadowGlobalTracking", L"Global Tracking",
-     kShadowFadeMembers, 2},
+     kShadowFadeMembers, 2, nullptr, nullptr, nullptr, 0},
 };
 static HWND g_groupWnds[ARRAYSIZE(kGroups)] = {};
 static HWND g_groupTitle[ARRAYSIZE(kGroups)] = {};
+static HWND g_titleCombo[ARRAYSIZE(kGroups)] = {};
 
 // Group frame window: paints pane bg + a 1px stroke frame. Created before
 // the rows so it sits BEHIND them; positioned by LayoutRows to wrap the
@@ -14447,16 +14672,19 @@ static LRESULT CALLBACK GroupProc(HWND hwnd, UINT msg, WPARAM wParam,
 
 
 
+static bool g_groupClassOk = false;
+static std::wstring g_groupClassName;
 static void RegisterGroupClass() {
     static bool done = false;
     if (done) return;
     done = true;
+    g_groupClassName = Uq(L"AbTenebrisControl_Group");  // unique per load
     WNDCLASSW wc = {};
     wc.lpfnWndProc = GroupProc;
     wc.hInstance = GetModHInstance();
     wc.hbrBackground = nullptr;
-    wc.lpszClassName = L"AbTenebrisControl_Group";
-    RegisterClassW(&wc);
+    wc.lpszClassName = g_groupClassName.c_str();
+    g_groupClassOk = RegisterClassGuarded(wc);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -14735,15 +14963,16 @@ static void LayoutRows(HWND hwnd) {
 
         int ctlH = MulDiv(row.spec->kind == Kind::Slider ? 28 : 24, dpi, 96);
         int ctlY = y + (rowH - ctlH) / 2;
+        // Rows living inside a titled group get 12px of label padding
+        // (Doc: the frame already indents them visually).
+        bool inGroup = false;
+        for (const GroupSpec& g : kGroups)
+            for (int mk = 0; mk < g.memberCount && !inGroup; mk++)
+                if (wcscmp(g.memberKeys[mk], row.spec->key) == 0)
+                    inGroup = true;
         if (row.label) {
-            // Rows living inside a titled group get 12px of label padding
-            // (Doc: the frame already indents them visually).
-            bool inGroup = false;
-            for (const GroupSpec& g : kGroups)
-                for (int mk = 0; mk < g.memberCount && !inGroup; mk++)
-                    if (wcscmp(g.memberKeys[mk], row.spec->key) == 0)
-                        inGroup = true;
-            MoveWindow(row.label, margin + (inGroup ? MulDiv(12, dpi, 96) : 0),
+            // [v2.10.46] In-group indent 12 -> 20 (Doc: +8px).
+            MoveWindow(row.label, margin + (inGroup ? MulDiv(20, dpi, 96) : 0),
                        y, labelW, rowH, !g_resizing);
         }
         // Slider column caps at 560px — precision dies on an endless track.
@@ -14753,8 +14982,12 @@ static void LayoutRows(HWND hwnd) {
         // the same line (the value column's right edge).
         int valueRight = margin + labelW + sliderW + MulDiv(8, dpi, 96) +
                          valueW;
-        // Checkboxes span the whole row (own text); others sit in the ctl column.
-        int ctlX = margin + (row.spec->kind == Kind::Chk ? 0 : labelW);
+        // Checkboxes span the whole row (own text); others sit in the ctl
+        // column. [v2.10.46] A checkbox row inside a group (Invert) shares
+        // the 20px indent of the group's labels (Doc: +8px).
+        int ctlX = margin + ((row.spec->kind == Kind::Chk && inGroup)
+                                 ? MulDiv(20, dpi, 96)
+                                 : (row.spec->kind == Kind::Chk ? 0 : labelW));
         int ctlWid =
             row.spec->kind == Kind::Slider
                 ? sliderW
@@ -14763,7 +14996,9 @@ static void LayoutRows(HWND hwnd) {
                        : (row.spec->kind == Kind::Color
                               ? editW
                               : (row.spec->kind == Kind::Chk
-                                     ? labelW + ctlW - MulDiv(20, dpi, 96)
+                                     ? labelW + ctlW - MulDiv(20, dpi, 96) +
+                                           ((inGroup) ? MulDiv(20, dpi, 96)
+                                                      : 0)
                                      : ctlW)));
         if (row.spec->kind == Kind::Combo)
             ctlX = valueRight - ctlWid;
@@ -14877,10 +15112,23 @@ static void LayoutRows(HWND hwnd) {
             ReleaseDC(g_groupTitle[gi], tdc);
             int cbW = tsz.cx + MulDiv(30, dpi, 96);
             int cbH = titleH;
-            MoveWindow(g_groupTitle[gi], fx + MulDiv(10, dpi, 96),
-                       yTop - cbH / 2, cbW, cbH, TRUE);
-            SetWindowLongPtrW(g_groupWnds[gi], GWLP_USERDATA,
-                              tsz.cx + MulDiv(18, dpi, 96));
+            // [v2.10.46] Title checkboxes +8px right (Doc): 10 -> 18 from the
+            // frame's left edge; the paint gap widens to match.
+            int titleX = fx + MulDiv(18, dpi, 96);
+            MoveWindow(g_groupTitle[gi], titleX, yTop - cbH / 2, cbW, cbH,
+                       TRUE);
+            int gapW = tsz.cx + MulDiv(26, dpi, 96);
+            if (g_titleCombo[gi]) {
+                int comboW = MulDiv(190, dpi, 96);
+                int comboH = MulDiv(26, dpi, 96);
+                // NOTE: for a COMBOBOX the window height is the DROPDOWN
+                // height, not the closed face — give it room for 3 items.
+                MoveWindow(g_titleCombo[gi], titleX + cbW + MulDiv(6, dpi, 96),
+                           yTop - comboH / 2, comboW,
+                           comboH + MulDiv(84, dpi, 96), TRUE);
+                gapW += MulDiv(6, dpi, 96) + comboW + MulDiv(8, dpi, 96);
+            }
+            SetWindowLongPtrW(g_groupWnds[gi], GWLP_USERDATA, gapW);
         }
     }
 }
@@ -14984,6 +15232,9 @@ static std::wstring GetCtlValueText(const Row& row) {
                        : L"0";
         case Kind::Slider: {
             int v = (int)SendMessageW(row.ctl, TBM_GETPOS, 0, 0);
+            // [v2.10.37] pct rows: the trackbar holds 0-100, the cfg wants
+            // 0-255.
+            if (row.spec->pct) v = (v * 255 + 50) / 100;
             swprintf_s(buf, L"%d", v);
             return buf;
         }
@@ -15013,6 +15264,9 @@ static void SetCtlFromValue(Row& row, const std::wstring& val) {
             break;
         case Kind::Slider: {
             int v = _wtoi(val.c_str());
+            // [v2.10.37] pct rows: `val` is the CFG value (0-255); the UI
+            // edits a 0-100% view of it.
+            if (row.spec->pct) v = (v * 100 + 127) / 255;
             if (v < row.spec->minV) v = row.spec->minV;
             if (v > row.spec->maxV) v = row.spec->maxV;
             CtlLog(L"[SET] %s v=%d editHwnd=0x%p", row.spec->key, v,
@@ -15065,6 +15319,13 @@ static void CollectAllValues(std::unordered_map<std::wstring, std::wstring>& out
     }
     if (!g_customHex.empty())
         out[L"Tint.tintColorHex"] = g_customHex;  // picker's write path
+    // [v2.10.39] Title combos (Fade trigger): read selection -> cfg value.
+    for (int gi = 0; gi < (int)ARRAYSIZE(kGroups); gi++) {
+        if (!kGroups[gi].titleComboKey || !g_titleCombo[gi]) continue;
+        int sel = (int)SendMessageW(g_titleCombo[gi], CB_GETCURSEL, 0, 0);
+        out[kGroups[gi].titleComboKey] =
+            sel >= 0 ? kGroups[gi].titleComboOptions[sel] : L"dblclick";
+    }
     // Keys not shown in the UI survive from the given snapshot.
     if (fillMissing) {
         for (const auto& e : *fillMissing) {
@@ -15088,32 +15349,67 @@ static bool RowlessOn(const wchar_t* key) {
 }
 
 static void ApplyGroupEnableStates() {
+    // [v2.10.38] Two-gate model: a row is enabled only if BOTH its section's
+    // sidebar toggle (Overlay/Spotlight/Shadows/Selection master switches)
+    // AND its group-title checkbox (where it belongs to one) are on. General
+    // and Diagnostics have no sidebar toggle, so they are always gated by
+    // their group alone.
+    // [v2.10.39] The section toggle now ALSO gates the group-title checkbox
+    // and title combo; the Idle Timeout row has a third gate — the Fade
+    // group's trigger combo must be an idle mode.
+    auto sectionOn = [](int section) {
+        for (const SidebarToggle& t : kSidebarToggles)
+            if (t.section == section) return RowlessOn(t.key);
+        return true;
+    };
     for (int gi = 0; gi < (int)ARRAYSIZE(kGroups); gi++) {
-        bool on = RowlessOn(kGroups[gi].titleKey);
-        for (int m = 0; m < kGroups[gi].memberCount; m++) {
-            Row* r = FindRowByKey(kGroups[gi].memberKeys[m]);
-            if (!r) continue;
-            EnableWindow(r->ctl, on);
-            if (r->value) EnableWindow(r->value, on);
-            if (r->spin) EnableWindow(r->spin, on);
-            // [v2.10.32] Synchronous repaint on enable-state flips: the
-            // disabled-slider dim is painted after the native WM_PAINT, and
-            // some machines (VM) never requeued that paint — sliders looked
-            // identical enabled vs disabled. RDW_UPDATENOW makes the paint
-            // (and thus the dim) deterministic.
-            RedrawWindow(r->ctl, nullptr, nullptr,
+        bool on = sectionOn(kGroups[gi].section);
+        if (g_groupTitle[gi]) EnableWindow(g_groupTitle[gi], on);
+        if (g_titleCombo[gi]) EnableWindow(g_titleCombo[gi], on);
+    }
+    auto fadeTriggerIdle = []() {
+        int gi = 0;  // Fade group is kGroups[0]
+        if (!g_titleCombo[gi]) return false;
+        int sel = (int)SendMessageW(g_titleCombo[gi], CB_GETCURSEL, 0, 0);
+        return sel > 0;  // 0 = dblclick
+    };
+    for (Row& r : g_rows) {
+        bool on = sectionOn(r.spec->section);
+        for (int gi = 0; gi < (int)ARRAYSIZE(kGroups); gi++) {
+            bool member = false;
+            for (int m = 0; m < kGroups[gi].memberCount; m++)
+                if (wcscmp(kGroups[gi].memberKeys[m], r.spec->key) == 0) {
+                    member = true;
+                    break;
+                }
+            if (member && !RowlessOn(kGroups[gi].titleKey)) on = false;
+        }
+        // [v2.10.41] Both idle-mode rows answer the trigger combo too.
+        if ((wcscmp(r.spec->key, L"Toggle.idleFadeTimeout") == 0 ||
+             wcscmp(r.spec->key, L"Toggle.idleFadeInvert") == 0) &&
+            !fadeTriggerIdle())
+            on = false;
+        if (r.ctl) EnableWindow(r.ctl, on);
+        if (r.value) EnableWindow(r.value, on);
+        if (r.spin) EnableWindow(r.spin, on);
+        // [v2.10.32] Synchronous repaint on enable-state flips: the
+        // disabled-slider dim is painted after the native WM_PAINT, and
+        // some machines (VM) never requeued that paint — sliders looked
+        // identical enabled vs disabled. RDW_UPDATENOW makes the paint
+        // (and thus the dim) deterministic.
+        if (r.ctl)
+            RedrawWindow(r.ctl, nullptr, nullptr,
                          RDW_INVALIDATE | RDW_ERASE | RDW_FRAME |
                              RDW_ALLCHILDREN | RDW_UPDATENOW);
-            if (r->label) {
-                // [v2.10.26] A disabled STATIC paints its text via DrawState
-                // emboss (the white shadow). Labels stay ENABLED and dim by
-                // the abtDim prop -> kColDim in CTLCOLORSTATIC instead.
-                if (on)
-                    RemovePropW(r->label, L"abtDim");
-                else
-                    SetPropW(r->label, L"abtDim", (HANDLE)1);
-                InvalidateRect(r->label, nullptr, TRUE);
-            }
+        if (r.label) {
+            // [v2.10.26] A disabled STATIC paints its text via DrawState
+            // emboss (the white shadow). Labels stay ENABLED and dim by
+            // the abtDim prop -> kColDim in CTLCOLORSTATIC instead.
+            if (on)
+                RemovePropW(r.label, L"abtDim");
+            else
+                SetPropW(r.label, L"abtDim", (HANDLE)1);
+            InvalidateRect(r.label, nullptr, TRUE);
         }
     }
     RefreshSquareFrames();
@@ -15150,6 +15446,7 @@ static void SetRowlessKey(const wchar_t* key, bool on) {
 }
 
 static void OnControlChanged();  // fwd: defined after the pane section
+static void SwitchSection(int section);  // fwd: SidebarClickProc (2.10.37)
 
 // Sidebar checkbox toggle: flip one enable-key. [v2.10.11] STAGED, not a
 // silent save: it routes through OnControlChanged like every other control,
@@ -15166,6 +15463,44 @@ static void ToggleSidebarEnable(const wchar_t* key) {
     }
     OnControlChanged();
     InvalidateRect(g_sidebar, nullptr, TRUE);
+}
+
+// [v2.10.37] Sidebar click handling as a SUBCLASS, not LBN_SELCHANGE: the
+// notification (a) fires for clicks BELOW the last item too, and LB_GETCURSEL
+// then reports the last item - so clicking the "empty" zone under the sidebar
+// toggled that item's enable checkbox (Doc's phantom hit-zone); (b) never
+// fires when the clicked item is already selected, which left repeat toggles
+// dead. Direct LB_ITEMFROMPOINT hit-testing answers both.
+static LRESULT CALLBACK SidebarClickProc(HWND hwnd, UINT msg,
+                                         WPARAM wParam, LPARAM lParam,
+                                         UINT_PTR, DWORD_PTR) {
+    if (msg == WM_LBUTTONDOWN) {
+        int hit = (int)SendMessageW(hwnd, LB_ITEMFROMPOINT, 0, lParam);
+        if (hit >> 16) {
+            // Outside client / below the last item: nothing there. Restore
+            // the current section's highlight and eat the click.
+            SendMessageW(hwnd, LB_SETCURSEL, g_curSection, 0);
+            return 0;
+        }
+        int sel = hit & 0xFFFF;
+        POINT pt{(short)LOWORD(lParam), (short)HIWORD(lParam)};
+        RECT item = {};
+        if (!SendMessageW(hwnd, LB_GETITEMRECT, sel, (LPARAM)&item))
+            return 0;
+        bool hitBox = pt.x >= item.right - MulDiv(32, GetDpiForWindow(hwnd), 96);
+        for (const SidebarToggle& t : kSidebarToggles) {
+            if (t.section == sel) {
+                if (hitBox) {
+                    ToggleSidebarEnable(t.key);  // stay on the section
+                    return 0;
+                }
+                break;  // text zone of a toggle section = navigate
+            }
+        }
+        SwitchSection(sel);
+        return 0;
+    }
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
 }
 
 // Checked state of a sidebar toggle: row control if the key has one,
@@ -15251,6 +15586,22 @@ static void SyncFromExternalChanges() {
         if (!FindRowByKey(t.key)) syncRowless(t.key);
     for (const GroupSpec& g : kGroups)
         if (!FindRowByKey(g.titleKey)) syncRowless(g.titleKey);
+    // [v2.10.39] Title combos (Fade trigger) follow external file changes.
+    for (int gi = 0; gi < (int)ARRAYSIZE(kGroups); gi++) {
+        if (!kGroups[gi].titleComboKey || !g_titleCombo[gi]) continue;
+        auto it = file.find(kGroups[gi].titleComboKey);
+        if (it == file.end()) continue;
+        if (!externallyChanged(kGroups[gi].titleComboKey, it->second))
+            continue;
+        int sel = 0;
+        for (int i = 0; i < kGroups[gi].titleComboCount; i++)
+            if (it->second == kGroups[gi].titleComboOptions[i]) {
+                sel = i;
+                break;
+            }
+        SendMessageW(g_titleCombo[gi], CB_SETCURSEL, sel, 0);
+        any = true;
+    }
     g_lastSynced = file;
     if (any) {
         ApplyGroupEnableStates();
@@ -15323,12 +15674,14 @@ static LRESULT CALLBACK PaneProc(HWND hwnd, UINT msg, WPARAM wParam,
                 if (!row.ctl || GetParent(row.ctl) != hwnd) continue;
                 if (!IsWindowEnabled(row.ctl)) continue;
                 bool hit = false;
+                bool overSpin = false;  // wheel over the value box/spinner
                 for (HWND t : {row.value, row.spin, row.ctl}) {
                     if (!t) continue;
                     RECT rc;
                     GetWindowRect(t, &rc);
                     if (PtInRect(&rc, pt)) {
                         hit = true;
+                        if (t != row.ctl) overSpin = true;  // edit or spinner
                         break;
                     }
                 }
@@ -15336,12 +15689,17 @@ static LRESULT CALLBACK PaneProc(HWND hwnd, UINT msg, WPARAM wParam,
                 if (row.spec->kind == Kind::Slider) {
                     int v = (int)SendMessageW(row.ctl, TBM_GETPOS, 0, 0);
                     // Doc's mapping: wheel DOWN = value DOWN. Step =
-                    // ~1% of the slider's range (min 1).
+                    // ~1% of the slider's range (min 1) over the TRACKBAR;
+                    // over the spinbox/edit the step is always 1 (Doc:
+                    // precise entry must not jump by slider steps).
                     int range = row.spec->maxV - row.spec->minV;
-                    int step = range > 100 ? (range + 50) / 100 : 1;
+                    int step = overSpin ? 1 : (range > 100 ? (range + 50) / 100 : 1);
                     v += (delta > 0 ? step : -step);
                     if (v < row.spec->minV) v = row.spec->minV;
                     if (v > row.spec->maxV) v = row.spec->maxV;
+                    // [v2.10.37] trackbar pos -> CFG value at the boundary
+                    // (SetCtlFromValue expects cfg units; pct rows hold %).
+                    if (row.spec->pct) v = (v * 255 + 50) / 100;
                     SetCtlFromValue(row, std::to_wstring(v));
                     OnControlChanged();
                     CtlLog(L"[WHEEL] slider '%s' delta=%d -> v=%d",
@@ -15389,16 +15747,21 @@ static LRESULT CALLBACK PaneProc(HWND hwnd, UINT msg, WPARAM wParam,
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+static std::wstring g_paneClassName;
 static void RegisterPaneClass() {
     static bool done = false;
     if (done) return;
     done = true;
+    g_paneClassName = Uq(L"AbTenebrisControl_Pane");  // unique per load
     WNDCLASSW wc = {};
     wc.lpfnWndProc = PaneProc;
     wc.hInstance = GetModHInstance();
     wc.hbrBackground = nullptr;
-    wc.lpszClassName = L"AbTenebrisControl_Pane";
-    RegisterClassW(&wc);
+    wc.lpszClassName = g_paneClassName.c_str();
+    if (!RegisterClassGuarded(wc)) {
+        done = false;  // stale: retry next call
+        g_paneClassName.clear();
+    }
 }
 
 static void BuildSectionPanes(HWND parent, const RECT& content) {
@@ -15414,8 +15777,15 @@ static void BuildSectionPanes(HWND parent, const RECT& content) {
 
     for (const CtlSpec& spec : kSpecs) {
         if (!g_panes[spec.section]) {
+            // [v2.10.43] Crash guard: a stale Pane class (survivor of a
+            // raced teardown) must NOT receive CreateWindowExW — its
+            // wndproc points into unmapped memory. Degrade to no window.
+            if (g_paneClassName.empty()) {
+                Wh_Log(L"[RELOAD] Pane class unavailable - skipping pane build");
+                return;
+            }
             g_panes[spec.section] = CreateWindowExW(
-                0, L"AbTenebrisControl_Pane", nullptr,
+                0, g_paneClassName.c_str(), nullptr,
                 WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
                 content.left, content.top, content.right - content.left,
                 content.bottom - content.top, parent, nullptr, hInst, nullptr);
@@ -15425,8 +15795,12 @@ static void BuildSectionPanes(HWND parent, const RECT& content) {
             RegisterGroupClass();
             for (int gi = 0; gi < (int)ARRAYSIZE(kGroups); gi++) {
                 if (kGroups[gi].section != spec.section) continue;
+                if (!g_groupClassOk) {
+                    Wh_Log(L"[RELOAD] Group class unavailable - skipping frame");
+                    continue;
+                }
                 g_groupWnds[gi] = CreateWindowExW(
-                    0, L"AbTenebrisControl_Group", nullptr,
+                    0, g_groupClassName.c_str(), nullptr,
                     WS_CHILD | WS_VISIBLE, 0, 0, 0, 0,
                     g_panes[spec.section], nullptr, hInst, nullptr);
                 g_groupTitle[gi] = CreateWindowExW(
@@ -15440,6 +15814,34 @@ static void BuildSectionPanes(HWND parent, const RECT& content) {
                                           : g_font),
                              TRUE);
                 Darkize(g_groupTitle[gi]);
+                // [v2.10.39] Trigger combo rides on the frame next to the
+                // title (Fade group only). Same owner-draw + square-border
+                // treatment as row combos.
+                g_titleCombo[gi] = nullptr;
+                if (kGroups[gi].titleComboKey) {
+                    g_titleCombo[gi] = CreateWindowExW(
+                        0, L"COMBOBOX", nullptr,
+                        WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+                            CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED |
+                            CBS_HASSTRINGS,
+                        0, 0, 0, 0, g_panes[spec.section],
+                        (HMENU)(INT_PTR)(6000 + gi), hInst, nullptr);
+                    SubclassComboPaint(g_titleCombo[gi]);
+                    SendMessageW(g_titleCombo[gi], CB_SETITEMHEIGHT, 0,
+                                 MulDiv(24, dpi, 96));
+                    COMBOBOXINFO cbi = {sizeof(cbi)};
+                    if (SendMessageW(g_titleCombo[gi], CB_GETCOMBOBOXINFO, 0,
+                                     (LPARAM)&cbi) &&
+                        cbi.hwndList)
+                        SubclassSquareBorder(cbi.hwndList, false);
+                    for (int i = 0; i < kGroups[gi].titleComboCount; i++)
+                        SendMessageW(g_titleCombo[gi], CB_ADDSTRING, 0,
+                                     (LPARAM)kGroups[gi]
+                                         .titleComboDisplay[i]);
+                    SendMessageW(g_titleCombo[gi], WM_SETFONT,
+                                 (WPARAM)g_font, TRUE);
+                    Darkize(g_titleCombo[gi], true);
+                }
             }
         }
         HWND pane = g_panes[spec.section];
@@ -15504,8 +15906,9 @@ static void BuildSectionPanes(HWND parent, const RECT& content) {
                                       pane,
                                       (HMENU)(INT_PTR)(2000 + (int)g_rows.size()),
                                       hInst, nullptr);
-                SendMessageW(ctl, TBM_SETRANGE, TRUE,
-                             MAKELPARAM(spec.minV, spec.maxV));
+                SendMessageW(ctl, TBM_SETRANGEMIN, TRUE, spec.minV);
+                SendMessageW(ctl, TBM_SETRANGEMAX, TRUE, spec.maxV);
+                SendMessageW(ctl, TBM_SETPOS, TRUE, (LPARAM)spec.maxV);
                 RouteTrackbarWheel(ctl);
                 break;
             case Kind::Combo: {
@@ -15633,7 +16036,12 @@ static void BuildProfilesPane(HWND parent, const RECT& content) {
         if (sp.section == SEC_GENERAL) genRows++;
     int rowH36 = MulDiv(36, dpi, 96);
     int profTop = m + genRows * rowH36 + m;
-    HWND pane = CreateWindowExW(0, L"AbTenebrisControl_Pane", nullptr,
+    RegisterPaneClass();
+    if (g_paneClassName.empty()) {
+        Wh_Log(L"[RELOAD] Pane class unavailable - skipping profiles pane");
+        return;
+    }
+    HWND pane = CreateWindowExW(0, g_paneClassName.c_str(), nullptr,
                                 WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
                                 content.left, content.top + profTop,
                                 content.right - content.left,
@@ -15705,7 +16113,12 @@ static void BuildProfilesPane(HWND parent, const RECT& content) {
 
 static void BuildDiagnosticsPane(HWND parent, const RECT& content) {
     HINSTANCE hInst = GetModHInstance();
-    HWND pane = CreateWindowExW(0, L"AbTenebrisControl_Pane", nullptr,
+    RegisterPaneClass();
+    if (g_paneClassName.empty()) {
+        Wh_Log(L"[RELOAD] Pane class unavailable - skipping diagnostics pane");
+        return;
+    }
+    HWND pane = CreateWindowExW(0, g_paneClassName.c_str(), nullptr,
                                 WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
                                 content.left, content.top,
                                 content.right - content.left,
@@ -15793,6 +16206,19 @@ static void LoadValuesIntoControls() {
         auto it = kv.find(L"Tint.tintColorHex");
         g_customHex = (it != kv.end()) ? it->second : L"";
     }
+    // [v2.10.39] Title combos (Fade trigger): cfg value -> selection.
+    for (int gi = 0; gi < (int)ARRAYSIZE(kGroups); gi++) {
+        if (!kGroups[gi].titleComboKey || !g_titleCombo[gi]) continue;
+        auto it = kv.find(kGroups[gi].titleComboKey);
+        std::wstring val = (it != kv.end()) ? it->second : L"dblclick";
+        int sel = 0;
+        for (int i = 0; i < kGroups[gi].titleComboCount; i++)
+            if (val == kGroups[gi].titleComboOptions[i]) {
+                sel = i;
+                break;
+            }
+        SendMessageW(g_titleCombo[gi], CB_SETCURSEL, sel, 0);
+    }
     ApplyGroupEnableStates();
     g_loading = false;
 }
@@ -15802,6 +16228,11 @@ static void LoadValuesIntoControls() {
 
 static void SwitchSection(int section) {
     g_curSection = section;
+    // [v2.10.38] SidebarClickProc eats WM_LBUTTONDOWN, so the listbox's
+    // native selection never runs — the highlight used to stick on General
+    // while the panes switched. Set it here; keyboard (LBN_SELCHANGE) and
+    // mouse both land in this function.
+    SendMessageW(g_sidebar, LB_SETCURSEL, section, 0);
     for (int s = 0; s < SEC_COUNT; s++) {
         if (g_panes[s]) ShowWindow(g_panes[s], s == section ? SW_SHOW : SW_HIDE);
     }
@@ -15873,6 +16304,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                 (HMENU)(INT_PTR)ID_SIDEBAR, hInst, nullptr);
             Darkize(g_sidebar);
             ReverseWheel(g_sidebar, /*sidebar=*/true);
+            SetWindowSubclass(g_sidebar, SidebarClickProc, 9, 0);
             SendMessageW(g_sidebar, WM_SETFONT, (WPARAM)g_font, TRUE);
             SendMessageW(g_sidebar, LB_SETITEMHEIGHT, 0,
                          MAKELPARAM(MulDiv(36, dpi, 96), 0));
@@ -15891,6 +16323,27 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             g_chkPreview = preview;
             SendMessageW(preview, WM_SETFONT, (WPARAM)g_font, TRUE);
             Darkize(preview);
+            // [v2.10.37] Remember the preview choice across instances
+            // (settings.cfg is engine-owned and filtered by kCfgKeys, so the
+            // flag lives in its own tiny ui_state file).
+            {
+                std::wstring dir = GetAbTenebrisConfigDir();
+                if (!dir.empty()) {
+                    std::wstring sp = dir + L"\\ui_state.txt";
+                    HANDLE hs = CreateFileW(sp.c_str(), GENERIC_READ,
+                                            FILE_SHARE_READ, nullptr,
+                                            OPEN_EXISTING,
+                                            FILE_ATTRIBUTE_NORMAL, nullptr);
+                    if (hs != INVALID_HANDLE_VALUE) {
+                        char buf[64] = {};
+                        DWORD rd = 0;
+                        ReadFile(hs, buf, sizeof(buf) - 1, &rd, nullptr);
+                        CloseHandle(hs);
+                        if (strstr(buf, "previewOn=1"))
+                            SendMessageW(preview, BM_SETCHECK, BST_CHECKED, 0);
+                    }
+                }
+            }
 
             struct Btn {
                 int id;
@@ -15986,6 +16439,8 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                     v += ud->iDelta;  // up arrow = value up (standard)
                     if (v < row.spec->minV) v = row.spec->minV;
                     if (v > row.spec->maxV) v = row.spec->maxV;
+                    // [v2.10.37] trackbar pos -> CFG value at the boundary
+                    if (row.spec->pct) v = (v * 255 + 50) / 100;
                     SetCtlFromValue(row, std::to_wstring(v));
                     OnControlChanged();
                 }
@@ -16339,25 +16794,22 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                 OnControlChanged();
                 return 0;
             }
+            // [v2.10.39] Title combos (Fade trigger): stage the edit and
+            // re-run gating (Idle Timeout row follows the selected mode).
+            if (id >= 6000 &&
+                id < 6000 + (int)ARRAYSIZE(kGroups) &&
+                code == CBN_SELCHANGE) {
+                OnControlChanged();
+                ApplyGroupEnableStates();
+                return 0;
+            }
             if (id == ID_SIDEBAR && code == LBN_SELCHANGE) {
+                // [v2.10.37] Mouse clicks are eaten by SidebarClickProc
+                // before the default proc; what arrives here is a KEYBOARD
+                // selection change - navigate only, never hit-test against
+                // a cursor that may be anywhere.
                 int sel = (int)SendMessageW(g_sidebar, LB_GETCURSEL, 0, 0);
-                if (sel >= 0) {
-                    // Click on the item's checkbox zone = toggle the enable
-                    // key (and stay on the section); click on text = navigate.
-                    POINT pt;
-                    GetCursorPos(&pt);
-                    ScreenToClient(g_sidebar, &pt);
-                    RECT item = {};
-                    SendMessageW(g_sidebar, LB_GETITEMRECT, sel, (LPARAM)&item);
-                    bool hitBox = pt.x >= item.right - MulDiv(32, GetDpiForWindow(hwnd), 96);
-                    for (const SidebarToggle& t : kSidebarToggles) {
-                        if (t.section == sel && hitBox) {
-                            ToggleSidebarEnable(t.key);
-                            return 0;
-                        }
-                    }
-                    SwitchSection(sel);
-                }
+                if (sel >= 0) SwitchSection(sel);
                 return 0;
             }
             // Slider value-edit typed a number (id 3000+rowIndex).
@@ -16374,6 +16826,8 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                         if (v > row.spec->maxV) v = row.spec->maxV;
                         g_syncing = true;
                         SendMessageW(row.ctl, TBM_SETPOS, TRUE, (LPARAM)v);
+                        g_syncing = false;  // [v2.10.38] was left TRUE forever
+                        OnControlChanged();  // typed value = a staged edit
                     }
                 }
                 return 0;
@@ -16401,6 +16855,27 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                 return 0;
             }
             if (id == ID_CHK_PREVIEW && code == BN_CLICKED) {
+                // [v2.10.37] persist the choice across window instances
+                {
+                    std::wstring dir = GetAbTenebrisConfigDir();
+                    if (!dir.empty()) {
+                        CreateDirectoryW(dir.c_str(), nullptr);
+                        std::wstring sp = dir + L"\\ui_state.txt";
+                        bool on = SendMessageW(g_chkPreview, BM_GETCHECK, 0,
+                                               0) == BST_CHECKED;
+                        HANDLE hs = CreateFileW(sp.c_str(), GENERIC_WRITE, 0,
+                                                nullptr, CREATE_ALWAYS,
+                                                FILE_ATTRIBUTE_NORMAL,
+                                                nullptr);
+                        if (hs != INVALID_HANDLE_VALUE) {
+                            char buf[32];
+                            int l = sprintf(buf, "previewOn=%d", on ? 1 : 0);
+                            DWORD w2 = 0;
+                            WriteFile(hs, buf, (DWORD)l, &w2, nullptr);
+                            CloseHandle(hs);
+                        }
+                    }
+                }
                 if (SendMessageW(g_chkPreview, BM_GETCHECK, 0, 0) ==
                         BST_CHECKED &&
                     g_dirty) {
@@ -16665,11 +17140,18 @@ static void OpenSettingsWindow() {
     wc.hIcon = g_trayIcon ? g_trayIcon
                           : LoadIcon(nullptr, IDI_APPLICATION);
     wc.hbrBackground = nullptr;
-    wc.lpszClassName = kWindowClassName;
-    RegisterClassW(&wc);
+    // [v2.10.47] Unique per-load class name.
+    static const std::wstring s_setCls = Uq(kWindowClassName);
+    wc.lpszClassName = s_setCls.c_str();
+    if (!RegisterClassGuarded(wc)) {
+        Wh_Log(L"[RELOAD] settings window class stale - aborting open");
+        return;
+    }
 
     int wndW = 960;  // raw px — fixed per Doc; we adjust slowly from here
-    int wndH = 700;
+    // [v2.10.41] 850: the Overlay tab (11 rows + 3 group bands) fits its
+    // pane at Doc's 125% without the scrollbar (pane needs ~790 client px).
+    int wndH = 850;
     RECT work = {};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     int x = work.left + ((work.right - work.left) - wndW) / 2;
@@ -16678,7 +17160,7 @@ static void OpenSettingsWindow() {
     // FIXED size per Doc: caption + sysmenu + minimize only — no thick
     // frame, no maximize box. Size adjustments are code changes from here.
     g_settingsWnd = CreateWindowExW(
-        0, kWindowClassName, kWindowTitle,
+        0, s_setCls.c_str(), kWindowTitle,
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX |
             WS_CLIPCHILDREN,
         x, y, wndW, wndH,
@@ -17098,15 +17580,22 @@ static DWORD WINAPI UIThreadProc(void*) {
     WNDCLASSW wc = {};
     wc.lpfnWndProc = MsgWndProc;
     wc.hInstance = GetModHInstance();
-    wc.lpszClassName = kMessageClassName;
-    RegisterClassW(&wc);
-
-    g_msgWnd = CreateWindowExW(0, kMessageClassName, L"AbTenebrisControl",
+    // [v2.10.47] Unique per-load class name.
+    static const std::wstring s_msgCls = Uq(kMessageClassName);
+    wc.lpszClassName = s_msgCls.c_str();
+    if (!RegisterClassGuarded(wc)) {
+        // Stale class from a previous instance: creating the window would
+        // fail-fast explorer. No tray this boot, no crash.
+        Wh_Log(L"[CTRL] message window class stale - tray disabled this boot");
+        CtlLog(L"[CTRL] message window class stale - tray disabled this boot");
+    } else {
+        g_msgWnd = CreateWindowExW(0, s_msgCls.c_str(), L"AbTenebrisControl",
                                WS_OVERLAPPED, 0, 0, 0, 0, nullptr, nullptr,
                                wc.hInstance, nullptr);
-    if (g_msgWnd) {
-        AddTrayIcon(g_msgWnd, L"init");
-        SetTimer(g_msgWnd, kTrayRetryTimer, 5000, nullptr);
+        if (g_msgWnd) {
+            AddTrayIcon(g_msgWnd, L"init");
+            SetTimer(g_msgWnd, kTrayRetryTimer, 5000, nullptr);
+        }
     }
 
     MSG msg;
@@ -17172,9 +17661,19 @@ static void WhTool_ModUninit() {
     // (no other instance exists). Just shut the UI thread down cleanly.
     if (g_uiThreadId) {
         PostThreadMessageW(g_uiThreadId, WM_QUIT, 0, 0);
-        for (int i = 0; i < 40; ++i) {
-            if (!g_settingsWnd && !g_trayAdded) break;
+        // [v2.10.43] Wait for the WINDOWS to actually die, not just the
+        // flags: a window surviving the unmap pins its class with a wndproc
+        // into unmapped memory, and the NEXT push's init then fail-fasts
+        // explorer (the every-push crash). 6s budget; escalate with
+        // WM_CLOSE and 3s more before giving up (logged either way).
+        for (int i = 0; i < 120; ++i) {
+            if (!g_settingsWnd && !g_trayAdded && !g_msgWnd) break;
             Sleep(50);
+        }
+        if (IsWindow(g_msgWnd)) {
+            PostMessageW(g_msgWnd, WM_CLOSE, 0, 0);
+            for (int i = 0; i < 60 && IsWindow(g_msgWnd); ++i) Sleep(50);
+            Wh_Log(L"[CTRL] msgWnd still alive after uninit wait (class will stay pinned)");
         }
         RemoveTrayIcon();
     }
@@ -17186,6 +17685,7 @@ static void WhTool_ModSettingsChanged() {
 }
 
 BOOL Wh_ModInit() {
+    InitClassSuffix();  // [v2.10.47] per-load unique window-class names
     RefreshDebugFileLogGate();
     // v2.11.0 SINGLE-PROCESS ARCHITECTURE: everything runs in the
     // desktop-owner explorer process. The dedicated windhawk.exe tool host
@@ -17211,6 +17711,11 @@ void Wh_ModUninit() {
     if (g_crashReporterHandle)
         SetUnhandledExceptionFilter(
             (LPTOP_LEVEL_EXCEPTION_FILTER)g_crashReporterHandle);
+    // [v2.10.49] Restore the pre-mod terminate handler: our DLL-local lambda
+    // must not survive the unmap (post-unload std::terminate in explorer
+    // would jump into freed memory).
+    if (g_prevTerminate)
+        std::set_terminate(g_prevTerminate);
     WhTool_ModUninit();
     Engine_ModUninit();
 }
