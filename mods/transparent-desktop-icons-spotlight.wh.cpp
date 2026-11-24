@@ -2,7 +2,7 @@
 // @id              transparent-desktop-icons-spotlight
 // @name            "Ab Tenebris" - Transparent Desktop Icons with Spotlight and Dynamic Shadows
 // @description     Make desktop icons transparent when idle with an interactive spotlight effect, plus the Ab Tenebris control panel: tray icon and native settings window. Hover over the desktop or select icons to reveal them.
-// @version         2.10.50
+// @version         2.10.57
 // @author          drgutman
 // @github          https://github.com/drgutman
 // @homepage        https://instagram.com/drgutman
@@ -786,6 +786,10 @@ struct Settings {
     // 1 = desktop idle, 2 = system idle. idleFadeTimeout gates the idle
     // modes in ms; idle -> overlay fades OUT, input -> fades back.
     int fadeTriggerMode;
+    // [v2.10.55] Standalone dblclick split: the idle-fade master switch no
+    // longer lives in toggleOnDoubleClick (which is back to being just the
+    // double-click toggle row).
+    bool fadeEnabled;
     int idleFadeTimeout;
     bool idleFadeInvert;  // idle -> overlay fades IN (full opacity) instead of out
 
@@ -1023,9 +1027,9 @@ std::atomic<bool>   g_threadStop{false};
 //         (this caused a real Explorer deadlock once - see QuickSnapshotStatePoll).
 //
 // Declared order (outermost -> innermost when nesting is unavoidable):
+//   g_renderMutex         - g_settings + master render state
 //   g_stateMutex          - cached HWNDs, editing/drag UI flags
 //   g_snapshotMutex       - g_iconSnapshots (the single source of truth)
-//   g_renderMutex         - g_settings + master render state
 //   g_cacheMutex          - g_iconCache (GPU icon bitmaps)
 //   g_comboShadowCacheMutex / g_hashCacheMutex / g_uniqueShapesMutex /
 //   g_overlayCacheMutex   - asset caches; these are leaf locks: never take
@@ -1035,6 +1039,16 @@ std::atomic<bool>   g_threadStop{false};
 //   disk-cache mutexes    - independent domains, never nested with the above
 //
 // Known nesting actually used today:
+//   RenderLoop:           g_renderMutex -> g_stateMutex
+//                         ([v2.10.54 ORDER CORRECTED] the declaration above
+//                         used to say state OUTER / render INNER, but this
+//                         nesting — the loop holds g_renderMutex across
+//                         UpdateMouseAndAnimations, which takes g_stateMutex
+//                         for the selected-rects/editing snapshot — is the
+//                         only two-mutex nesting in the file. Grep-verified
+//                         2026-11-24: no state -> render path exists. The
+//                         old order described an earlier era of the loop;
+//                         the code drifted, the comment didn't.)
 //   ProcessSnapshotData:  g_snapshotMutex -> g_cacheMutex (asset lookups)
 //   RenderUnderlayLoop:   g_comboShadowCacheMutex held across DrawBitmap calls
 //                         (leaf usage only - do not add lock acquisitions inside)
@@ -1102,7 +1116,7 @@ ComPtr<IDCompositionVisual>  g_compositionVisual;
 // NULL-reference semantics (MSDN: insertAbove=TRUE with NULL reference =
 // BELOW all siblings) — the explicit referenceVisual form removes the trap.
 ComPtr<IDXGISwapChain1>      g_tintSwapChain;
-ComPtr<ID2D1DeviceContext>   g_tintDc;
+// [v2.10.54] g_tintDc removed — g_dc retargets onto the tint surface.
 ComPtr<ID2D1Bitmap1>         g_tintTargetBitmap;
 ComPtr<IDCompositionVisual>  g_rootVisual;
 ComPtr<IDCompositionVisual>  g_tintCompVisual;
@@ -1295,6 +1309,11 @@ std::atomic<ULONGLONG> g_lastDesktopInputMs{0};
 // the overlay renders at FULL alpha (255) regardless of idleOpacity, so the
 // icons go completely invisible (Doc: "fully visible or fully invisible").
 std::atomic<bool> g_idleFadeOpaque{false};
+// [v2.10.56] Manual toggle latch (Doc): a double-click toggle works in ANY
+// trigger mode and suspends the idle automation until the user double-clicks
+// back. Without the latch, IdleFadeTick would undo the manual state within
+// one 125ms tick.
+std::atomic<bool> g_idleManualOverride{false};
 
 // Cold-start retry tracking
 std::atomic<int>       g_initAttempts{0};
@@ -3072,11 +3091,17 @@ uint64_t GetShadowBakeHash() {
 // idleFadeTimeout of idleness the overlay fades OUT (bypassed = true); any
 // input fades it back IN. Modes: 0 = double-click only (no timer),
 // 1 = desktop idle (no input ON the desktop), 2 = system idle
-// (GetLastInputInfo). The Fade group checkbox (toggleOnDoubleClick) gates
-// the whole family.
+// (GetLastInputInfo). [v2.10.55] The Fade group checkbox is
+// Toggle.fadeEnabled now — toggleOnDoubleClick is the standalone
+// double-click row and no longer gates anything idle.
 static void IdleFadeTick() {
     Settings s = SnapshotSettings();
-    if (!s.toggleOnDoubleClick || s.fadeTriggerMode == 0) return;
+    // [v2.10.55] fadeEnabled (the Fade group checkbox) is the idle master;
+    // toggleOnDoubleClick is the standalone double-click row now.
+    if (!s.fadeEnabled || s.fadeTriggerMode == 0) return;
+    // [v2.10.56] Manual latch: the user double-click-toggled; automation
+    // stands down until the next toggle flips the latch off.
+    if (g_idleManualOverride.load(std::memory_order_relaxed)) return;
     ULONGLONG now = GetTickCount64();
     bool idle = false;
     if (s.fadeTriggerMode == 1) {
@@ -3111,13 +3136,14 @@ static void IdleFadeTick() {
 static void UpdateIdleFadeTimer() {
     if (!g_overlayWnd || !IsWindow(g_overlayWnd)) return;
     Settings s = SnapshotSettings();
-    if (s.toggleOnDoubleClick && s.fadeTriggerMode != 0) {
+    if (s.fadeEnabled && s.fadeTriggerMode != 0) {
         SetTimer(g_overlayWnd, TIMER_ID_IDLE_FADE, 125, nullptr);
     } else {
         KillTimer(g_overlayWnd, TIMER_ID_IDLE_FADE);
         // [v2.10.42] Leave NO stale automation state behind: a flip back to
         // double-click mode while idle must not keep the overlay pinned at
-        // 255 or bypassed forever.
+        // 255 or bypassed forever. [v2.10.56] the manual latch too.
+        g_idleManualOverride.store(false, std::memory_order_relaxed);
         if (g_idleFadeOpaque.exchange(false, std::memory_order_relaxed) ||
             g_overlayBypassed.exchange(false, std::memory_order_relaxed)) {
             if (g_renderEvent) SetEvent(g_renderEvent);
@@ -3291,34 +3317,165 @@ void ReadBackgroundColor(D2D1_COLOR_F& color) {
 
 // Load wallpaper image from given path into a Direct2D bitmap.
 // Returns true on success, false on failure (file missing, corrupt, etc.)
-bool LoadWallpaperBitmap(const std::wstring& path, ComPtr<ID2D1Bitmap>& outBitmap) {
-    if (!g_dc || path.empty()) return false;
-    if (!g_wicFactory && !InitWIC()) return false;
+// [v2.10.54 WALL-DECODE-SPLIT] LoadWallpaperBitmap removed — its decode now
+// runs as DecodeWallpaperPixels on the wallpaper decode thread, and the D2D
+// upload is ApplyDecodedWallpaper on the UI thread (see below).
 
-    ComPtr<IWICBitmapDecoder> decoder;
-    // We use GENERIC_READ. If Windows is actively saving the file, this will fail with ERROR_SHARING_VIOLATION.
-    HRESULT hr = g_wicFactory->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &decoder);
-    if (FAILED(hr)) {
-        return false;
+// --- [v2.10.54 WALL-DECODE-SPLIT] -------------------------------------------
+// RefreshWallpaperAndStyle used to run the WIC DECODE of a 4K wallpaper on
+// the Explorer UI/STA thread while HOLDING g_renderMutex — UI stall + render
+// stall in one step, on every wallpaper change (and the timer-retry loop
+// repeated it every 300ms while a file was mid-save). Only the two
+// IDesktopWallpaper COM reads and the config reads need STA; the decode is
+// pure WIC (free-threaded). So: the decode runs on a dedicated thread
+// against g_workerWicFactory, and the (cheap) D2D upload happens back on the
+// UI thread via WMAPP_WALLPAPER_APPLY. The old wallpaper stays displayed
+// until the new one lands — no blank flash mid-change.
+static const UINT WMAPP_WALLPAPER_APPLY = WM_APP + 16;
+
+static HANDLE g_wallKickEvent = nullptr;   // auto-reset: new path to decode
+static HANDLE g_wallStopEvent = nullptr;   // manual reset: unload
+static SafeThread g_wallDecodeThread;
+static std::mutex g_wallDecodeMutex;
+static std::wstring g_wallPendingPath;     // request (decode thread consumes)
+static std::vector<BYTE> g_wallDecodedPixels; // result (UI thread consumes)
+static UINT g_wallDecodedW = 0, g_wallDecodedH = 0;
+static std::wstring g_wallDecodedPath;
+static std::atomic<bool> g_wallDecodedReady{false};
+
+// Pure WIC decode to PBGRA pixels — no D2D, no STA requirements, safe on a
+// bare worker thread (WIC factories are free-threaded).
+static bool DecodeWallpaperPixels(const std::wstring& path,
+                                  std::vector<BYTE>& pixels, UINT& w, UINT& h) {
+    if (!g_workerWicFactory) {
+        if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                                    CLSCTX_INPROC_SERVER,
+                                    IID_PPV_ARGS(&g_workerWicFactory))))
+            return false;
     }
-
+    ComPtr<IWICBitmapDecoder> decoder;
+    if (FAILED(g_workerWicFactory->CreateDecoderFromFilename(
+            path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad,
+            &decoder)))
+        return false;
     ComPtr<IWICBitmapFrameDecode> frame;
-    hr = decoder->GetFrame(0, &frame);
-    if (FAILED(hr)) return false;
-
+    if (FAILED(decoder->GetFrame(0, &frame))) return false;
     ComPtr<IWICFormatConverter> converter;
-    hr = g_wicFactory->CreateFormatConverter(&converter);
-    if (FAILED(hr)) return false;
-
-    hr = converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0.0f, WICBitmapPaletteTypeCustom);
-    if (FAILED(hr)) return false;
-
-    ComPtr<ID2D1Bitmap> bitmap;
-    hr = g_dc->CreateBitmapFromWicBitmap(converter.Get(), nullptr, &bitmap);
-    if (FAILED(hr)) return false;
-
-    outBitmap = bitmap;
+    if (FAILED(g_workerWicFactory->CreateFormatConverter(&converter)))
+        return false;
+    if (FAILED(converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppPBGRA,
+                                     WICBitmapDitherTypeNone, nullptr, 0.0f,
+                                     WICBitmapPaletteTypeCustom)))
+        return false;
+    if (FAILED(converter->GetSize(&w, &h)) || w == 0 || h == 0) return false;
+    pixels.resize((size_t)w * h * 4);
+    if (FAILED(converter->CopyPixels(nullptr, w * 4,
+                                     (UINT)pixels.size(), pixels.data())))
+        return false;
     return true;
+}
+
+static void WallpaperDecodeThreadProc() {
+    // MTA: WIC only, no STA objects on this thread.
+    HRESULT hrCom = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    while (true) {
+        HANDLE hs[2] = {g_wallStopEvent, g_wallKickEvent};
+        DWORD r = WaitForMultipleObjects(2, hs, FALSE, INFINITE);
+        if (r != WAIT_OBJECT_0 + 1) break; // stop event or handle error
+        std::wstring path;
+        {
+            std::lock_guard<std::mutex> lock(g_wallDecodeMutex);
+            path = g_wallPendingPath;
+            g_wallPendingPath.clear();
+        }
+        if (path.empty()) continue;
+        std::vector<BYTE> px;
+        UINT w = 0, h = 0;
+        bool ok = DecodeWallpaperPixels(path, px, w, h);
+        {
+            std::lock_guard<std::mutex> lock(g_wallDecodeMutex);
+            g_wallDecodedPixels = ok ? std::move(px) : std::vector<BYTE>();
+            g_wallDecodedW = ok ? w : 0;
+            g_wallDecodedH = ok ? h : 0;
+            g_wallDecodedPath = ok ? path : std::wstring();
+        }
+        g_wallDecodedReady.store(true, std::memory_order_release);
+        if (g_messageWnd)
+            PostMessageW(g_messageWnd, WMAPP_WALLPAPER_APPLY, 0, 0);
+    }
+    if (SUCCEEDED(hrCom)) CoUninitialize();
+}
+
+// Called from RefreshWallpaperAndStyle (UI thread, holds g_renderMutex):
+// queue the path and wake the decode thread; the UI thread returns instantly.
+static void KickWallpaperDecode(const std::wstring& path) {
+    {
+        std::lock_guard<std::mutex> lock(g_wallDecodeMutex);
+        g_wallPendingPath = path;
+    }
+    if (!g_wallDecodeThread.joinable()) {
+        g_wallStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        g_wallKickEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (g_wallStopEvent && g_wallKickEvent)
+            g_wallDecodeThread.reset(new std::thread(WallpaperDecodeThreadProc));
+    }
+    if (g_wallKickEvent) SetEvent(g_wallKickEvent);
+}
+
+// UI thread (message wnd): upload the decoded pixels to a D2D bitmap on
+// g_dc and swap the wallpaper in. Cheap — the decode already happened.
+static void ApplyDecodedWallpaper() {
+    std::vector<BYTE> px;
+    UINT w = 0, h = 0;
+    std::wstring path;
+    if (!g_wallDecodedReady.exchange(false, std::memory_order_acq_rel)) return;
+    {
+        std::lock_guard<std::mutex> lock(g_wallDecodeMutex);
+        px.swap(g_wallDecodedPixels);
+        w = g_wallDecodedW;
+        h = g_wallDecodedH;
+        path = std::move(g_wallDecodedPath);
+        g_wallDecodedW = g_wallDecodedH = 0;
+        g_wallDecodedPath.clear();
+    }
+    std::lock_guard<std::mutex> lock(g_renderMutex);
+    if (!g_dc) return;
+    if (px.empty() || w == 0 || h == 0 || path.empty()) {
+        // Decode failed (likely ERROR_SHARING_VIOLATION mid-save): same
+        // retry cadence the old inline path used.
+        if (g_messageWnd) SetTimer(g_messageWnd, TIMER_ID_WALLPAPER_UPDATE, 300, nullptr);
+        return;
+    }
+    D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
+        D2D1_BITMAP_OPTIONS_NONE,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+    ComPtr<ID2D1Bitmap1> newBitmap;
+    if (FAILED(g_dc->CreateBitmap(D2D1::SizeU(w, h), px.data(), w * 4, &props, &newBitmap)) ||
+        !newBitmap) {
+        if (g_messageWnd) SetTimer(g_messageWnd, TIMER_ID_WALLPAPER_UPDATE, 300, nullptr);
+        return;
+    }
+    g_wallpaperBitmap = newBitmap;
+    g_hasWallpaper = true;
+    g_currentWallpaperPath = path;
+    WIN32_FILE_ATTRIBUTE_DATA fileInfo;
+    if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fileInfo))
+        g_lastWallpaperWriteTime = fileInfo.ftLastWriteTime;
+
+    g_tileBrush.Reset();
+    if (g_wallpaperPosition == DWPOS_TILE && g_wallpaperBitmap) {
+        D2D1_BITMAP_BRUSH_PROPERTIES brushProps = D2D1::BitmapBrushProperties(
+            D2D1_EXTEND_MODE_WRAP, D2D1_EXTEND_MODE_WRAP, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        g_dc->CreateBitmapBrush(g_wallpaperBitmap.Get(), brushProps, &g_tileBrush);
+    }
+    {
+        DiagLog(L"[WALLPAPER] pos=%d img=%ux%u path='%s' (async)",
+                (int)g_wallpaperPosition, w, h, path.c_str());
+        DebugLog(L"[WALLPAPER] pos=%d img=%ux%u path='%s' (async)",
+                 (int)g_wallpaperPosition, w, h, path.c_str());
+    }
+    g_forceRender = true;
+    if (g_renderEvent) SetEvent(g_renderEvent);
 }
 
 // Unified wallpaper and style refresh.
@@ -3390,31 +3547,16 @@ void RefreshWallpaperAndStyle() {
         g_wallpaperPosition = pos;
 
         if (pathChanged || timeChanged || posChanged) {
-            ComPtr<ID2D1Bitmap> newBitmap;
-            if (!newPath.empty() && LoadWallpaperBitmap(newPath, newBitmap)) {
-                g_wallpaperBitmap = newBitmap;
-                g_hasWallpaper = true;
-                g_currentWallpaperPath = newPath;
-                g_lastWallpaperWriteTime = newWriteTime;
-                // [MULTIMON v2.9.6] Wallpaper probe: the replica draws THIS
-                // path/position combo; compare against what the desktop
-                // shows when a fit looks wrong. Runs only on actual reloads.
-                {
-                    D2D1_SIZE_U wp = newBitmap ? newBitmap->GetPixelSize() : D2D1::SizeU(0, 0);
-                    DiagLog(L"[WALLPAPER] pos=%d img=%ux%u path='%s'",
-                            (int)g_wallpaperPosition, wp.width, wp.height, newPath.c_str());
-                    DebugLog(L"[WALLPAPER] pos=%d img=%ux%u path='%s'",
-                            (int)g_wallpaperPosition, wp.width, wp.height, newPath.c_str());
-                }
+            // [v2.10.54 WALL-DECODE-SPLIT] decode OFF this thread; the apply
+            // (bitmap swap + path/time record + tile brush) happens on the
+            // message thread when the decode lands. Until then the OLD
+            // wallpaper keeps displaying. A failed decode (file mid-save)
+            // re-arms TIMER_ID_WALLPAPER_UPDATE, which re-runs THIS function,
+            // re-detects the change (path/time not yet recorded) and re-kicks.
+            if (!newPath.empty()) {
+                KickWallpaperDecode(newPath);
             } else {
                 if (g_messageWnd) SetTimer(g_messageWnd, TIMER_ID_WALLPAPER_UPDATE, 300, nullptr);
-            }
-
-            g_tileBrush.Reset();
-            if (g_hasWallpaper && g_wallpaperPosition == DWPOS_TILE && g_wallpaperBitmap) {
-                D2D1_BITMAP_BRUSH_PROPERTIES brushProps = D2D1::BitmapBrushProperties(
-                    D2D1_EXTEND_MODE_WRAP, D2D1_EXTEND_MODE_WRAP, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-                g_dc->CreateBitmapBrush(g_wallpaperBitmap.Get(), brushProps, &g_tileBrush);
             }
         } else {
         }
@@ -3713,10 +3855,11 @@ LRESULT CALLBACK ListViewSubclassProcInner(HWND hWnd, UINT uMsg, WPARAM wParam, 
                     g_lastDesktopInputMs.store(GetTickCount64(),
                                                std::memory_order_relaxed);
                     bool suppressSpotlight = false;
-                    // [v2.10.39] Manual double-click toggle only in the
-                    // double-click trigger mode; idle modes own the bit.
-                    if (SnapshotSettings().toggleOnDoubleClick &&
-                        SnapshotSettings().fadeTriggerMode == 0) {
+                    // [v2.10.56] Manual double-click toggle in ANY trigger
+                    // mode (Doc: "regardless of the automation"). In idle
+                    // modes the toggle LATCHES: IdleFadeTick stands down
+                    // until the user toggles back.
+                    if (SnapshotSettings().toggleOnDoubleClick) {
                         LVHITTESTINFO hti = {};
                         hti.pt.x = (short)LOWORD(lParam);
                         hti.pt.y = (short)HIWORD(lParam);
@@ -3724,6 +3867,12 @@ LRESULT CALLBACK ListViewSubclassProcInner(HWND hWnd, UINT uMsg, WPARAM wParam, 
                         if (hti.flags & LVHT_NOWHERE) {
                             bool nowBypassed = !g_overlayBypassed.load(std::memory_order_relaxed);
                             g_overlayBypassed.store(nowBypassed, std::memory_order_relaxed);
+                            if (SnapshotSettings().fadeTriggerMode != 0) {
+                                // OFF latch = automation stands down; ON
+                                // (toggle back) = automation resumes.
+                                g_idleManualOverride.store(nowBypassed, std::memory_order_relaxed);
+                                g_idleFadeOpaque.store(false, std::memory_order_relaxed);
+                            }
                         if (g_renderEvent) SetEvent(g_renderEvent);
                         if (g_underlayRenderEvent) SetEvent(g_underlayRenderEvent);
                         suppressSpotlight = nowBypassed;
@@ -4294,14 +4443,14 @@ bool CreateSwapChainResources(UINT width, UINT height) {
     hr = g_dxgiFactory->CreateSwapChainForComposition(g_dxgiDevice.Get(), &scd, nullptr, &g_tintSwapChain);
     if (FAILED(hr)) return false;
 
-    hr = g_d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &g_tintDc);
-    if (FAILED(hr)) return false;
-
+    // [v2.10.54] g_tintDc removed: g_dc (same ID2D1Device) retargets onto
+    // the tint surface per frame — device resources are device-scoped, a
+    // second context was pure overhead.
     ComPtr<IDXGISurface2> tintSurface;
     hr = g_tintSwapChain->GetBuffer(0, IID_PPV_ARGS(&tintSurface));
     if (FAILED(hr)) return false;
 
-    hr = g_tintDc->CreateBitmapFromDxgiSurface(tintSurface.Get(), bitmapProperties, &g_tintTargetBitmap);
+    hr = g_dc->CreateBitmapFromDxgiSurface(tintSurface.Get(), bitmapProperties, &g_tintTargetBitmap);
     if (FAILED(hr)) return false;
 
     hr = g_compositionDevice->CreateVisual(&g_rootVisual);
@@ -4466,7 +4615,6 @@ void ReleaseSwapChainResources() {
     g_targetBitmap.Reset();
     g_intermediateTarget.Reset();
     g_tintTargetBitmap.Reset();
-    g_tintDc.Reset();
     g_tintSwapChain.Reset();
     g_tintCompVisual.Reset();
     g_rootVisual.Reset();
@@ -4532,7 +4680,6 @@ void ReleaseAllDirectXResources() {
     g_rootVisual.Reset();
     g_tintSwapChain.Reset();
     g_tintTargetBitmap.Reset();
-    g_tintDc.Reset();
 
     g_underlayCompVisual.Reset();
     g_underlayCompTarget.Reset();
@@ -4541,7 +4688,6 @@ void ReleaseAllDirectXResources() {
 
     // 5. Release Device Contexts
     g_dc.Reset();
-    g_tintDc.Reset();
     g_underlayDc.Reset();
     g_bakeDc.Reset();
     {
@@ -4579,16 +4725,17 @@ bool ResizeSwapChain(UINT width, UINT height) {
     hr = g_dc->CreateBitmapFromDxgiSurface(surface.Get(), bitmapProperties, &g_targetBitmap);
     if (FAILED(hr)) return false;
 
-    // [TINT-SPLIT v2.9.26] resize the tint surface in lockstep
-    if (g_tintSwapChain && g_tintDc) {
-        g_tintDc->SetTarget(nullptr);
+    // [TINT-SPLIT v2.9.26] resize the tint surface in lockstep.
+    // [v2.10.54] g_dc already had SetTarget(nullptr) above; the tint bitmap
+    // is (re)created on g_dc like every other target bitmap.
+    if (g_tintSwapChain) {
         g_tintTargetBitmap.Reset();
         HRESULT hrT = g_tintSwapChain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
         if (SUCCEEDED(hrT)) {
             ComPtr<IDXGISurface2> tintSurface;
             hrT = g_tintSwapChain->GetBuffer(0, IID_PPV_ARGS(&tintSurface));
             if (SUCCEEDED(hrT)) {
-                g_tintDc->CreateBitmapFromDxgiSurface(tintSurface.Get(), bitmapProperties, &g_tintTargetBitmap);
+                g_dc->CreateBitmapFromDxgiSurface(tintSurface.Get(), bitmapProperties, &g_tintTargetBitmap);
             }
         }
     }
@@ -5514,15 +5661,15 @@ void RenderOverlay() {
     // on the TOP composition visual. DWM blends this over the replica in its
     // own composition pass and color space — the same blend it applies to the
     // real desktop everywhere else. One blend owner: the whole point.
-    if (g_tintDc && g_tintTargetBitmap) {
-        g_tintDc->SetTarget(g_tintTargetBitmap.Get());
-        g_tintDc->BeginDraw();
-        g_tintDc->Clear(D2D1::ColorF(0, 0, 0, 0));
+    if (g_tintTargetBitmap) {
+        g_dc->SetTarget(g_tintTargetBitmap.Get());
+        g_dc->BeginDraw();
+        g_dc->Clear(D2D1::ColorF(0, 0, 0, 0));
 
         // --- "OUT OF THE DARKNESS" TINT VEIL --- (moved verbatim from pass 1)
         if ((g_settings.tintEnabled || g_settings.batSignalEnabled) && g_settings.tintStrength > 0) {
             if (!g_tintBrush) {
-                g_tintDc->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 1.0f), &g_tintBrush);
+                g_dc->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 1.0f), &g_tintBrush);
             }
             if (g_tintBrush) {
                 D2D1_COLOR_F c = g_settings.tintColor;
@@ -5533,7 +5680,7 @@ void RenderOverlay() {
                 if (g_settings.batSignalEnabled) tintFade = 1.0f;
                 c.a = (g_settings.tintStrength / 100.0f) * tintFade;
                 g_tintBrush->SetColor(c);
-                g_tintDc->FillRectangle(D2D1::RectF(0.0f, 0.0f, (float)width, (float)height), g_tintBrush.Get());
+                g_dc->FillRectangle(D2D1::RectF(0.0f, 0.0f, (float)width, (float)height), g_tintBrush.Get());
             }
         }
 
@@ -5558,7 +5705,7 @@ void RenderOverlay() {
                 float destY2 = std::round(g_smoothedMousePos.y - g_bakedSpotlightHalfH);
                 D2D1_POINT_2F offset2 = D2D1::Point2F(destX2, destY2);
 
-                g_tintDc->DrawImage(g_spotlightStampEffect.Get(), &offset2, nullptr,
+                g_dc->DrawImage(g_spotlightStampEffect.Get(), &offset2, nullptr,
                                     D2D1_INTERPOLATION_MODE_LINEAR,
                                     D2D1_COMPOSITE_MODE_DESTINATION_OUT);
             }
@@ -5582,7 +5729,7 @@ void RenderOverlay() {
                                (void*)g_batSignalBitmap.Get(), batOpacity, batW, batH, bmx, bmy);
                     }
                     if (batOpacity > 0.001f) {
-                        g_tintDc->DrawBitmap(g_batSignalBitmap.Get(), &batDst, batOpacity,
+                        g_dc->DrawBitmap(g_batSignalBitmap.Get(), &batDst, batOpacity,
                                              D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
                     }
                 }
@@ -5636,7 +5783,7 @@ void RenderOverlay() {
                         float destY = std::round((float)rcBounds.top - pad - blurPadding);
                         D2D1_POINT_2F offset = D2D1::Point2F(destX, destY);
 
-                        g_tintDc->DrawImage(g_selectionStampEffect.Get(), &offset, nullptr,
+                        g_dc->DrawImage(g_selectionStampEffect.Get(), &offset, nullptr,
                                             D2D1_INTERPOLATION_MODE_LINEAR,
                                             D2D1_COMPOSITE_MODE_DESTINATION_OUT);
 
@@ -5645,7 +5792,7 @@ void RenderOverlay() {
             }
         }
 
-        CheckEndDraw(g_tintDc->EndDraw(), L"RenderOverlay.tint");
+        CheckEndDraw(g_dc->EndDraw(), L"RenderOverlay.tint");
         if (g_tintSwapChain) {
             HRESULT hrTint = g_tintSwapChain->Present(0, 0);
             if (hrTint == DXGI_ERROR_DEVICE_REMOVED || hrTint == DXGI_ERROR_DEVICE_RESET) {
@@ -6315,9 +6462,12 @@ bool CacheIconBitmap(HWND hLV, int imageIndex, uint64_t cacheKey, bool isFolder,
                 // against the 0/255 baselines can never match — compare a
                 // thresholded copy instead.
                 if (!pixelGeneric && isThumbnail && !isFolder) {
+                    // [v2.10.51] threshold with the SAME seal the baselines
+                    // use (was hardcoded 16 — desynced from the seal dial).
+                    const int thrT = g_iconSilThreshold.load(std::memory_order_relaxed);
                     std::vector<uint8_t> thr(alphaOnly.size());
                     for (size_t i = 0; i < alphaOnly.size(); ++i)
-                        thr[i] = (alphaOnly[i] >= 16) ? 255 : 0;
+                        thr[i] = (alphaOnly[i] != 0 && alphaOnly[i] >= thrT) ? 255 : 0;
                     auto matchesThr = [&](const SilhouetteData& b) {
                         return b.width == w && b.height == h &&
                                b.alphaData.size() == thr.size() &&
@@ -7301,10 +7451,16 @@ void ExtractIconAlphaBaseline(HICON hIcon, int targetSize, SilhouetteData& outBa
     outBaseline.height = h;
     outBaseline.alphaData.resize(w * h);
 
-    // Threshold synced 1:1 with CacheIconBitmap for 100% memcmp match
+    // Threshold synced 1:1 with the extraction seal (CacheIconBitmap) for a
+    // 100% memcmp match — [v2.10.51] was hardcoded 16 while the extraction
+    // seals at the user's General.iconSilThreshold, so a threshold != 16
+    // broke pixel-generic detection (baseline never matched the sealed
+    // pixels, placeholders stopped being caught). Baselines are rebuilt on
+    // a threshold change, so reading the atomic here stays consistent.
+    const int sealT = g_iconSilThreshold.load(std::memory_order_relaxed);
     for (UINT i = 0; i < w * h; ++i) {
         uint8_t a = tempBgra[i * 4 + 3];
-        outBaseline.alphaData[i] = (a >= 16) ? 255 : 0;
+        outBaseline.alphaData[i] = (a != 0 && a >= sealT) ? 255 : 0;
     }
 }
 
@@ -10245,6 +10401,12 @@ void BakeUnifiedShadows(const Settings& settings, uint64_t comboHash, const Silh
     cache.sourceBmp = sourceBmp; // Save master composite bitmap for overlay mask stamping
     cache.layers.reserve(passes);
 
+    // [v2.10.53 REVERT of BATCH-MAP 2.10.52] Doc field-caught: sluggish zoom
+    // changes + collapsed labels not covered on one zoom level. The deferred
+    // readback is the suspect (TtF sharing + disk saveback consume cpuAlpha
+    // downstream of it). Back to the proven per-layer EndDraw -> Copy -> Map
+    // until the failure is instrumented and understood.
+
     for (int p = 1; p <= passes; ++p) {
         float stepFraction = (float)p / passes;
         float currentBlur = sharpBlur + (softBlur - sharpBlur) * stepFraction;
@@ -10327,7 +10489,8 @@ void BakeUnifiedShadows(const Settings& settings, uint64_t comboHash, const Silh
             }
             if (!CheckEndDraw(g_bakeDc->EndDraw(), L"BakeUnifiedShadows.layer")) return;
 
-            // Extract alpha to CPU for disk cache serialization
+            // Extract alpha to CPU for disk cache serialization (per-layer,
+            // proven 2.10.51 behavior)
             std::vector<uint8_t> cpuAlpha(layerW * layerH);
             ComPtr<ID2D1Bitmap1> stg;
             if (layerW <= STAGING_TEX_SIZE && layerH <= STAGING_TEX_SIZE && g_stagingTexA) {
@@ -10459,6 +10622,11 @@ void PreflightShadowAssets(const Settings& localSettings) {
     {
         POINT mouse;
         if (GetCursorPos(&mouse)) {
+            // [v2.10.51] Snapshot rects are LV CLIENT coords (LVM_GETITEMRECT),
+            // GetCursorPos is SCREEN coords — mixing them skewed the sort
+            // center by the listview's screen origin (large on negative-origin
+            // secondary monitors). Convert the cursor into the same space.
+            if (g_cachedHwndLV) ScreenToClient(g_cachedHwndLV, &mouse);
             auto centerDist2 = [&mouse](const IconSnapshot& s) -> long long {
                 // Widest live rect wins; empty rects fall through to the next.
                 const RECT* r = &s.combinedRect;
@@ -10626,29 +10794,10 @@ void PreflightShadowAssets(const Settings& localSettings) {
             auto& entry = g_comboShadowCache[targetHash];
             if (entry.layers.empty()) entry.layers = std::move(cache.layers);
         }
-        auto& targetSaved = isTargetExpanded ? compData.shadows_e : compData.shadows_c;
-        if (targetSaved.empty()) {
-            std::lock_guard<std::mutex> shadowLock(g_comboShadowCacheMutex);
-            auto it = g_comboShadowCache.find(targetHash);
-            if (it != g_comboShadowCache.end() && !it->second.layers.empty()) {
-                for (const auto& sl : it->second.layers) {
-                    SavedShadowLayer saved;
-                    saved.offsetX = sl.offsetX;
-                    saved.offsetY = sl.offsetY;
-                    saved.width = sl.width;
-                    saved.height = sl.height;
-                    saved.alphaData = sl.cpuAlpha;
-                    targetSaved.push_back(std::move(saved));
-                }
-                uint64_t currentProfile = GetShadowBakeHash(localSettings); // Lock-free!
-                g_diskCache.SetComposite(targetHash, compData, currentProfile);
-                // [ZOOMDIAG v2.2.1] proof the upgrade to full landed.
-                DiagLog(L"[SAVEBACK] hash=%llu layers=%u sil=%ux%u",
-                        (unsigned long long)targetHash, (unsigned)targetSaved.size(),
-                        (isTargetExpanded ? compData.pc2_e.width : compData.pc2_c.width),
-                        (isTargetExpanded ? compData.pc2_e.height : compData.pc2_c.height));
-            }
-        }
+        // [v2.10.51] Dead SAVEBACK block removed: targetSaved IS savedLayers,
+        // which is guaranteed non-empty on this path (empty returns to
+        // BakeUnifiedShadows above) — the `if (targetSaved.empty())` upgrade
+        // + [SAVEBACK] log could never run.
     };
 
     // Sweep 1: silhouettes for EVERY icon first — the mask completes here.
@@ -11594,6 +11743,10 @@ static void ApplySettingsHotkey(HWND hwnd) {
 LRESULT CALLBACK MessageWndProcInner(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     if (uMsg == WMAPP_APPLYHOTKEY) {
         ApplySettingsHotkey(hWnd);
+        return 0;
+    }
+    if (uMsg == WMAPP_WALLPAPER_APPLY) { // [v2.10.54 WALL-DECODE-SPLIT]
+        ApplyDecodedWallpaper();
         return 0;
     }
     if (uMsg == WM_HOTKEY && wParam == 1) {
@@ -12583,6 +12736,7 @@ static const CfgKeyEntry kCfgKeys[] = {
     {L"Toggle.fadeTrigger", true},        // dblclick | desktopIdle | systemIdle
     {L"Toggle.idleFadeTimeout", false},
     {L"Toggle.idleFadeInvert", false},
+    {L"Toggle.fadeEnabled", false},       // [v2.10.55] idle-fade master switch
     // [v2.10.10] These two lived ONLY in kCfgDefaults (fresh-install
     // bootstrap) - WriteConfigMap filters by kCfgKeys, so every write of
     // them (tray menu Overlay toggle, Custom Shortcut Arrow checkbox) was
@@ -12649,6 +12803,7 @@ static const CfgDefault kCfgDefaults[] = {
     {L"Toggle.fadeTrigger", 0, L"dblclick"},
     {L"Toggle.idleFadeTimeout", 10000, nullptr},
     {L"Toggle.idleFadeInvert", 0, nullptr},
+    {L"Toggle.fadeEnabled", 0, nullptr},  // [v2.10.55] idle-fade master switch
     {L"Toggle.overlayEnabled", 1, nullptr},
     {L"Toggle.toggleFadeInDuration", 400, nullptr},
     {L"Toggle.toggleFadeOutDuration", 400, nullptr},
@@ -12878,7 +13033,7 @@ static bool ImportAbTenebrisConfigFromWindhawk() {
         }
     }
     bool ok = WriteAbTenebrisConfig(kv);
-    Wh_Log(L"[CFG] self-import %hs", ok ? L"written" : L"FAILED");
+    Wh_Log(L"[CFG] self-import %ls", ok ? L"written" : L"FAILED");
     return ok;
 }
 
@@ -13006,6 +13161,19 @@ void LoadSettings() {
         if (trig == L"desktopIdle")     s.fadeTriggerMode = 1;
         else if (trig == L"systemIdle") s.fadeTriggerMode = 2;
         else                            s.fadeTriggerMode = 0;
+    }
+    // [v2.10.55 MIGRATE] The idle-fade enable bit used to live in the Fade
+    // group's TITLE checkbox (Toggle.toggleOnDoubleClick — pre-split files
+    // have no Toggle.fadeEnabled key). Old file: idle trigger + title
+    // checkbox on = idle fade on. Fresh file: the key exists in
+    // kCfgDefaults, so cfgIntDef returns the real default (0, off).
+    {
+        int fadeEn = cfgIntDef(L"Toggle.fadeEnabled", -1);
+        if (fadeEn < 0)
+            s.fadeEnabled = (s.fadeTriggerMode != 0) && s.toggleOnDoubleClick;
+        else
+            s.fadeEnabled = fadeEn != 0;
+        if (s.fadeTriggerMode == 0) s.fadeEnabled = false; // dblclick owns mode 0
     }
     s.idleFadeTimeout          = std::max(cfgInt(L"Toggle.idleFadeTimeout"), 100);
     s.idleFadeInvert           = cfgInt(L"Toggle.idleFadeInvert") != 0;
@@ -13263,6 +13431,17 @@ void RegistryWatcherThreadInner() {
 
     DWORD notifyFlags = REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_THREAD_AGNOSTIC;
 
+    // [v2.10.52 ENV-GATE] DWM + Themes fire on ANY write in their subtree
+    // (accent toggles, taskbar tweaks, OTHER apps' personalization writes) —
+    // each one used to cost a FULL refresh: cache wipe + deep pass. What the
+    // mod actually depends on from those subtrees is captured by
+    // GetEnvironmentHash() (font, light/dark, theme file, wallpaper). So: on
+    // a DWM/Themes event, recompute the hash — unchanged means the write
+    // touched nothing we render with, skip entirely. Desktop/Colors/
+    // Wallpapers/CLSID keep their existing behavior (wallpaper tag / full).
+    auto envRelevant = [&]() -> uint64_t { return GetEnvironmentHash(); };
+    uint64_t lastEnvHash = envRelevant();
+
     while (!g_unloading) {
         if (hKeyDesktop) RegNotifyChangeKeyValue(hKeyDesktop, FALSE, notifyFlags, hEvents[1], TRUE);
         if (hKeyColors) RegNotifyChangeKeyValue(hKeyColors, FALSE, notifyFlags, hEvents[2], TRUE);
@@ -13277,6 +13456,20 @@ void RegistryWatcherThreadInner() {
             break;
         }
      if (res >= WAIT_OBJECT_0 + 1 && res <= WAIT_OBJECT_0 + 6) {
+
+         int keyIdx = (int)(res - WAIT_OBJECT_0);
+         if (keyIdx == 4 || keyIdx == 5) {
+             // [v2.10.52 ENV-GATE] DWM / Themes: only react when the
+             // environment we render with actually changed.
+             uint64_t nowHash = envRelevant();
+             if (nowHash == lastEnvHash) {
+                 DiagLog(L"[REGWATCH] key event %d fired but env hash unchanged — no refresh",
+                         keyIdx);
+                 Sleep(250); // keep the burst coalescing either way
+                 continue;
+             }
+             lastEnvHash = nowHash;
+         }
 
          // Scope the refresh: Colors/Wallpapers only affect the background,
          // so don't pay a full icon-cache wipe + deep pass for them.
@@ -13361,6 +13554,23 @@ void FolderWatcherThreadProcInner() {
 
         if (res > WAIT_OBJECT_0 && res < WAIT_OBJECT_0 + hEvents.size()) {
             DWORD idx = res - WAIT_OBJECT_0;
+            // [v2.10.52 DEBOUNCE] One download-to-Desktop fires repeated
+            // LAST_WRITE notifications for ~seconds; each one used to cost a
+            // full snapshot pass (100-450ms UI capture). Wait for the writes
+            // to go QUIET: re-arm, drain the burst with a 400ms quiet window,
+            // only then fire ONE pass. Unload aborts the drain immediately.
+            FindNextChangeNotification(hEvents[idx]);
+            bool quiet = false;
+            while (!g_unloading) {
+                DWORD d = WaitForSingleObject(hEvents[idx], 400);
+                if (d == WAIT_OBJECT_0) {
+                    FindNextChangeNotification(hEvents[idx]); // still writing
+                    continue;
+                }
+                quiet = (d == WAIT_TIMEOUT);
+                break;
+            }
+            if (!quiet) break; // unload during drain
             if (g_overlayWnd) {
                 if (g_isLeftButtonDown.load(std::memory_order_relaxed)) {
                     DiagLog(L"[TRIG-FOLDER] desktop folder change (deferred, button down)");
@@ -13373,7 +13583,6 @@ void FolderWatcherThreadProcInner() {
                     }
                 }
             }
-            FindNextChangeNotification(hEvents[idx]);
         }
     }
 
@@ -13623,6 +13832,10 @@ static void Engine_ModUninit() {
     }
 
     // 6. THE EXECUTIONER: Hierarchically release all GPU & COM resources
+    // [v2.10.54] wallpaper decode thread first: it touches g_workerWicFactory
+    // and must be parked before the resources die.
+    if (g_wallStopEvent) SetEvent(g_wallStopEvent);
+    g_wallDecodeThread.reset(); // join
     ReleaseAllDirectXResources();
 
     // 7. CLEANUP EVENT HANDLES
@@ -13790,7 +14003,6 @@ static void ApplyUiPalette() {
 }
 
 static HFONT g_font = nullptr;
-static HFONT g_fontBold = nullptr;
 static HFONT g_fontEmoji = nullptr;
 static HBRUSH g_brushBg = nullptr;
 static HBRUSH g_brushSidebar = nullptr;
@@ -14209,102 +14421,28 @@ static std::wstring GetCfgPath() {
     return dir.empty() ? dir : dir + L"\\" + kCfgFileName;
 }
 
-static void TrimW(std::wstring& s) {
-    size_t b = s.find_first_not_of(L" \t\r\n");
-    if (b == std::wstring::npos) {
-        s.clear();
-        return;
-    }
-    size_t e = s.find_last_not_of(L" \t\r\n");
-    s = s.substr(b, e - b + 1);
-}
+// [v2.10.54 MERGE-DEBT] The control panel used to carry its OWN copies of
+// Trim / config parser / config writer (TrimW / ReadConfigFile /
+// WriteConfigMap), byte-for-byte logic twins of the engine's
+// TrimWstring / ReadAbTenebrisConfig / WriteAbTenebrisConfig — two
+// implementations of one file store, free to drift apart silently (the
+// v2.10.10 key-drop disease class). They are thin forwarders now: ONE
+// implementation lives in the engine section, everything else forwards.
+
+static void TrimW(std::wstring& s) { TrimWstring(s); }
 
 static bool ReadConfigFile(const std::wstring& path,
                            std::unordered_map<std::wstring, std::wstring>& out) {
-    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                           OPEN_EXISTING, 0, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return false;
-
-    std::wstring content;
-    LARGE_INTEGER size{};
-    if (GetFileSizeEx(h, &size) && size.QuadPart > 0 &&
-        size.QuadPart < 1024 * 1024) {
-        std::vector<char> bytes((size_t)size.QuadPart);
-        DWORD got = 0;
-        if (ReadFile(h, bytes.data(), (DWORD)bytes.size(), &got, nullptr) &&
-            got >= 2) {
-            const unsigned char* p = (const unsigned char*)bytes.data();
-            if (p[0] == 0xFF && p[1] == 0xFE) {
-                content.assign((const wchar_t*)(p + 2), (got - 2) / 2);
-            } else {
-                int wlen = MultiByteToWideChar(CP_UTF8, 0, (const char*)p, got,
-                                               nullptr, 0);
-                if (wlen > 0) {
-                    std::wstring w(wlen, L'\0');
-                    MultiByteToWideChar(CP_UTF8, 0, (const char*)p, got, &w[0],
-                                        wlen);
-                    content = std::move(w);
-                }
-            }
-        }
-    }
-    CloseHandle(h);
-
-    size_t pos = 0;
-    while (pos < content.size()) {
-        size_t eol = content.find(L'\n', pos);
-        size_t end = (eol == std::wstring::npos) ? content.size() : eol;
-        std::wstring line = content.substr(pos, end - pos);
-        pos = (eol == std::wstring::npos) ? content.size() : eol + 1;
-        TrimW(line);
-        if (line.empty() || line[0] == L';' || line[0] == L'#') continue;
-        size_t eq = line.find(L'=');
-        if (eq == std::wstring::npos) continue;
-        std::wstring key = line.substr(0, eq);
-        std::wstring val = line.substr(eq + 1);
-        TrimW(key);
-        TrimW(val);
-        if (!key.empty()) out[std::move(key)] = std::move(val);
-    }
-    return true;
+    return ReadAbTenebrisConfig(path, out);
 }
 
+// [v2.10.54 MERGE-DEBT] forwarder — see the block above ReadConfigFile.
+// GetCfgDir() and GetAbTenebrisConfigDir() resolve to the SAME directory
+// (%LOCALAPPDATA%\AbTenebris) and both writers filter by kCfgKeys, so the
+// engine implementation is a drop-in.
 static bool WriteConfigMap(
     const std::unordered_map<std::wstring, std::wstring>& kv) {
-    std::wstring dir = GetCfgDir();
-    if (dir.empty()) return false;
-    CreateDirectoryW(dir.c_str(), nullptr);
-    std::wstring tmp = dir + L"\\settings.cfg.tmp";
-    std::wstring finalPath = dir + L"\\" + kCfgFileName;
-
-    HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr,
-                           CREATE_ALWAYS, 0, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return false;
-
-    WORD bom = 0xFEFF;
-    DWORD wrote = 0;
-    WriteFile(h, &bom, sizeof(bom), &wrote, nullptr);
-
-    std::wstring body;
-    for (const auto& e : kCfgKeys) {
-        auto it = kv.find(e.key);
-        if (it == kv.end()) continue;
-        body += e.key;
-        body += L'=';
-        body += it->second;
-        body += L"\r\n";
-    }
-    BOOL ok =
-        WriteFile(h, body.data(), (DWORD)(body.size() * sizeof(wchar_t)),
-                  &wrote, nullptr);
-    CloseHandle(h);
-    if (!ok) {
-        DeleteFileW(tmp.c_str());
-        return false;
-    }
-    return MoveFileExW(tmp.c_str(), finalPath.c_str(),
-                       MOVEFILE_REPLACE_EXISTING) != 0;
+    return WriteAbTenebrisConfig(kv);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -14357,24 +14495,17 @@ static const SidebarToggle kSidebarToggles[] = {
     {SEC_SELECTION, L"Selection.enableSelectionGlow"},
 };
 
-// Mirror of the ENGINE's kCtrlTintPresets table (mod_014) - swatch preview
-// only; the engine remains the single source of truth.
-struct TintPresetColor {
-    const wchar_t* name;
-    COLORREF rgb;
-};
-static const TintPresetColor kTintPresetColors[] = {
-    {L"Black", RGB(0x00, 0x00, 0x00)},
-    {L"Slate", RGB(0x16, 0x19, 0x1E)},
-    {L"Midnight", RGB(0x05, 0x15, 0x29)},
-    {L"Wine", RGB(0x1A, 0x0F, 0x2B)},
-    {L"Nightshade", RGB(0x22, 0x0C, 0x29)},
-    {L"Deep_Red", RGB(0x29, 0x06, 0x06)},
-    {L"Umber", RGB(0x26, 0x16, 0x0F)},
-    {L"Sepia", RGB(0x2B, 0x20, 0x09)},
-    {L"Forest", RGB(0x15, 0x20, 0x0C)},
-    {L"Abyss", RGB(0x04, 0x20, 0x24)},
-};
+// [v2.10.54 MERGE-DEBT] The control panel's private kTintPresetColors mirror
+// is gone — the ENGINE's kTintPresets (name + 0xRRGGBB) is the single tint
+// table. Swatch sites convert to COLORREF (which is 0x00BBGGRR — the byte
+// order FLIPS) via TintRgbToColorref below. The combo options list
+// (kCtrlTintPresets, needs "Custom" and a static initializer for kSpecs) is
+// cross-checked against the engine table at window open — see
+// VerifyTableSync.
+
+static COLORREF TintRgbToColorref(uint32_t rgb) {
+    return RGB((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
+}
 
 // The picked custom color (written to Tint.tintColorHex by the picker; no
 // dedicated UI row anymore).
@@ -14432,12 +14563,18 @@ static const CtlSpec kSpecs[] = {
     SLDP(SEC_OVERLAY, L"Spotlight.idleOpacity", L"Opacity", 0, 100),
     CHKS(SEC_OVERLAY, L"Spotlight.overlayClipToIcons",
          L"Clip Overlay to Icons"),
+    // [v2.10.55] The double-click toggle is a STANDALONE feature again (Doc:
+    // it used to be the Fade group's title checkbox). Sits between Clip
+    // Overlay and the Fade group; the Fade durations serve BOTH it and the
+    // idle fade, so the durations gate on EITHER switch being on.
+    CHKS(SEC_OVERLAY, L"Toggle.toggleOnDoubleClick",
+         L"Toggle on Double-Click"),
     // [v2.10.42] Fade group row order (Doc): Invert checkbox FIRST, then
-    // Idle Timeout, then the durations. Invert + Idle Timeout enabled only
-    // when the Fade group's trigger combo is an idle mode.
+    // Idle Timeout, then the durations. Invert + Idle Timeout are idle-only
+    // (gated by the Fade group alone since v2.10.55).
     CHKS(SEC_OVERLAY, L"Toggle.idleFadeInvert", L"Invert"),
     SLD(SEC_OVERLAY, L"Toggle.idleFadeTimeout",
-        L"Idle Timeout (ms)", 500, 120000),
+        L"Idle Timeout (ms)", 500, 10000),
     SLD(SEC_OVERLAY, L"Toggle.toggleFadeInDuration",
         L"Fade In Duration (ms)", 0, 3000),
     SLD(SEC_OVERLAY, L"Toggle.toggleFadeOutDuration",
@@ -14496,6 +14633,65 @@ static const CtlSpec kSpecs[] = {
     SLD(SEC_SELECTION, L"Selection.selectionFadeOutDuration",
         L"Fade Out Duration (ms)", 0, 5000),
 };
+
+// [v2.10.54 MERGE-DEBT] Table-sync assertion — the v2.10.10 disease guard.
+// That bug happened because a key was added to SOME of the hand-synced
+// tables but not all, and every write silently dropped it. These tables are
+// STILL hand-synced (they can't reference each other: static initializers),
+// so instead of trusting discipline, VERIFY the sync at settings-window
+// startup and log loudly on any drift. Checks:
+//   1. every kSpecs row key exists in kCfgKeys (else the write filter
+//      silently drops it — the exact 2.10.10 failure),
+//   2. every kCfgDefaults key exists in kCfgKeys (defaults for keys the
+//      store never persists are dead weight AND a drift marker),
+//   3. kCtrlTintPresets (combo list) matches kTintPresets (colors) 1:1 in
+//      order, plus the trailing "Custom".
+// A NEW settings key added to kCfgKeys but with no kCfgDefaults entry is
+// legal (blank-file fallback fills it via CfgIntDefault's 0) but logged.
+static void VerifyTableSync() {
+    int problems = 0;
+    for (const CtlSpec& spec : kSpecs) {
+        if (!spec.key || !*spec.key) continue; // Hint rows carry no key
+        bool found = false;
+        for (const auto& e : kCfgKeys)
+            if (wcscmp(spec.key, e.key) == 0) { found = true; break; }
+        if (!found) {
+            DiagLogAlways(L"[TABLE-SYNC] kSpecs key NOT in kCfgKeys (writes will be DROPPED): %s",
+                          spec.key);
+            problems++;
+        }
+    }
+    for (const auto& d : kCfgDefaults) {
+        bool found = false;
+        for (const auto& e : kCfgKeys)
+            if (wcscmp(d.key, e.key) == 0) { found = true; break; }
+        if (!found) {
+            DiagLogAlways(L"[TABLE-SYNC] kCfgDefaults key NOT in kCfgKeys: %s", d.key);
+            problems++;
+        }
+    }
+    if (ARRAYSIZE(kCtrlTintPresets) != ARRAYSIZE(kTintPresets) + 1) {
+        DiagLogAlways(L"[TABLE-SYNC] kCtrlTintPresets count %zu != kTintPresets %zu + Custom",
+                      (size_t)ARRAYSIZE(kCtrlTintPresets), (size_t)ARRAYSIZE(kTintPresets));
+        problems++;
+    } else {
+        for (size_t i = 0; i < ARRAYSIZE(kTintPresets); ++i) {
+            if (wcscmp(kCtrlTintPresets[i], kTintPresets[i].name) != 0) {
+                DiagLogAlways(L"[TABLE-SYNC] tint preset order drift at [%zu]: combo '%s' vs colors '%s'",
+                              i, kCtrlTintPresets[i], kTintPresets[i].name);
+                problems++;
+            }
+        }
+        if (wcscmp(kCtrlTintPresets[ARRAYSIZE(kTintPresets)], L"Custom") != 0) {
+            DiagLogAlways(L"[TABLE-SYNC] kCtrlTintPresets last entry is not Custom");
+            problems++;
+        }
+    }
+    if (!problems)
+        DiagLog(L"[TABLE-SYNC] ok (%zu spec rows, %zu cfg keys, %zu defaults)",
+                (size_t)ARRAYSIZE(kSpecs), (size_t)ARRAYSIZE(kCfgKeys),
+                (size_t)ARRAYSIZE(kCfgDefaults));
+}
 
 static const wchar_t* kSectionNames[SEC_COUNT] = {
     L"General", L"Overlay", L"Spotlight", L"Shadows", L"Selection",
@@ -14600,13 +14796,14 @@ static const wchar_t* const kArrowMembers[] = {
     L"General.customArrowScale", L"General.customArrowOffsetX",
     L"General.customArrowOffsetY"};
 // [v2.10.39] Fade trigger options (values = engine cfg contract; display =
-// user-facing). dblclick keeps the old double-click toggle behavior.
+// user-facing). [v2.10.55] dblclick LEFT the combo — it is the standalone
+// "Toggle on Double-Click" row now; the combo is idle-modes only.
 static const wchar_t* const kFadeTriggerVals[] = {
-    L"dblclick", L"desktopIdle", L"systemIdle"};
+    L"desktopIdle", L"systemIdle"};
 static const wchar_t* const kFadeTriggerDisplay[] = {
-    L"On Double-Click (Toggle)", L"On Desktop Idle", L"On System Idle"};
+    L"Desktop Idle", L"System Idle"};
 static const GroupSpec kGroups[] = {
-    {SEC_OVERLAY, L"Toggle.toggleOnDoubleClick", L"Fade",
+    {SEC_OVERLAY, L"Toggle.fadeEnabled", L"Fade on:",
      kFadeMembers, 4, L"Toggle.fadeTrigger", kFadeTriggerVals,
      kFadeTriggerDisplay, ARRAYSIZE(kFadeTriggerVals)},
     {SEC_OVERLAY, L"Tint.tintEnabled", L"Tint", kTintMembers, 2, nullptr,
@@ -14754,6 +14951,61 @@ static AlphaBlendFn GetAlphaBlend() {
     return fn;
 }
 
+// [v2.10.55] The 40% background WASH, shared: sliders dim through their
+// WM_PAINT path (DimSliderIfDisabled below), owner-draw swatch/pick buttons
+// dim through WM_DRAWITEM when ODS_DISABLED. 1x1 top-down 32bpp DIB,
+// premultiplied, cached.
+// Wash color = the palette's window background (Doc: "the exact color
+// of the window background #202020 at 40% opacity"): over the bg the
+// blend is a color onto itself = invisible, so only the lighter pixels
+// darken — no rectangle around the control.
+// NOTE: the wash DC is cached once; if the theme flips while the
+// window is open the palette changes but ApplyUiPalette should reset
+// s_wash (brush-recreation law).
+static void AbtDimWashApply(HDC hdc, const RECT& rc, int alphaPct = 40) {
+    if (rc.right <= rc.left || rc.bottom <= rc.top) return;
+    static HDC s_src = nullptr;
+    static COLORREF s_wash = 0xFFFFFFFF;  // invalid -> build on first use
+    static int s_alpha = -1;
+    if (!s_src || s_wash != g_pal.bg || s_alpha != alphaPct) {
+        if (s_src) { DeleteDC(s_src); s_src = nullptr; }
+        BITMAPINFO bi = {};
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = 1;
+        bi.bmiHeader.biHeight = -1;  // top-down
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        void* bits = nullptr;
+        HBITMAP bm = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits,
+                                      nullptr, 0);
+        if (bm) {
+            // [v2.10.34] PREMULTIPLIED is load-bearing: AlphaBlend's
+            // AC_SRC_ALPHA math is dst' = src + dst*(1-a/255) — storing
+            // full-brightness RGB made #202020 blend to #333 (Doc's "gray
+            // rectangle LIGHTER than the background" on main). RGB must
+            // already carry the alpha factor.
+            const int A = 255 * alphaPct / 100;
+            BYTE* p = (BYTE*)bits;  // B,G,R,A
+            p[0] = (BYTE)(GetBValue(g_pal.bg) * A / 255);
+            p[1] = (BYTE)(GetGValue(g_pal.bg) * A / 255);
+            p[2] = (BYTE)(GetRValue(g_pal.bg) * A / 255);
+            p[3] = (BYTE)A;
+            s_src = CreateCompatibleDC(hdc);
+            SelectObject(s_src, bm);
+            DeleteObject(bm);  // DC keeps the selection alive
+            s_wash = g_pal.bg;
+            s_alpha = alphaPct;
+        }
+    }
+    if (s_src) {
+        if (AlphaBlendFn ab = GetAlphaBlend()) {
+            BLENDFUNCTION bf = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+            ab(hdc, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
+               s_src, 0, 0, 1, 1, bf);
+        }
+    }
+}
+
 static void DimSliderIfDisabled(HWND h) {
     if (IsWindowEnabled(h)) return;
     RECT rc;
@@ -14778,63 +15030,20 @@ static void DimSliderIfDisabled(HWND h) {
                     (int)GetBValue(pre2));
         }
     }
-    // 1x1 top-down 32bpp DIB, premultiplied WASH @ 40% alpha, cached.
-    // Wash color = the palette's window background (Doc: "the exact color
-    // of the window background #202020 at 40% opacity"): over the bg the
-    // blend is a color onto itself = invisible, so only the lighter slider
-    // pixels darken — no rectangle around the trackbar.
-    // NOTE: the wash DC is cached once; if the theme flips while the
-    // window is open the palette changes but ApplyUiPalette should reset
-    // s_wash (brush-recreation law).
-    static HDC s_src = nullptr;
-    static COLORREF s_wash = 0xFFFFFFFF;  // invalid -> build on first use
-    if (!s_src || s_wash != g_pal.bg) {
-        if (s_src) { DeleteDC(s_src); s_src = nullptr; }
-        BITMAPINFO bi = {};
-        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bi.bmiHeader.biWidth = 1;
-        bi.bmiHeader.biHeight = -1;  // top-down
-        bi.bmiHeader.biPlanes = 1;
-        bi.bmiHeader.biBitCount = 32;
-        void* bits = nullptr;
-        HBITMAP bm = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits,
-                                      nullptr, 0);
-        if (bm) {
-            // [v2.10.34] PREMULTIPLIED is load-bearing: AlphaBlend's
-            // AC_SRC_ALPHA math is dst' = src + dst*(1-a/255) — storing
-            // full-brightness RGB made #202020 blend to #333 (Doc's "gray
-            // rectangle LIGHTER than the background" on main). RGB must
-            // already carry the 40% factor.
-            const int A = 102;  // 40%
-            BYTE* p = (BYTE*)bits;  // B,G,R,A
-            p[0] = (BYTE)(GetBValue(g_pal.bg) * A / 255);
-            p[1] = (BYTE)(GetGValue(g_pal.bg) * A / 255);
-            p[2] = (BYTE)(GetRValue(g_pal.bg) * A / 255);
-            p[3] = (BYTE)A;
-            s_src = CreateCompatibleDC(hdc);
-            SelectObject(s_src, bm);
-            DeleteObject(bm);  // DC keeps the selection alive
-            s_wash = g_pal.bg;
-        }
-    }
-    if (s_src) {
-        if (AlphaBlendFn ab = GetAlphaBlend()) {
-            BLENDFUNCTION bf = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-            ab(hdc, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
-               s_src, 0, 0, 1, 1, bf);
-            // [v2.10.34] post-blend sample: the expected result over a bg
-            // pixel is UNCHANGED #202020; over the channel it darkens.
-            static int s_probe2 = 0;
-            if (s_probe2 < 4) {
-                s_probe2++;
-                int my = (rc.top + rc.bottom) / 2;
-                COLORREF post1 = GetPixel(hdc, 2, my);
-                COLORREF post2 = GetPixel(hdc, (rc.right - rc.left) / 2, my);
-                DiagLog(L"[DIM] post=(%02X,%02X,%02X)mid=(%02X,%02X,%02X)",
-                        (int)GetRValue(post1), (int)GetGValue(post1),
-                        (int)GetBValue(post1), (int)GetRValue(post2),
-                        (int)GetGValue(post2), (int)GetBValue(post2));
-            }
+    AbtDimWashApply(hdc, rc);
+    // [v2.10.34] post-blend sample: the expected result over a bg
+    // pixel is UNCHANGED #202020; over the channel it darkens.
+    {
+        static int s_probe2 = 0;
+        if (s_probe2 < 4) {
+            s_probe2++;
+            int my = (rc.top + rc.bottom) / 2;
+            COLORREF post1 = GetPixel(hdc, 2, my);
+            COLORREF post2 = GetPixel(hdc, (rc.right - rc.left) / 2, my);
+            DiagLog(L"[DIM] post=(%02X,%02X,%02X)mid=(%02X,%02X,%02X)",
+                    (int)GetRValue(post1), (int)GetGValue(post1),
+                    (int)GetBValue(post1), (int)GetRValue(post2),
+                    (int)GetGValue(post2), (int)GetBValue(post2));
         }
     }
     ReleaseDC(h, hdc);
@@ -15000,6 +15209,24 @@ static void LayoutRows(HWND hwnd) {
                                            ((inGroup) ? MulDiv(20, dpi, 96)
                                                       : 0)
                                      : ctlW)));
+        // [v2.10.55 HIT ZONE] A checkbox owns its whole client rect as the
+        // click target — the full-row width let clicks toggle from empty
+        // space way out to the right (Doc caught it on Clip Overlay +
+        // Invert). Cap the control to its measured text + glyph box; the
+        // row keeps the grid, the dead space stops being a button.
+        if (row.spec->kind == Kind::Chk && row.ctl) {
+            wchar_t txt[256] = {};
+            GetWindowTextW(row.ctl, txt, 256);
+            HDC hdc = GetDC(row.ctl);
+            HFONT f = (HFONT)SendMessageW(row.ctl, WM_GETFONT, 0, 0);
+            HFONT of = (HFONT)SelectObject(hdc, f);
+            SIZE sz = {};
+            GetTextExtentPoint32W(hdc, txt, (int)wcslen(txt), &sz);
+            SelectObject(hdc, of);
+            ReleaseDC(row.ctl, hdc);
+            int need = sz.cx + MulDiv(30, dpi, 96);  // glyph box + focus pad
+            if (need < ctlWid) ctlWid = need;
+        }
         if (row.spec->kind == Kind::Combo)
             ctlX = valueRight - ctlWid;
         else if (row.spec->kind == Kind::Color)
@@ -15110,20 +15337,40 @@ static void LayoutRows(HWND hwnd) {
                                   (int)wcslen(kGroups[gi].titleText), &tsz);
             SelectObject(tdc, of);
             ReleaseDC(g_groupTitle[gi], tdc);
-            int cbW = tsz.cx + MulDiv(30, dpi, 96);
+            int cbW = tsz.cx + MulDiv(22, dpi, 96);
             int cbH = titleH;
             // [v2.10.46] Title checkboxes +8px right (Doc): 10 -> 18 from the
             // frame's left edge; the paint gap widens to match.
             int titleX = fx + MulDiv(18, dpi, 96);
             MoveWindow(g_groupTitle[gi], titleX, yTop - cbH / 2, cbW, cbH,
                        TRUE);
-            int gapW = tsz.cx + MulDiv(26, dpi, 96);
+            // [v2.10.57] Combo 10 dip closer to the title (Doc: "closer to
+            // the ':' in 'Fade on:'") — cbW pad 30->22, gap 6->4, paint gap
+            // 26->16 all move left together.
+            int gapW = tsz.cx + MulDiv(16, dpi, 96);
             if (g_titleCombo[gi]) {
-                int comboW = MulDiv(190, dpi, 96);
+                // [v2.10.56] Width = widest entry + closed-face arrow box,
+                // not a fixed 190 — "Fade on:" + two short entries stays
+                // tight (Doc).
+                int comboW = MulDiv(48, dpi, 96);
+                {
+                    HDC cdc = GetDC(g_groupWnds[gi]);
+                    HFONT of2 = (HFONT)SelectObject(cdc, g_font);
+                    for (int ci = 0; ci < kGroups[gi].titleComboCount; ci++) {
+                        SIZE csz = {};
+                        GetTextExtentPoint32W(cdc, kGroups[gi].titleComboDisplay[ci],
+                                              (int)wcslen(kGroups[gi].titleComboDisplay[ci]),
+                                              &csz);
+                        if (csz.cx + MulDiv(40, dpi, 96) > comboW)
+                            comboW = csz.cx + MulDiv(40, dpi, 96);
+                    }
+                    SelectObject(cdc, of2);
+                    ReleaseDC(g_groupWnds[gi], cdc);
+                }
                 int comboH = MulDiv(26, dpi, 96);
                 // NOTE: for a COMBOBOX the window height is the DROPDOWN
                 // height, not the closed face — give it room for 3 items.
-                MoveWindow(g_titleCombo[gi], titleX + cbW + MulDiv(6, dpi, 96),
+                MoveWindow(g_titleCombo[gi], titleX + cbW + MulDiv(4, dpi, 96),
                            yTop - comboH / 2, comboW,
                            comboH + MulDiv(84, dpi, 96), TRUE);
                 gapW += MulDiv(6, dpi, 96) + comboW + MulDiv(8, dpi, 96);
@@ -15355,24 +15602,27 @@ static void ApplyGroupEnableStates() {
     // and Diagnostics have no sidebar toggle, so they are always gated by
     // their group alone.
     // [v2.10.39] The section toggle now ALSO gates the group-title checkbox
-    // and title combo; the Idle Timeout row has a third gate — the Fade
-    // group's trigger combo must be an idle mode.
+    // and title combo.
+    // [v2.10.55] Fade split: the durations serve BOTH the idle fade (Fade
+    // group checkbox) AND the standalone double-click toggle row, so they
+    // stay enabled while EITHER is on (Doc). Invert + Idle Timeout are
+    // idle-only: gated by the Fade group alone (the old trigger-combo third
+    // gate is gone — every combo option is an idle mode now).
     auto sectionOn = [](int section) {
         for (const SidebarToggle& t : kSidebarToggles)
             if (t.section == section) return RowlessOn(t.key);
         return true;
+    };
+    auto dblclickRowOn = []() {
+        if (Row* r = FindRowByKey(L"Toggle.toggleOnDoubleClick"))
+            return SendMessageW(r->ctl, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        return RowlessOn(L"Toggle.toggleOnDoubleClick");
     };
     for (int gi = 0; gi < (int)ARRAYSIZE(kGroups); gi++) {
         bool on = sectionOn(kGroups[gi].section);
         if (g_groupTitle[gi]) EnableWindow(g_groupTitle[gi], on);
         if (g_titleCombo[gi]) EnableWindow(g_titleCombo[gi], on);
     }
-    auto fadeTriggerIdle = []() {
-        int gi = 0;  // Fade group is kGroups[0]
-        if (!g_titleCombo[gi]) return false;
-        int sel = (int)SendMessageW(g_titleCombo[gi], CB_GETCURSEL, 0, 0);
-        return sel > 0;  // 0 = dblclick
-    };
     for (Row& r : g_rows) {
         bool on = sectionOn(r.spec->section);
         for (int gi = 0; gi < (int)ARRAYSIZE(kGroups); gi++) {
@@ -15384,14 +15634,19 @@ static void ApplyGroupEnableStates() {
                 }
             if (member && !RowlessOn(kGroups[gi].titleKey)) on = false;
         }
-        // [v2.10.41] Both idle-mode rows answer the trigger combo too.
-        if ((wcscmp(r.spec->key, L"Toggle.idleFadeTimeout") == 0 ||
-             wcscmp(r.spec->key, L"Toggle.idleFadeInvert") == 0) &&
-            !fadeTriggerIdle())
-            on = false;
+        // [v2.10.55] Shared fade durations: dblclick row rescues them even
+        // when the Fade group is off.
+        if (!on && (wcscmp(r.spec->key, L"Toggle.toggleFadeInDuration") == 0 ||
+                    wcscmp(r.spec->key, L"Toggle.toggleFadeOutDuration") == 0) &&
+            dblclickRowOn())
+            on = true;
         if (r.ctl) EnableWindow(r.ctl, on);
         if (r.value) EnableWindow(r.value, on);
         if (r.spin) EnableWindow(r.spin, on);
+        // [v2.10.55] The tint Color row's swatch + picker ride the row's
+        // enable state (owner-draw buttons read ODS_DISABLED for the dim).
+        if (r.swatch) EnableWindow(r.swatch, on);
+        if (r.pick) EnableWindow(r.pick, on);
         // [v2.10.32] Synchronous repaint on enable-state flips: the
         // disabled-slider dim is painted after the native WM_PAINT, and
         // some machines (VM) never requeued that paint — sliders looked
@@ -16177,11 +16432,16 @@ static void LoadValuesIntoControls() {
     std::unordered_map<std::wstring, std::wstring> kv;
     std::wstring path = GetCfgPath();
     if (!ReadConfigFile(path, kv) || kv.empty()) {
-        // Engine hasn't imported yet: fall back to defaults matching the
-        // Windhawk block defaults (the engine will self-import on its side).
-        for (const auto& e : kCfgKeys) kv[e.key] = e.isString ? L"" : L"0";
-        kv[L"Toggle.overlayEnabled"] = L"1";      // engine default is TRUE
-        kv[L"General.customArrowEnabled"] = L"1";  // engine default is TRUE
+        // Engine hasn't imported yet: fall back to the built-in defaults
+        // (kCfgDefaults — same table the engine's fresh-install bootstrap
+        // seeds the file with). [v2.10.51] This used to fill every int key
+        // with "0": on a blank file the UI showed targetFps=0,
+        // iconSilThreshold=0 (everything seals), shadows off — nothing like
+        // what the engine actually boots with.
+        for (const auto& e : kCfgKeys) {
+            if (e.isString) kv[e.key] = CfgStrDefault(e.key);
+            else kv[e.key] = std::to_wstring(CfgIntDefault(e.key));
+        }
     }
     g_initialSnapshot = kv;
     g_lastSynced = kv;  // window-open state = first sync baseline
@@ -16538,9 +16798,9 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                     GetWindowTextW(r.ctl, sel, 32);  // combo text = display
                     COLORREF col = kColInputBg;
                     bool found = false;
-                    for (const TintPresetColor& p : kTintPresetColors) {
+                    for (const TintPresetEntry& p : kTintPresets) {
                         if (wcscmp(sel, p.name) == 0) {
-                            col = p.rgb;
+                            col = TintRgbToColorref(p.rgb);
                             found = true;
                             break;
                         }
@@ -16562,6 +16822,11 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                     FillRect(di->hDC, &di->rcItem, fill);
                     DeleteObject(fill);
                     FrameRect(di->hDC, &di->rcItem, g_brushStroke);
+                    // [v2.10.56] Group-disabled tint: 60% wash (Doc: 40%
+                    // read as still-on; swatch only — the pick button dims
+                    // like every other button).
+                    if (di->itemState & ODS_DISABLED)
+                        AbtDimWashApply(di->hDC, di->rcItem, 60);
                     return TRUE;
                 }
                 return TRUE;
@@ -16574,7 +16839,10 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                 FillRect(di->hDC, &di->rcItem, g_brushInput);
                 HFONT old = (HFONT)SelectObject(di->hDC, g_fontMdl2);
                 SetBkMode(di->hDC, TRANSPARENT);
-                SetTextColor(di->hDC, kColGlyph);
+                // [v2.10.56] dims like every other button (no wash — Doc).
+                SetTextColor(di->hDC, (di->itemState & ODS_DISABLED)
+                                          ? kColDisabled
+                                          : kColGlyph);
                 DrawTextW(di->hDC, L"", 1, &di->rcItem,
                           DT_CENTER | DT_VCENTER | DT_SINGLELINE);
                 SelectObject(di->hDC, old);
@@ -16906,9 +17174,9 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                     GetWindowTextW(row.ctl, sel, 32);
                     COLORREF start = RGB(0x05, 0x15, 0x29);
                     bool found = false;
-                    for (const TintPresetColor& pr : kTintPresetColors) {
+                    for (const TintPresetEntry& pr : kTintPresets) {
                         if (wcscmp(sel, pr.name) == 0) {
-                            start = pr.rgb;
+                            start = TintRgbToColorref(pr.rgb);
                             found = true;
                             break;
                         }
@@ -17148,10 +17416,18 @@ static void OpenSettingsWindow() {
         return;
     }
 
-    int wndW = 960;  // raw px — fixed per Doc; we adjust slowly from here
-    // [v2.10.41] 850: the Overlay tab (11 rows + 3 group bands) fits its
-    // pane at Doc's 125% without the scrollbar (pane needs ~790 client px).
-    int wndH = 850;
+    // [v2.10.54 DPI-WINDOW] The window size used to be RAW pixels (960x850)
+    // while every widget inside is MulDiv-scaled — at 150-200% the contents
+    // outgrew the fixed frame and clipped. Base = the 100%-dpi equivalent of
+    // Doc's verified 125% geometry (960/1.25 = 768, 850/1.25 = 680), so
+    // Doc's 125% layout stays PIXEL-IDENTICAL and higher dpi scales the
+    // frame with the contents.
+    int uiDpi = GetDpiForSystem();  // system DPI, same source the widget
+                                    // layout at 125% targets on the primary
+    int wndW = MulDiv(768, uiDpi, 96);  // = 960 raw at Doc's 125%
+    // [v2.10.41] the Overlay tab (11 rows + 3 group bands) fits its pane at
+    // 125% without the scrollbar (pane needs ~790 client px).
+    int wndH = MulDiv(680, uiDpi, 96);  // = 850 raw at Doc's 125%
     RECT work = {};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     int x = work.left + ((work.right - work.left) - wndW) / 2;
@@ -17564,13 +17840,16 @@ static LRESULT CALLBACK MsgWndProc(HWND hwnd, UINT msg, WPARAM wParam,
 static DWORD WINAPI UIThreadProc(void*) {
     HRESULT hrCom = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
+    // [v2.10.54] hand-synced tables get verified, not trusted (see function).
+    VerifyTableSync();
+
     INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_STANDARD_CLASSES |
                                                  ICC_BAR_CLASSES |
                                                  ICC_UPDOWN_CLASS};
     InitCommonControlsEx(&icc);
 
     g_font = MakePtFont(10, false);
-    g_fontBold = MakePtFont(10, true);
+    // [v2.10.51] g_fontBold removed — created, never used.
     // 🦇 rows need emoji fallback — Segoe UI alone renders tofu boxes.
     g_fontEmoji = MakePtFont(12, false, L"Segoe UI Emoji");
     g_fontMdl2 = MakePtFont(12, false, L"Segoe MDL2 Assets");
