@@ -16,27 +16,6 @@
 
 # AB TENEBRIS - Transparent Desktop Icons with Spotlight and Dynamic Shadows
 
-## THE SHELL WALLPAPER CENTERING QUIRK (measured, 2026-11-21)
-When Windows Explorer renders a wallpaper in Fill or Span mode, the image is
-cover-fit (aspect preserved) and the overflow is cropped - but the crop is
-NOT centered mathematically. Measured on Windows 11 26300, dual monitor
-(3840x2160 @125% + 1080x1920 @100%), six configurations, shifts matching
-predictions to 1-2 px:
-
-| Axis of the overflow | Shell's centering divisor |
-|---|---|
-| Horizontal (left/right crop) | `/2` (mathematical centering) |
-| Vertical (top/bottom crop) | `/3` (top gets 1/3 of the overflow) |
-
-Both Fill and Span follow the same per-axis law, at any scale factor (this
-mod replicates the wallpaper with these exact formulas - see
-ComputeWallpaperRects and the SPAN block if you need a reference
-implementation). Fun facts: the /3 vertical quirk was independently
-discovered here in 2026-11 (multimon ghosting hunt) and again for the
-horizontal axis in 2026-11-21 while chasing issue #5793; the earlier belief
-that /3 applied to both axes was correlation - the discriminating variable
-turned out to be which axis overflowed, not the zoom direction.
-
 ## SETTINGS
 All settings live in the **Ab Tenebris settings window** — open it from the
 tray icon this mod adds to the taskbar (left-click the icon, or right-click
@@ -98,8 +77,26 @@ And don't come back to me crying if you set it on fire.
 
 ![Demonstration:](https://i.imgur.com/7cTTHTN.gif)
 
+## THE SHELL WALLPAPER CENTERING QUIRK (measured, 2026-11-21)
+When Windows Explorer renders a wallpaper in Fill or Span mode, the image is
+cover-fit (aspect preserved) and the overflow is cropped - but the crop is
+NOT centered mathematically. Measured on Windows 11 26300, dual monitor
+(3840x2160 @125% + 1080x1920 @100%), six configurations, shifts matching
+predictions to 1-2 px:
 
+| Axis of the overflow | Shell's centering divisor |
+|---|---|
+| Horizontal (left/right crop) | `/2` (mathematical centering) |
+| Vertical (top/bottom crop) | `/3` (top gets 1/3 of the overflow) |
 
+Both Fill and Span follow the same per-axis law, at any scale factor (this
+mod replicates the wallpaper with these exact formulas - see
+ComputeWallpaperRects and the SPAN block if you need a reference
+implementation). Fun facts: the /3 vertical quirk was independently
+discovered here in 2026-11 (multimon ghosting hunt) and again for the
+horizontal axis in 2026-11-21 while chasing issue #5793; the earlier belief
+that /3 applied to both axes was correlation - the discriminating variable
+turned out to be which axis overflowed, not the zoom direction.
 
 */
 // ==/WindhawkModReadme==
